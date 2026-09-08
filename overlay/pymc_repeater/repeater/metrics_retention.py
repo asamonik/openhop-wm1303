@@ -6,12 +6,14 @@ historical trends:
   Tier      | Period    | Resolution    | Action
   ----------|-----------|---------------|-----------------------------------------
   Hot       | 0-7h      | Full          | Keep all original data points
-  Warm      | 7-24h     | 1 minute      | Aggregate into _1m summary tables
-  Cool      | 1-3 days  | 10 minutes    | Aggregate into _10m summary tables
+  Warm      | 7h-3 days | 1 minute      | Aggregate into _1m summary tables
   Cold      | 3-8 days  | 15 minutes    | Aggregate into _15m summary tables
   Expired   | >8 days   | Deleted       | Remove from all tables
 
-Summary tables use option A: separate tables per resolution level.
+Legacy _10m summaries remain readable until expiry; a 10-minute bucket cannot
+be split truthfully into 15-minute buckets. Cumulative channel snapshots stay
+raw until expiry (plus one baseline per retained channel), preserving the
+transitions between samples. The eight-day limit is the configurable default.
 After each cleanup pass, a WAL TRUNCATE checkpoint is performed.
 """
 import logging
@@ -20,6 +22,8 @@ import sqlite3
 import threading
 import ctypes
 import ctypes.util
+import functools
+import math
 
 from contextlib import contextmanager as _contextmanager
 
@@ -33,31 +37,50 @@ class _SharedConn:
 
     def _ensure_conn(self):
         if self._conn is None:
-            self._conn = sqlite3.connect(
+            conn = sqlite3.connect(
                 self._path, timeout=10, check_same_thread=False,
             )
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._conn.execute("PRAGMA busy_timeout=5000")
-            self._conn.execute("PRAGMA cache_size=-512")
-            self._conn.execute("PRAGMA mmap_size=0")
-            self._conn.execute("PRAGMA temp_store=MEMORY")
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA busy_timeout=5000")
+                conn.execute("PRAGMA cache_size=-512")
+                conn.execute("PRAGMA mmap_size=0")
+                conn.execute("PRAGMA temp_store=MEMORY")
+            except BaseException:
+                conn.close()
+                raise
+            self._conn = conn
         return self._conn
 
     def __enter__(self):
         self._lock.acquire()
-        return self._ensure_conn()
+        try:
+            return self._ensure_conn()
+        except BaseException:
+            self._lock.release()
+            raise
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         try:
             if self._conn:
                 if exc_type is None:
-                    self._conn.commit()
+                    try:
+                        self._conn.commit()
+                    except BaseException:
+                        self._conn.rollback()
+                        raise
                 else:
                     self._conn.rollback()
         finally:
             self._lock.release()
         return False
+
+    def close(self):
+        with self._lock:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
 
 
 # Module-level shared connection registry (Python 3.13 compatible)
@@ -82,7 +105,6 @@ def _db_conn(path, timeout=5):
     with shared as conn:
         yield conn
 
-import threading
 import time
 from typing import List, Tuple, Optional, Dict
 
@@ -121,7 +143,6 @@ DEFAULT_VACUUM_INTERVAL_S = 7 * 86400    # weekly
 
 # Tier boundaries (in seconds from now)
 TIER_HOT_SECONDS = 7 * 3600              # 7 hours
-TIER_WARM_SECONDS = 24 * 3600            # 24 hours
 TIER_COOL_SECONDS = 3 * 86400            # 3 days
 # Cold = 3-8 days (until retention_days)
 
@@ -129,15 +150,6 @@ TIER_COOL_SECONDS = 3 * 86400            # 3 days
 BUCKET_1M = 60
 BUCKET_10M = 600
 BUCKET_15M = 900
-
-# TODO #232: marker for source columns that hold a CUMULATIVE (monotonically
-# increasing since service start) counter instead of an interval value.
-# An agg_cols entry of the form ("CUMDELTA:<source_column>", "<alias>") tells
-# _aggregate_from_source() to emit the per-bucket delta relative to the
-# PREVIOUS bucket (window function LAG), clamped at 0 so a counter reset on
-# service restart yields 0 instead of a large negative spike. Within-bucket
-# MAX-MIN cannot be used because these tables are written once per bucket.
-CUMDELTA_PREFIX = "CUMDELTA:"
 
 # Tables that should only be deleted after retention (no downsampling)
 # These are either already compact or not suitable for aggregation.
@@ -172,9 +184,6 @@ DOWNSAMPLE_TABLES: List[Dict] = [
             ("MAX(snr)",        "max_snr"),
             ("AVG(airtime_ms)", "avg_airtime_ms"),
             ("SUM(airtime_ms)", "total_airtime_ms"),
-            # TODO #245: without this the TX wait series is dropped during
-            # rollup, so the chart can only ever draw the airtime line.
-            ("SUM(wait_time_ms)", "total_wait_time_ms"),
             ("SUM(length)",     "total_bytes"),
             ("AVG(hop_count)",  "avg_hop_count"),
             ("SUM(CASE WHEN crc_ok=0 THEN 1 ELSE 0 END)", "crc_error_count"),
@@ -221,10 +230,7 @@ DOWNSAMPLE_TABLES: List[Dict] = [
             ("SUM(cad_hw_detected)", "total_cad_hw_detected"),
             ("SUM(cad_sw_clear)",   "total_cad_sw_clear"),
             ("SUM(cad_sw_detected)", "total_cad_sw_detected"),
-            # TODO #242: retries were never rolled up, so the CAD chart
-            # could only ever show clear/detected and reported a calm
-            # channel while thousands of TXs needed a second look.
-            ("SUM(cad_busy_events)", "total_cad_busy_events"),
+            ("SUM(cad_busy_events)",      "total_cad_busy_events"),
         ],
     },
     {
@@ -234,42 +240,21 @@ DOWNSAMPLE_TABLES: List[Dict] = [
         "group_cols": ["channel_id"],
         "agg_cols": [
             ("COUNT(*)",                "sample_count"),
-            # NOTE: rx_count/tx_count/tx_failed/tx_airtime_ms/tx_bytes/
-            # lbt_blocked/lbt_passed are CUMULATIVE counters in
-            # channel_stats_history (monotonically increasing since service
-            # start). Using SUM would multiply the cumulative value by the
-            # number of samples in the bucket, which is meaningless.
-            # TODO #232: the previous `MAX(x) - MIN(x)` within-bucket delta
-            # always evaluated to 0 here, because the snapshot loop writes
-            # channel_stats_history once per 60 s and the warm tier buckets
-            # at exactly BUCKET_1M = 60 s -> one sample per bucket -> no
-            # observable spread. These columns are now marked with the
-            # CUMDELTA_PREFIX so _aggregate_from_source() computes the delta
-            # against the PREVIOUS bucket with a window function instead.
-            # Higher-tier re-aggregation (_1m -> _10m -> _15m) is unchanged:
-            # the existing SUM logic on aliases starting with `total_`
-            # correctly sums per-minute deltas into 10/15-minute deltas.
-            # NOTE: legacy `pkt_count` column was removed here — it is a
-            # dead column in the WM1303 schema (never written by any
-            # overlay code; RX totals come from packet_activity via
-            # _pkt_counts_for). Referencing it caused
-            # "no such column: pkt_count" WARNINGs that blocked every
-            # channel_stats_history rollup tier (warm/cool/cold), leaving
-            # channel_stats_history_{1m,10m,15m} empty and the base table
-            # unbounded.
-            ("CUMDELTA:rx_count",                         "total_rx_count"),
+            # Legacy schema only: new cumulative snapshots are NOT rolled
+            # up. MAX-MIN loses transitions between buckets and resets.
+            # Keep raw snapshots (~69,120 rows at six channels/eight days)
+            # and calculate reset-aware differences when querying.
+            ("MAX(rx_count) - MIN(rx_count)",             "total_rx_count"),
             ("AVG(avg_rssi)",                             "avg_rssi"),
             ("AVG(avg_snr)",                              "avg_snr"),
-            ("CUMDELTA:tx_count",                         "total_tx_count"),
-            ("CUMDELTA:tx_failed",                        "total_tx_failed"),
-            ("CUMDELTA:tx_airtime_ms",                    "total_tx_airtime_ms"),
-            ("CUMDELTA:tx_bytes",                         "total_tx_bytes"),
-            ("CUMDELTA:lbt_blocked",                      "total_lbt_blocked"),
-            ("CUMDELTA:lbt_passed",                       "total_lbt_passed"),
+            ("MAX(tx_count) - MIN(tx_count)",             "total_tx_count"),
+            ("MAX(tx_failed) - MIN(tx_failed)",           "total_tx_failed"),
+            ("MAX(tx_airtime_ms) - MIN(tx_airtime_ms)",   "total_tx_airtime_ms"),
+            ("MAX(tx_bytes) - MIN(tx_bytes)",             "total_tx_bytes"),
+            ("MAX(lbt_blocked) - MIN(lbt_blocked)",       "total_lbt_blocked"),
+            ("MAX(lbt_passed) - MIN(lbt_passed)",         "total_lbt_passed"),
             ("AVG(noise_floor_dbm)",                      "avg_noise_floor_dbm"),
             ("AVG(tx_noisefloor_dbm)",                    "avg_tx_noisefloor_dbm"),
-            # TODO #243: without this the LBT RSSI series is structurally
-            # empty, so the chart promises a line it can never draw.
             ("AVG(lbt_last_rssi)",                        "avg_lbt_last_rssi"),
         ],
     },
@@ -307,6 +292,14 @@ DOWNSAMPLE_TABLES: List[Dict] = [
     },
 ]
 
+# AVG ignores NULL, so every average needs its own denominator. COUNT(*)
+# alone cannot preserve nullable averages when partial buckets are merged.
+for _cfg in DOWNSAMPLE_TABLES:
+    _cfg["agg_cols"] += [
+        (f"COUNT({expr[4:-1]})", f"{alias}_count")
+        for expr, alias in _cfg["agg_cols"] if expr.startswith("AVG(")
+    ]
+
 DB_DIR = "/var/lib/openhop_repeater"
 
 
@@ -316,7 +309,12 @@ def _summary_table_name(base_table: str, suffix: str) -> str:
 
 
 def _create_summary_table(conn: sqlite3.Connection, cfg: Dict, suffix: str):
-    """Create a summary table if it doesn't exist."""
+    """Create summaries and migrate legacy average denominators.
+
+    Old summaries did not retain non-NULL counts. Their only available
+    fallback is sample_count for a non-NULL average (necessarily approximate).
+    New summaries always record the exact per-field count.
+    """
     table_name = _summary_table_name(cfg["table"], suffix)
     group_cols = cfg["group_cols"]
     agg_cols = cfg["agg_cols"]
@@ -331,21 +329,15 @@ def _create_summary_table(conn: sqlite3.Connection, cfg: Dict, suffix: str):
     col_defs = ", ".join(cols)
     sql = f"CREATE TABLE IF NOT EXISTS {table_name} ({col_defs})"
     conn.execute(sql)
-
-    # CREATE TABLE IF NOT EXISTS is a no-op once the table exists, so a newly
-    # added aggregation column would never reach a database created before it
-    # was introduced: every INSERT then fails with "no such column". Add any
-    # missing column explicitly. Generic on purpose, so extending agg_cols
-    # stays a one-line change instead of a migration each time.
-    try:
-        existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table_name})")}
-        for _, alias in agg_cols:
-            if alias not in existing:
-                conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {alias} REAL")
-                logger.info("MetricsRetention: added column %s.%s", table_name, alias)
-    except Exception as e:
-        logger.warning("MetricsRetention: column migration failed for %s: %s",
-                       table_name, e)
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table_name})")}
+    for expr, alias in agg_cols:
+        if expr.startswith("AVG("):
+            count_alias = f"{alias}_count"
+            if count_alias not in existing:
+                conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {count_alias} REAL")
+                conn.execute(
+                    f"UPDATE {table_name} SET {count_alias} = "
+                    f"CASE WHEN {alias} IS NULL THEN 0 ELSE sample_count END")
 
     # Create index on bucket_ts for fast range queries
     idx_name = f"idx_{table_name}_bucket_ts"
@@ -357,69 +349,39 @@ def _create_summary_table(conn: sqlite3.Connection, cfg: Dict, suffix: str):
         grp_idx = ", ".join(group_cols + ["bucket_ts"])
         conn.execute(f"CREATE INDEX IF NOT EXISTS {idx_name2} ON {table_name}({grp_idx})")
 
-    # TODO #231: a UNIQUE index on (bucket_ts, *group_cols) is what makes the
-    # per-bucket `INSERT OR IGNORE` idempotency in _aggregate_from_source() /
-    # _aggregate_from_summary() work. Without it those helpers had to fall back
-    # on a window-wide "does the target already contain anything?" probe, which
-    # silently deleted un-aggregated source rows on every cycle after the first.
-    # Existing installs may already contain duplicate buckets from the old
-    # behaviour, so drop those (keeping the lowest rowid) before creating it.
-    uniq_name = f"uidx_{table_name}_bucket"
-    uniq_cols = ", ".join(["bucket_ts"] + list(group_cols))
-    try:
-        conn.execute(
-            f"CREATE UNIQUE INDEX IF NOT EXISTS {uniq_name} ON {table_name}({uniq_cols})")
-    except sqlite3.IntegrityError:
+
+def _atomic_rollup(func):
+    """Keep each insert/delete pair atomic even if the caller catches errors."""
+    @functools.wraps(func)
+    def wrapped(conn, *args, **kwargs):
+        conn.execute("SAVEPOINT metrics_rollup")
         try:
-            conn.execute(
-                f"DELETE FROM {table_name} WHERE rowid NOT IN "
-                f"(SELECT MIN(rowid) FROM {table_name} GROUP BY {uniq_cols})")
-            conn.execute(
-                f"CREATE UNIQUE INDEX IF NOT EXISTS {uniq_name} ON {table_name}({uniq_cols})")
-            logger.info("MetricsRetention: de-duplicated %s and added unique bucket index",
-                        table_name)
-        except Exception as e:
-            logger.warning("MetricsRetention: could not create unique index on %s: %s",
-                           table_name, e)
+            result = func(conn, *args, **kwargs)
+        except BaseException:
+            conn.execute("ROLLBACK TO metrics_rollup")
+            conn.execute("RELEASE metrics_rollup")
+            raise
+        conn.execute("RELEASE metrics_rollup")
+        return result
+    return wrapped
 
 
+@_atomic_rollup
 def _aggregate_from_source(conn: sqlite3.Connection, cfg: Dict,
                            from_ts: float, to_ts: float,
-                           bucket_seconds: int, target_suffix: str) -> Tuple[int, int]:
+                           bucket_seconds: int, target_suffix: str) -> int:
     """Aggregate raw source data into a summary table and delete originals.
 
-    Used for the Warm tier (source → _1m) and for the cool/cold source
-    fallbacks (source → _10m / _15m).
-
-    TODO #231: the previous implementation probed the target table for ANY row
-    inside [from_ts, to_ts) and, when it found one, deleted the entire source
-    window WITHOUT aggregating it. The tier windows are 17 h / 2 d / 5 d wide
-    and slide forward every hour, so from the second cycle after a service
-    start that probe always matched and every newly-eligible source row was
-    discarded unaggregated. The guard is now per-bucket: the
-    UNIQUE(bucket_ts, *group_cols) index created by _create_summary_table()
-    combined with INSERT OR IGNORE makes re-running a window idempotent
-    without losing data that was never rolled up.
-
-    TODO #232: agg_cols entries carrying CUMDELTA_PREFIX hold cumulative
-    counters. They are converted into per-bucket deltas with a LAG() window
-    function rather than aggregated within the bucket, because these tables are
-    written once per bucket and any within-bucket spread is therefore 0.
-
-    Returns (source_rows_deleted, summary_rows_inserted).
+    Used for warm data (source → _1m) and old data after outages (→ _15m).
+    Returns the number of source rows deleted.
     """
     source_table = cfg["table"]
+    if source_table == "channel_stats_history":
+        raise ValueError("Cumulative channel snapshots must remain raw until expiry")
     ts_col = cfg["ts_col"]
     group_cols = cfg["group_cols"]
     agg_cols = cfg["agg_cols"]
     target_table = _summary_table_name(source_table, target_suffix)
-
-    # Consume only buckets that are COMPLETE at this bucket size; see the
-    # matching note in _aggregate_from_summary(). Rows above the aligned edge
-    # stay put and are picked up on the next cycle.
-    to_ts = (int(to_ts) // bucket_seconds) * bucket_seconds
-    if to_ts <= from_ts:
-        return (0, 0)
 
     # Check if there's data in this range in the source table
     count_row = conn.execute(
@@ -427,128 +389,62 @@ def _aggregate_from_source(conn: sqlite3.Connection, cfg: Dict,
         (from_ts, to_ts)
     ).fetchone()
     if not count_row or count_row[0] == 0:
-        return (0, 0)
+        return 0
 
+    # Existing summaries describe *other* consumed rows, never these rows.
+    # Append partial buckets; queries and later tiers combine them additively.
     # Build the aggregation query from raw source data
     bucket_expr = f"CAST(({ts_col} / {bucket_seconds}) AS INTEGER) * {bucket_seconds}"
-    has_cumdelta = any(expr.startswith(CUMDELTA_PREFIX) for expr, _ in agg_cols)
+    select_cols = [f"{bucket_expr} AS bucket_ts"]
+    for gc in group_cols:
+        select_cols.append(gc)
+    for expr, alias in agg_cols:
+        select_cols.append(f"{expr} AS {alias}")
 
-    if not has_cumdelta:
-        select_cols = [f"{bucket_expr} AS bucket_ts"]
-        for gc in group_cols:
-            select_cols.append(gc)
-        for expr, alias in agg_cols:
-            select_cols.append(f"{expr} AS {alias}")
+    group_by = ["bucket_ts"] + group_cols
+    select_sql = f"""SELECT {', '.join(select_cols)}
+                     FROM {source_table}
+                     WHERE {ts_col} >= ? AND {ts_col} < ?
+                     GROUP BY {', '.join(group_by)}"""
 
-        group_by = ["bucket_ts"] + group_cols
-        select_sql = f"""SELECT {', '.join(select_cols)}
-                         FROM {source_table}
-                         WHERE {ts_col} >= ? AND {ts_col} < ?
-                         GROUP BY {', '.join(group_by)}"""
-    else:
-        # Two stages. Stage 1 collapses each bucket and keeps the LAST
-        # cumulative level observed in it (the counters are monotonic, so MAX
-        # is the last value). Stage 2 turns those per-bucket levels into
-        # per-bucket deltas with LAG over the bucket boundary.
-        inner_cols = [f"{bucket_expr} AS bucket_ts"]
-        outer_cols = ["bucket_ts"]
-        for gc in group_cols:
-            inner_cols.append(gc)
-            outer_cols.append(gc)
-        for expr, alias in agg_cols:
-            if expr.startswith(CUMDELTA_PREFIX):
-                src_col = expr[len(CUMDELTA_PREFIX):]
-                level = f"_cum_{alias}"
-                inner_cols.append(f"MAX({src_col}) AS {level}")
-                # COALESCE(LAG(...), level) makes the first bucket of the
-                # window yield 0 instead of NULL; the 2-argument scalar MAX
-                # clamps at 0 so a counter reset on service restart cannot
-                # produce a large negative spike.
-                outer_cols.append(
-                    f"MAX(0, {level} - COALESCE(LAG({level}) OVER _w, {level})) "
-                    f"AS {alias}")
-            else:
-                inner_cols.append(f"{expr} AS {alias}")
-                outer_cols.append(alias)
-
-        inner_group_by = ["bucket_ts"] + group_cols
-        partition = f"PARTITION BY {', '.join(group_cols)} " if group_cols else ""
-        select_sql = f"""WITH _buckets AS (
-                             SELECT {', '.join(inner_cols)}
-                             FROM {source_table}
-                             WHERE {ts_col} >= ? AND {ts_col} < ?
-                             GROUP BY {', '.join(inner_group_by)}
-                         )
-                         SELECT {', '.join(outer_cols)}
-                         FROM _buckets
-                         WINDOW _w AS ({partition}ORDER BY bucket_ts)"""
-
-    # INSERT OR IGNORE relies on the UNIQUE(bucket_ts, *group_cols) index for
-    # per-bucket idempotency, so a window may be re-processed safely.
+    # Insert aggregated data into summary table
     insert_cols = ["bucket_ts"] + group_cols + [alias for _, alias in agg_cols]
     placeholders = ", ".join(["?"] * len(insert_cols))
-    insert_sql = (f"INSERT OR IGNORE INTO {target_table} "
-                  f"({', '.join(insert_cols)}) VALUES ({placeholders})")
+    insert_sql = f"INSERT INTO {target_table} ({', '.join(insert_cols)}) VALUES ({placeholders})"
 
-    inserted = 0
     rows = conn.execute(select_sql, (from_ts, to_ts)).fetchall()
     if rows:
-        before = conn.total_changes
         conn.executemany(insert_sql, rows)
-        inserted = conn.total_changes - before
 
-    # Only drop the source rows once the aggregate is stored.
-    #
-    # For CUMDELTA configs the NEWEST consumed bucket is deliberately kept:
-    # its rows are the LAG seed that lets the next window compute a real delta
-    # for its own first bucket instead of emitting 0. Without this, every
-    # cycle would silently under-count by one bucket per channel, because the
-    # predecessor it needs was deleted by the previous cycle. The retained
-    # rows are consumed and deleted on the following cycle (the window is far
-    # wider than the interval it slides by), re-aggregate into a bucket that
-    # already exists (INSERT OR IGNORE skips it), and are swept by the
-    # retention cutoff in any case.
-    delete_to = to_ts - bucket_seconds if has_cumdelta else to_ts
+    # Delete original rows that have been aggregated
     cur = conn.execute(
         f"DELETE FROM {source_table} WHERE {ts_col} >= ? AND {ts_col} < ?",
-        (from_ts, delete_to)
+        (from_ts, to_ts)
     )
-    return (cur.rowcount, inserted)
+    return cur.rowcount
 
 
+@_atomic_rollup
 def _aggregate_from_summary(conn: sqlite3.Connection, cfg: Dict,
                             from_ts: float, to_ts: float,
                             source_suffix: str, bucket_seconds: int,
-                            target_suffix: str) -> Tuple[int, int]:
+                            target_suffix: str) -> int:
     """Re-aggregate from a finer summary table into a coarser one.
 
-    Used for cascading: _1m → _10m, _10m → _15m.
+    Used for cascading: _1m → _15m. Non-divisible bucket widths cannot be
+    re-aggregated without moving some observations into the wrong bucket.
     Reads from the source summary table, aggregates into the target summary
     table, and deletes the consumed source summary rows.
-
-    TODO #231: this function carried the same window-wide "was this range
-    already aggregated?" probe as _aggregate_from_source(). Once the target
-    held a single row anywhere in the tier window, every later cycle deleted
-    the consumed _1m/_10m rows without ever writing the coarser bucket. The
-    probe is replaced by INSERT OR IGNORE against the
-    UNIQUE(bucket_ts, *group_cols) index.
-
-    Returns (source_rows_deleted, summary_rows_inserted).
+    Returns the number of source summary rows deleted.
     """
     base_table = cfg["table"]
     group_cols = cfg["group_cols"]
     agg_cols = cfg["agg_cols"]
     source_table = _summary_table_name(base_table, source_suffix)
     target_table = _summary_table_name(base_table, target_suffix)
-
-    # Consume only buckets that are COMPLETE at this bucket size. The tier
-    # window slides forward every cycle and its edges are not bucket-aligned,
-    # so a target bucket straddling to_ts would be written from partial input
-    # and the remainder would then be silently dropped by INSERT OR IGNORE on
-    # the next cycle. Rows above the aligned edge simply wait one cycle.
-    to_ts = (int(to_ts) // bucket_seconds) * bucket_seconds
-    if to_ts <= from_ts:
-        return (0, 0)
+    source_resolution = {"1m": BUCKET_1M, "10m": BUCKET_10M, "15m": BUCKET_15M}[source_suffix]
+    if bucket_seconds % source_resolution:
+        raise ValueError("Target bucket must be a multiple of the source resolution")
 
     # Check if there's data in this range in the source summary table
     count_row = conn.execute(
@@ -556,13 +452,13 @@ def _aggregate_from_summary(conn: sqlite3.Connection, cfg: Dict,
         (from_ts, to_ts)
     ).fetchone()
     if not count_row or count_row[0] == 0:
-        return (0, 0)
+        return 0
 
     # Build re-aggregation query from summary table.
     # Summary tables have: bucket_ts, group_cols, and agg columns.
     # For re-aggregation, we need to combine the summary values correctly:
     # - COUNT/SUM columns → SUM them
-    # - AVG columns → weighted average using sample_count
+    # - AVG columns → weighted average using each field's non-NULL count
     # - MIN columns → MIN
     # - MAX columns → MAX
     bucket_expr = f"CAST((bucket_ts / {bucket_seconds}) AS INTEGER) * {bucket_seconds}"
@@ -570,31 +466,21 @@ def _aggregate_from_summary(conn: sqlite3.Connection, cfg: Dict,
     for gc in group_cols:
         select_cols.append(gc)
 
-    # Re-aggregate: for summary tables, all values are already aggregated.
-    # We use the naming convention to determine re-aggregation strategy:
-    # - *_count, total_* → SUM
-    # - avg_* → weighted average (SUM(val * sample_count) / SUM(sample_count))
-    # - min_* → MIN
-    # - max_* → MAX
+    # Identify averages from their expressions, not a *_count suffix:
+    # avg_hop_count is an average; avg_hop_count_count is its denominator.
     reagg_exprs = []
-    for _, alias in agg_cols:
-        if alias == "sample_count":
-            reagg_exprs.append((f"SUM({alias})", alias))
-        elif alias.startswith("total_") or alias.endswith("_count"):
-            reagg_exprs.append((f"SUM({alias})", alias))
-        elif alias.startswith("avg_"):
-            # Weighted average: SUM(avg_val * sample_count) / SUM(sample_count)
+    for raw_expr, alias in agg_cols:
+        if raw_expr.startswith("AVG("):
+            count_expr = (f"COALESCE({alias}_count, "
+                          f"CASE WHEN {alias} IS NULL THEN 0 ELSE sample_count END)")
             reagg_exprs.append(
-                (f"SUM({alias} * sample_count) / NULLIF(SUM(sample_count), 0)", alias))
+                (f"SUM({alias} * {count_expr}) / NULLIF(SUM({count_expr}), 0)", alias))
         elif alias.startswith("min_"):
             reagg_exprs.append((f"MIN({alias})", alias))
         elif alias.startswith("max_"):
             reagg_exprs.append((f"MAX({alias})", alias))
-        elif alias == "unique_packets":
-            # Can't truly re-aggregate distinct counts, use SUM as approximation
-            reagg_exprs.append((f"SUM({alias})", alias))
         else:
-            # Default: SUM for counters, AVG for unknown
+            # Counters add; distinct counts can only be approximated by SUM.
             reagg_exprs.append((f"SUM({alias})", alias))
 
     for expr, alias in reagg_exprs:
@@ -606,26 +492,21 @@ def _aggregate_from_summary(conn: sqlite3.Connection, cfg: Dict,
                      WHERE bucket_ts >= ? AND bucket_ts < ?
                      GROUP BY {', '.join(group_by)}"""
 
-    # Insert into target. INSERT OR IGNORE + the UNIQUE(bucket_ts, *group_cols)
-    # index give per-bucket idempotency, so re-processing a window is safe.
+    # Insert into target
     insert_cols = ["bucket_ts"] + group_cols + [alias for _, alias in reagg_exprs]
     placeholders = ", ".join(["?"] * len(insert_cols))
-    insert_sql = (f"INSERT OR IGNORE INTO {target_table} "
-                  f"({', '.join(insert_cols)}) VALUES ({placeholders})")
+    insert_sql = f"INSERT INTO {target_table} ({', '.join(insert_cols)}) VALUES ({placeholders})"
 
-    inserted = 0
     rows = conn.execute(select_sql, (from_ts, to_ts)).fetchall()
     if rows:
-        before = conn.total_changes
         conn.executemany(insert_sql, rows)
-        inserted = conn.total_changes - before
 
     # Delete consumed source summary rows
     cur = conn.execute(
         f"DELETE FROM {source_table} WHERE bucket_ts >= ? AND bucket_ts < ?",
         (from_ts, to_ts)
     )
-    return (cur.rowcount, inserted)
+    return cur.rowcount
 
 
 class MetricsRetention:
@@ -634,12 +515,19 @@ class MetricsRetention:
                  cleanup_interval_s: int = DEFAULT_CLEANUP_INTERVAL_S,
                  vacuum_interval_s: int = DEFAULT_VACUUM_INTERVAL_S,
                  db_dir: str = DB_DIR):
+        for name, value in (("retention_days", retention_days),
+                            ("cleanup_interval_s", cleanup_interval_s),
+                            ("vacuum_interval_s", vacuum_interval_s)):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
         self.retention_days = retention_days
         self.cleanup_interval_s = cleanup_interval_s
         self.vacuum_interval_s = vacuum_interval_s
         self.db_dir = db_dir
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._lifecycle_lock = threading.Lock()
         # Persist last VACUUM timestamp so a service restart does not cause
         # an immediate VACUUM (which briefly uses 2-3x the DB size in RAM).
         self._vacuum_state_path = os.path.join(self.db_dir, ".last_vacuum")
@@ -678,30 +566,69 @@ class MetricsRetention:
         return self.retention_days * 86400
 
     def start(self):
-        if self._running:
-            return
-        self._running = True
-        self._thread = threading.Thread(target=self._run, daemon=True,
-                                        name="MetricsRetention")
-        self._thread.start()
+        with self._lifecycle_lock:
+            if self._thread and self._thread.is_alive():
+                return
+            self._stop_event.clear()
+            self._running = True
+            self._thread = threading.Thread(target=self._run, daemon=True,
+                                            name="MetricsRetention")
+            try:
+                self._thread.start()
+            except BaseException:
+                self._running = False
+                self._thread = None
+                raise
         logger.info("MetricsRetention started (retention=%dd, cleanup_every=%ds, "
                     "tiers=7h/24h/3d/%dd)",
                     self.retention_days, self.cleanup_interval_s,
                     self.retention_days)
 
     def stop(self):
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=5)
+        """Signal shutdown and join the worker before releasing its connections."""
+        if self._thread is threading.current_thread():
+            self._stop_event.set()
+            raise RuntimeError("MetricsRetention cannot join its own worker")
+        with self._lifecycle_lock:
+            self._stop_event.set()
+            if self._thread:
+                # SQL execution/VACUUM is not bounded by busy_timeout. A timed
+                # join would let shutdown close storage while this producer
+                # still owns database work. The worker never takes this lock.
+                self._thread.join()
+            self._close_connections()
+            self._running = False
+            self._thread = None
+
+    def _close_connections(self):
+        with _shared_conn_lock:
+            for path in list(_shared_conn_instances):
+                if os.path.abspath(os.path.dirname(path)) == os.path.abspath(self.db_dir):
+                    # Keep a failed close reachable for a later stop retry.
+                    _shared_conn_instances[path].close()
+                    del _shared_conn_instances[path]
 
     def _run(self):
-        # First run after 60s so service start is clean
-        time.sleep(60)
-        while self._running:
+        try:
+            self._run_cycles()
+        finally:
             try:
-                self._ensure_summary_tables()
+                self._close_connections()
+            finally:
+                self._running = False
+
+    def _run_cycles(self):
+        # First run after 60s so service start is clean
+        if self._stop_event.wait(60):
+            return
+        while not self._stop_event.is_set():
+            try:
                 self.cleanup_once()
+                if self._stop_event.is_set():
+                    return
                 self._wal_truncate()
+                if self._stop_event.is_set():
+                    return
                 if time.time() - self._last_vacuum >= self.vacuum_interval_s:
                     self.vacuum_once()
                     self._last_vacuum = time.time()
@@ -710,11 +637,8 @@ class MetricsRetention:
                 malloc_trim()
             except Exception as e:
                 logger.error("Retention cycle error: %s", e)
-            # Sleep in 5s chunks to allow clean shutdown
-            for _ in range(self.cleanup_interval_s // 5):
-                if not self._running:
-                    return
-                time.sleep(5)
+            if self._stop_event.wait(self.cleanup_interval_s):
+                return
 
     def _ensure_summary_tables(self):
         """Create summary tables if they don't exist yet."""
@@ -738,18 +662,16 @@ class MetricsRetention:
 
     def cleanup_once(self):
         """Run one complete cleanup cycle: downsample + delete expired."""
+        self._ensure_summary_tables()
         now = time.time()
         total_deleted = 0
         total_aggregated = 0
 
         # --- Phase 1: Tiered downsampling ---
-        # Warm tier: 7h-24h → 1 minute buckets
-        warm_from = now - TIER_WARM_SECONDS
+        # Retain 1m until day three, then roll directly to 15m. Never move
+        # legacy 10m buckets into 15m: the boundaries do not line up.
+        warm_from = max(now - TIER_COOL_SECONDS, now - self.retention_seconds)
         warm_to = now - TIER_HOT_SECONDS
-
-        # Cool tier: 24h-3d → 10 minute buckets
-        cool_from = now - TIER_COOL_SECONDS
-        cool_to = now - TIER_WARM_SECONDS
 
         # Cold tier: 3d-retention → 15 minute buckets
         cold_from = now - self.retention_seconds
@@ -778,78 +700,48 @@ class MetricsRetention:
                         if not exists:
                             continue
 
-                        # Warm tier: aggregate 7h-24h into 1m buckets
-                        try:
-                            deleted, inserted = _aggregate_from_source(
-                                conn, cfg, warm_from, warm_to, BUCKET_1M, "1m")
-                            if deleted or inserted:
+                        if table != "channel_stats_history":
+                            # Raw fallbacks also cover late arrivals and outages.
+                            for from_ts, to_ts, resolution, suffix in (
+                                (warm_from, warm_to, BUCKET_1M, "1m"),
+                                (cold_from, cold_to, BUCKET_15M, "15m"),
+                            ):
+                                try:
+                                    deleted = _aggregate_from_source(
+                                        conn, cfg, from_ts, to_ts, resolution, suffix)
+                                    total_deleted += deleted
+                                    total_aggregated += deleted
+                                except Exception as e:
+                                    logger.warning("Tier %s from raw %s failed: %s", suffix, table, e)
+                            try:
+                                deleted = _aggregate_from_summary(
+                                    conn, cfg, cold_from, cold_to,
+                                    "1m", BUCKET_15M, "15m")
                                 total_deleted += deleted
-                                total_aggregated += inserted
-                                logger.debug("Tier warm: %s consumed %d rows → "
-                                             "%d _1m buckets", table, deleted, inserted)
-                        except Exception as e:
-                            logger.warning("Tier warm %s failed: %s", table, e)
-
-                        # Cool tier: cascade _1m → _10m (24h-3d)
-                        try:
-                            deleted, inserted = _aggregate_from_summary(
-                                conn, cfg, cool_from, cool_to,
-                                "1m", BUCKET_10M, "10m")
-                            if deleted or inserted:
-                                total_deleted += deleted
-                                total_aggregated += inserted
-                                logger.debug("Tier cool: %s consumed %d _1m rows → "
-                                             "%d _10m buckets", table, deleted, inserted)
-                        except Exception as e:
-                            logger.warning("Tier cool %s failed: %s", table, e)
-
-                        # Cool tier fallback: source data older than 24h
-                        # (first run or data that was never in _1m)
-                        try:
-                            deleted, inserted = _aggregate_from_source(
-                                conn, cfg, cool_from, cool_to, BUCKET_10M, "10m")
-                            if deleted or inserted:
-                                total_deleted += deleted
-                                total_aggregated += inserted
-                                logger.debug("Tier cool (source fallback): %s consumed "
-                                             "%d rows → %d _10m buckets",
-                                             table, deleted, inserted)
-                        except Exception as e:
-                            logger.warning("Tier cool fallback %s failed: %s", table, e)
-
-                        # Cold tier: cascade _10m → _15m (3d-8d)
-                        try:
-                            deleted, inserted = _aggregate_from_summary(
-                                conn, cfg, cold_from, cold_to,
-                                "10m", BUCKET_15M, "15m")
-                            if deleted or inserted:
-                                total_deleted += deleted
-                                total_aggregated += inserted
-                                logger.debug("Tier cold: %s consumed %d _10m rows → "
-                                             "%d _15m buckets", table, deleted, inserted)
-                        except Exception as e:
-                            logger.warning("Tier cold %s failed: %s", table, e)
-
-                        # Cold tier fallback: source data older than 3d
-                        # (first run or data that was never in _1m/_10m)
-                        try:
-                            deleted, inserted = _aggregate_from_source(
-                                conn, cfg, cold_from, cold_to, BUCKET_15M, "15m")
-                            if deleted or inserted:
-                                total_deleted += deleted
-                                total_aggregated += inserted
-                                logger.debug("Tier cold (source fallback): %s consumed "
-                                             "%d rows → %d _15m buckets",
-                                             table, deleted, inserted)
-                        except Exception as e:
-                            logger.warning("Tier cold fallback %s failed: %s", table, e)
+                                total_aggregated += deleted
+                            except Exception as e:
+                                logger.warning("Tier cold from 1m %s failed: %s", table, e)
 
                         # Delete from source anything older than retention
                         try:
                             cutoff = now - self.retention_seconds
+                            where = f"{ts_col} < ?"
+                            params = [cutoff]
+                            if table == "channel_stats_history":
+                                # One older baseline per still-retained channel
+                                # preserves its first in-window delta (+ at
+                                # most six rows). Inactive old channels expire.
+                                where += (
+                                    f" AND rowid NOT IN (SELECT rowid FROM ("
+                                    f"SELECT rowid, ROW_NUMBER() OVER (PARTITION BY channel_id "
+                                    f"ORDER BY {ts_col} DESC, rowid DESC) AS newest "
+                                    f"FROM {table} WHERE {ts_col} < ? AND channel_id IN "
+                                    f"(SELECT channel_id FROM {table} WHERE {ts_col} >= ?)) "
+                                    f"WHERE newest = 1)"
+                                )
+                                params.extend([cutoff, cutoff])
                             cur = conn.execute(
-                                f"DELETE FROM {table} WHERE {ts_col} < ?",
-                                (cutoff,)
+                                f"DELETE FROM {table} WHERE {where}", params,
                             )
                             if cur.rowcount > 0:
                                 total_deleted += cur.rowcount
@@ -862,12 +754,12 @@ class MetricsRetention:
                     # Delete expired rows from summary tables too
                     for cfg in configs:
                         cutoff = now - self.retention_seconds
-                        for suffix in ["1m", "10m", "15m"]:
+                        for suffix, resolution in (("1m", BUCKET_1M), ("10m", BUCKET_10M), ("15m", BUCKET_15M)):
                             summary_table = _summary_table_name(cfg["table"], suffix)
                             try:
                                 cur = conn.execute(
-                                    f"DELETE FROM {summary_table} WHERE bucket_ts < ?",
-                                    (cutoff,)
+                                    f"DELETE FROM {summary_table} WHERE bucket_ts + ? <= ?",
+                                    (resolution, cutoff)
                                 )
                                 if cur.rowcount > 0:
                                     total_deleted += cur.rowcount
@@ -917,7 +809,7 @@ class MetricsRetention:
 
         if total_aggregated > 0:
             logger.info("MetricsRetention cleanup complete: %d rows deleted "
-                        "(%d summary buckets written)",
+                        "(%d aggregated into summary tables)",
                         total_deleted, total_aggregated)
         else:
             logger.info("MetricsRetention cleanup pass complete, %d rows deleted",
@@ -965,25 +857,24 @@ class MetricsRetention:
 
 
 _singleton: Optional[MetricsRetention] = None
+_singleton_lock = threading.Lock()
 
 
-def get_retention() -> MetricsRetention:
+def get_retention(config=None) -> MetricsRetention:
     global _singleton
-    if _singleton is None:
-        # Read config if available
-        retention_days = DEFAULT_RETENTION_DAYS
-        try:
-            from repeater import config as _cfg
-            cfg = getattr(_cfg, "CONFIG", None) or {}
-            retention_days = int(
-                cfg.get("storage", {}).get("retention", {}).get("metrics_days",
-                                                               DEFAULT_RETENTION_DAYS)
+    with _singleton_lock:
+        if _singleton is None or (config is not None and not (
+                _singleton._thread and _singleton._thread.is_alive())):
+            storage = (config or {}).get("storage") or {}
+            retention = storage.get("retention") or {}
+            _singleton = MetricsRetention(
+                retention_days=float(retention.get("metrics_days", DEFAULT_RETENTION_DAYS)),
+                db_dir=storage.get("storage_dir") or DB_DIR,
             )
-        except Exception:
-            pass
-        _singleton = MetricsRetention(retention_days=retention_days)
-    return _singleton
+        return _singleton
 
 
-def start():
-    get_retention().start()
+def start(config=None):
+    retention = get_retention(config)
+    retention.start()
+    return retention
