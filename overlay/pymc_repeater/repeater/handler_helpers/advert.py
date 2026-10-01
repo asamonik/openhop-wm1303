@@ -539,7 +539,16 @@ class AdvertHelper:
             advert_data = await self.advert_handler(packet)
             
             if not advert_data or not advert_data.get("valid"):
-                logger.warning("Invalid advert packet received, dropping.")
+                # The handler reports validity without a reason, so log signal
+                # and size context instead. That is what distinguishes a frame
+                # corrupted at the edge of receiver sensitivity (weak rssi, poor
+                # snr) from a structurally wrong advert arriving at a healthy
+                # signal level, which points at a peer or firmware problem.
+                _adv_payload = getattr(packet, "payload", None)
+                logger.warning(
+                    "Invalid advert packet received, dropping (rssi=%s snr=%s payload=%sB)",
+                    rssi, snr,
+                    len(_adv_payload) if _adv_payload is not None else "?")
                 packet.mark_do_not_retransmit()
                 packet.drop_reason = "Invalid advert packet"
                 return

@@ -2267,14 +2267,7 @@ class WM1303API:
     # -- tx_queues --------------------------------------------------------------
     def _tx_queues_get(self):
         """Return TX queue status for all channels (RF1 via PULL_RESP)."""
-        try:
-            import urllib.request, json as _json2
-            _resp = urllib.request.urlopen('http://127.0.0.1:8000/api/status', timeout=2)
-            _api_data = _json2.loads(_resp.read())
-        except Exception:
-            _api_data = {}
-
-        # Get TX queue stats via direct backend reference
+        # Primary source: direct backend reference.
         tx_stats = {}
         try:
             _bk = _get_backend()
@@ -2283,16 +2276,29 @@ class WM1303API:
         except Exception as e:
             logger.debug("tx_queues: could not get stats from backend: %s", e)
 
-        # If we couldn't get stats from the backend, try the status API
+        # Fallback: query the local status API, but ONLY when the direct backend
+        # reference yielded nothing.
+        #
+        # This request used to run unconditionally at the top of the handler on
+        # every poll. /api/status requires a bearer token, the loopback call
+        # sends none, so each poll produced an "Unauthorized access attempt to
+        # /api/status" warning in the journal while the result was discarded in
+        # the common path anyway (the backend reference had already supplied the
+        # stats). Making the fallback lazy removes the per-poll 401 and keeps the
+        # synchronous loopback request -- including its 2s timeout -- out of the
+        # request handler unless it is actually needed.
         if not tx_stats:
             try:
+                import urllib.request, json as _json2
+                _resp = urllib.request.urlopen('http://127.0.0.1:8000/api/status', timeout=2)
+                _api_data = _json2.loads(_resp.read())
                 if isinstance(_api_data, dict):
                     _d = _api_data.get('data', _api_data)
                     _tx_info = _d.get('tx_stats', {}).get('tx_queues', {})
                     if _tx_info:
                         tx_stats = _tx_info
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("tx_queues: status-API fallback unavailable: %s", e)
 
         # Build response with channel info from SSOT
         _CHANNEL_ID_BY_INDEX = ['channel_a', 'channel_b', 'channel_c', 'channel_d']

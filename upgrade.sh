@@ -1632,20 +1632,53 @@ fi
 # metrics retention is handled by repeater/metrics_retention.py (8-day window).
 step "Installing systemd-journald limits drop-in"
 JOURNALD_DROPIN_DIR="/etc/systemd/journald.conf.d"
-JOURNALD_DROPIN="${JOURNALD_DROPIN_DIR}/10-openhop.conf"
+# LOAD-ORDER CRITICAL filename -- see the matching comment in install.sh.
+# systemd sorts journald drop-ins by filename across /etc, /run and /usr/lib and
+# the LAST value for a key wins. Raspberry Pi OS ships
+# 40-rpi-volatile-storage.conf (Storage=volatile) and syslog.conf
+# (ForwardToSyslog=yes) under /usr/lib. The pre-v2.7.7 name 10-openhop.conf
+# sorted before both, so Storage=persistent never took effect and every reboot
+# wiped the journal. zz- sorts after any numeric prefix and after syslog.conf.
+JOURNALD_DROPIN="${JOURNALD_DROPIN_DIR}/zz-openhop.conf"
+JOURNALD_DROPIN_LEGACY="${JOURNALD_DROPIN_DIR}/10-openhop.conf"
 if [ -f "${SCRIPT_DIR}/config/journald-openhop.conf" ]; then
+    JOURNALD_CHANGED=0
+    # Remove the superseded name FIRST and unconditionally. A device upgraded
+    # twice could otherwise keep 10-openhop.conf next to an already-current
+    # zz-openhop.conf, which the cmp branch below would report as "up to date"
+    # while two drop-ins stayed in place.
+    if [ -f "${JOURNALD_DROPIN_LEGACY}" ]; then
+        rm -f "${JOURNALD_DROPIN_LEGACY}" >> "${LOG_FILE}" 2>&1
+        JOURNALD_CHANGED=1
+        ok "Removed superseded ${JOURNALD_DROPIN_LEGACY}"
+    fi
     if [ -f "${JOURNALD_DROPIN}" ] && cmp -s "${SCRIPT_DIR}/config/journald-openhop.conf" "${JOURNALD_DROPIN}"; then
-        ok "Already up to date"
+        ok "Drop-in already up to date"
     else
         mkdir -p "${JOURNALD_DROPIN_DIR}"
         cp "${SCRIPT_DIR}/config/journald-openhop.conf" "${JOURNALD_DROPIN}" >> "${LOG_FILE}" 2>&1
         chmod 644 "${JOURNALD_DROPIN}"
+        JOURNALD_CHANGED=1
+        ok "Installed ${JOURNALD_DROPIN} (SystemMaxUse=200M, MaxRetentionSec=8day)"
+    fi
+    if [ "${JOURNALD_CHANGED}" -eq 1 ]; then
         if systemctl restart systemd-journald >> "${LOG_FILE}" 2>&1; then
-            ok "Installed ${JOURNALD_DROPIN} (SystemMaxUse=200M, MaxRetentionSec=8day)"
+            ok "journald restarted"
         else
             warn "Drop-in installed but journald restart failed (applies after reboot)"
         fi
+        journalctl --flush >> "${LOG_FILE}" 2>&1 || warn "journal flush failed (non-fatal)"
         journalctl --vacuum-size=200M >> "${LOG_FILE}" 2>&1 || warn "journal vacuum failed (non-fatal)"
+    fi
+    step "Verifying effective journal storage"
+    # Read the MERGED configuration, not our own drop-in: only the last
+    # Storage= line is in effect. grep is guarded because a non-matching grep
+    # would abort the script under 'set -euo pipefail'.
+    EFFECTIVE_STORAGE=$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null | grep -E "^Storage=" | tail -1 || true)
+    if [ "${EFFECTIVE_STORAGE}" = "Storage=persistent" ]; then
+        ok "Journal storage is persistent (logs survive a reboot)"
+    else
+        warn "Effective journal storage is '${EFFECTIVE_STORAGE:-unset}', expected persistent - drop-in load-order conflict"
     fi
 else
     warn "config/journald-openhop.conf not found; skipped journal limits"
@@ -2063,6 +2096,32 @@ def migrate(db_path):
                 changes.append("added " + table + "." + column)
             except Exception as e:
                 pass  # column may already exist
+
+    # --- Drop retired legacy columns ---
+    # Script versions up to v2.7.6 migrated 'pkt_count' back into
+    # channel_stats_history (see the note in col_migrations above). On every
+    # device upgraded by one of those versions the column is still present and
+    # permanently NULL, which is the schema shape the stale-DB quarantine
+    # classifies as corrupt. Removing the column from the migration list stops
+    # new installs from getting it but does not clean up existing ones, so drop
+    # it here as well.
+    #
+    # Guard: only drop when the column holds no data whatsoever, so a database
+    # that unexpectedly does contain values is never altered. ALTER TABLE ...
+    # DROP COLUMN needs SQLite 3.35+ (2021); on older runtimes this raises and
+    # the column is simply left in place.
+    if has_column('channel_stats_history', 'pkt_count'):
+        try:
+            filled = cur.execute(
+                "SELECT COUNT(pkt_count) FROM channel_stats_history").fetchone()[0]
+            if filled == 0:
+                cur.execute("ALTER TABLE channel_stats_history DROP COLUMN pkt_count")
+                changes.append("dropped legacy channel_stats_history.pkt_count")
+            else:
+                changes.append("kept channel_stats_history.pkt_count ("
+                               + str(filled) + " non-NULL rows)")
+        except Exception as e:
+            pass  # SQLite < 3.35, or the column is in use; harmless to keep
 
     # --- Create indexes ---
     indexes = [

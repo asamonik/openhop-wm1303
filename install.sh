@@ -1584,11 +1584,30 @@ phase "Journal Log Management"
 
 step "Installing systemd-journald limits drop-in"
 JOURNALD_DROPIN_DIR="/etc/systemd/journald.conf.d"
-JOURNALD_DROPIN="${JOURNALD_DROPIN_DIR}/10-openhop.conf"
+# The drop-in filename is LOAD-ORDER CRITICAL. systemd merges journald drop-ins
+# by sorting filenames across ALL search directories (/etc, /run, /usr/lib) and
+# the LAST value read for a key wins. Raspberry Pi OS ships two drop-ins that
+# collide with ours:
+#   /usr/lib/systemd/journald.conf.d/40-rpi-volatile-storage.conf -> Storage=volatile
+#   /usr/lib/systemd/journald.conf.d/syslog.conf                  -> ForwardToSyslog=yes
+# Up to and including v2.7.6 this file was installed as 10-openhop.conf, which
+# sorts BEFORE both, so Storage=persistent and ForwardToSyslog=no were silently
+# discarded on every boot while the size/retention keys applied normally. The
+# journal therefore stayed in /run/log/journal (tmpfs) and every reboot erased
+# all evidence. Note that /etc only takes precedence over /usr/lib for an
+# IDENTICAL filename, so a higher-sorting name is required: zz- sorts after any
+# numeric prefix and after syslog.conf.
+JOURNALD_DROPIN="${JOURNALD_DROPIN_DIR}/zz-openhop.conf"
+JOURNALD_DROPIN_LEGACY="${JOURNALD_DROPIN_DIR}/10-openhop.conf"
 if [ -f "${SCRIPT_DIR}/config/journald-openhop.conf" ]; then
     mkdir -p "${JOURNALD_DROPIN_DIR}"
     cp "${SCRIPT_DIR}/config/journald-openhop.conf" "${JOURNALD_DROPIN}" >> "${LOG_FILE}" 2>&1
     chmod 644 "${JOURNALD_DROPIN}"
+    # Never let the superseded name coexist with the current one.
+    if [ -f "${JOURNALD_DROPIN_LEGACY}" ]; then
+        rm -f "${JOURNALD_DROPIN_LEGACY}" >> "${LOG_FILE}" 2>&1
+        ok "Removed superseded ${JOURNALD_DROPIN_LEGACY}"
+    fi
     ok "Installed ${JOURNALD_DROPIN} (SystemMaxUse=200M, MaxRetentionSec=8day)"
     step "Restarting systemd-journald to apply limits"
     if systemctl restart systemd-journald >> "${LOG_FILE}" 2>&1; then
@@ -1596,6 +1615,18 @@ if [ -f "${SCRIPT_DIR}/config/journald-openhop.conf" ]; then
     else
         warn "journald restart failed (limits apply after reboot)"
     fi
+    step "Verifying effective journal storage"
+    # Only the LAST Storage= line of the merged configuration is in effect, so
+    # read the merged view rather than our own drop-in. grep must be guarded:
+    # under 'set -euo pipefail' a non-matching grep would abort the installer.
+    EFFECTIVE_STORAGE=$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null | grep -E "^Storage=" | tail -1 || true)
+    if [ "${EFFECTIVE_STORAGE}" = "Storage=persistent" ]; then
+        ok "Journal storage is persistent (logs survive a reboot)"
+    else
+        warn "Effective journal storage is '${EFFECTIVE_STORAGE:-unset}', expected persistent - drop-in load-order conflict"
+    fi
+    step "Flushing journal to persistent storage"
+    journalctl --flush >> "${LOG_FILE}" 2>&1 || warn "journal flush failed (non-fatal)"
     step "Vacuuming existing journal to the new size limit"
     journalctl --vacuum-size=200M >> "${LOG_FILE}" 2>&1 || warn "journal vacuum failed (non-fatal)"
     ok "Journal within size limit"
