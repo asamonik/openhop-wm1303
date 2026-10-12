@@ -1436,6 +1436,7 @@ class RepeaterHandler(BaseHandler):
                 "node_name": repeater_config.get("node_name", "Unknown"),
                 "repeater": {
                     "mode": repeater_config.get("mode", "forward"),
+                    "owner_info": repeater_config.get("owner_info", ""),
                     "use_score_for_tx": repeater_config.get("use_score_for_tx", False),
                     "score_threshold": repeater_config.get("score_threshold", 0.3),
                     "send_advert_interval_hours": repeater_config.get(
@@ -1475,6 +1476,16 @@ class RepeaterHandler(BaseHandler):
         }
         # Add airtime stats
         stats.update(self.airtime_mgr.get_stats())
+        # Utilization is a percentage of the configured allowance. Duty is a
+        # percentage of elapsed time; keep both so downstream clients can label
+        # them correctly without changing the TX enforcement budget.
+        stats['tx_duty_pct'] = round(stats.get('current_airtime_ms', 0) / 600, 3)
+        stats['duty_window_seconds'] = 60
+        get_duty = getattr(radio, 'get_duty_cycle_stats', None)
+        if callable(get_duty):
+            duty = get_duty()
+            stats.update({key: duty[key] for key in (
+                'tx_duty_pct', 'rx_duty_pct', 'rx_availability_pct')})
         return stats
 
     def _start_background_tasks(self):

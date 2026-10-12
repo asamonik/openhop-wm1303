@@ -1053,6 +1053,9 @@ class WM1303Backend:
         # Per-channel TX timing statistics (updated after each TX)
         self._channel_tx_stats: dict[str, dict] = {}
         self._start_time = time.time()  # for duty cycle calculation
+        # One bin per second/channel bounds memory independently of packet rate.
+        self._duty_bins = {}
+        self._duty_lock = threading.Lock()
 
         # TODO #7: cumulative counter baseline restored from the last DB
         # snapshot by _restore_channel_stats_baseline(). Initialised empty here
@@ -3750,7 +3753,8 @@ class WM1303Backend:
                 self._rssi_spike_count = 0    # reset RSSI spike monitor on valid RX
                 self._consecutive_crash_count = 0  # reset SX1261 escalation on valid RX
                 self._consecutive_watchdog_restarts = 0  # Issue #11.1: reset auto-escalation on valid RX
-                self._update_rx_stats(cid, freq_hz, rssi, snr)
+                self._update_rx_stats(cid, freq_hz, rssi, snr,
+                                      self._rx_airtime_ms(rxpk, payload, ccfg))
                 # TX batch hold: dynamic delay based on queue depth
                 _dynamic_hold = self._calculate_dynamic_tx_hold()
                 if _dynamic_hold > 0:
@@ -3794,7 +3798,8 @@ class WM1303Backend:
                     and rx_sf == int(_che.get('spreading_factor', 8))):
                 try:
                     self._channel_e_rx_callback(payload, rssi=int(rssi), snr=snr)
-                    self._update_rx_stats("channel_e", freq_hz, rssi, snr)
+                    self._update_rx_stats("channel_e", freq_hz, rssi, snr,
+                                          self._rx_airtime_ms(rxpk, payload, _che))
                     logger.info("WM1303Backend: RX->channel_e freq=%d %d bytes rssi=%.1f snr=%.1f",
                                 freq_hz, len(payload), rssi, snr)
                     self._last_rx_timestamp = time.monotonic()
@@ -3822,7 +3827,8 @@ class WM1303Backend:
                     and (rx_sf == 0 or rx_sf == _chf_sf)):
                 try:
                     self._channel_f_rx_callback(payload, rssi=int(rssi), snr=snr)
-                    self._update_rx_stats("channel_f", freq_hz, rssi, snr)
+                    self._update_rx_stats("channel_f", freq_hz, rssi, snr,
+                                          self._rx_airtime_ms(rxpk, payload, self._channel_f_config_cache))
                     logger.info("WM1303Backend: RX->channel_f freq=%d SF%d BW%dkHz %d bytes rssi=%.1f snr=%.1f",
                                 freq_hz, rx_sf or _chf_sf, _chf_bw // 1000,
                                 len(payload), rssi, snr)
@@ -3970,6 +3976,7 @@ class WM1303Backend:
                          airtime_ms: float, wait_ms: float,
                          payload_len: int) -> None:
         """Update per-channel TX timing statistics."""
+        self._record_duty_airtime(channel_id, 'tx', airtime_ms)
         if channel_id not in self._channel_tx_stats:
             self._channel_tx_stats[channel_id] = {
                 "tx_packets": 0,
@@ -4728,9 +4735,62 @@ class WM1303Backend:
         self._schedule_heartbeat()  # schedule next heartbeat
 
 
+    @staticmethod
+    def _rx_airtime_ms(rxpk, payload, config):
+        """Use the received modulation, including multi-SF observations."""
+        sf, bw = _parse_datr(rxpk.get('datr', ''))
+        cr = rxpk.get('codr', config.get('coding_rate', '4/5'))
+        cr = int(cr.split('/')[-1]) if isinstance(cr, str) else int(cr)
+        return estimate_lora_airtime_ms(
+            len(payload), sf=sf, bw_hz=bw, cr=cr,
+            preamble=int(config.get('preamble_length', 17)),
+            crc_on=bool(config.get('crc_enabled', True)))
+
+    def _record_duty_airtime(self, channel_id, direction, airtime_ms):
+        if not math.isfinite(airtime_ms) or airtime_ms < 0:
+            return
+        now = time.monotonic()
+        second = int(now)
+        with self._duty_lock:
+            bins = self._duty_bins.setdefault(channel_id, collections.deque())
+            while bins and bins[0][0] <= now - 60:
+                bins.popleft()
+            if not bins or bins[-1][0] != second:
+                bins.append([second, 0.0, 0.0])
+            bins[-1][1 if direction == 'rx' else 2] += airtime_ms
+
+    def get_duty_cycle_stats(self):
+        """Packet airtime / 60 seconds, distinct from duty-budget utilization.
+
+        RX sums received airtime across channels and can exceed 100% when
+        channels receive simultaneously. RX availability estimates only the
+        time not occupied by TX; it does not measure hardware receive uptime.
+        """
+        now = time.monotonic()
+        channels = {}
+        with self._duty_lock:
+            for channel_id, bins in self._duty_bins.items():
+                while bins and bins[0][0] <= now - 60:
+                    bins.popleft()
+                rx_ms = sum(row[1] for row in bins)
+                tx_ms = sum(row[2] for row in bins)
+                channels[channel_id] = {
+                    'rx_airtime_ms': round(rx_ms, 3),
+                    'tx_airtime_ms': round(tx_ms, 3),
+                    'rx_duty_pct': round(rx_ms / 600, 3),
+                    'tx_duty_pct': round(tx_ms / 600, 3),
+                }
+        rx_ms = sum(row['rx_airtime_ms'] for row in channels.values())
+        tx_ms = sum(row['tx_airtime_ms'] for row in channels.values())
+        return {'window_seconds': 60, 'channels': channels,
+                'rx_duty_pct': round(rx_ms / 600, 3),
+                'tx_duty_pct': round(tx_ms / 600, 3),
+                'rx_availability_pct': round(max(0, 100 - tx_ms / 600), 3)}
+
     def _update_rx_stats(self, channel_id: str, freq_hz: int,
-                         rssi: float, snr: float) -> None:
+                         rssi: float, snr: float, airtime_ms: float = 0) -> None:
         """Update per-channel RX statistics."""
+        self._record_duty_airtime(channel_id, 'rx', airtime_ms)
         if channel_id not in self._channel_rx_stats:
             self._channel_rx_stats[channel_id] = {
                 "rx_count": 0, "last_rssi": -120.0, "last_snr": 0.0,
@@ -5057,20 +5117,17 @@ class WM1303Backend:
         tx_stats = {}
         if self._tx_queue_manager:
             tx_stats = self._tx_queue_manager.get_status()
+        duty = self.get_duty_cycle_stats()['channels']
         all_chs = set(list(self._channel_rx_stats.keys()) + list(tx_stats.keys()))
         for ch_id in all_chs:
             rx = self._channel_rx_stats.get(ch_id, {})
             tx = tx_stats.get(ch_id, {})
             tx_timing = self._channel_tx_stats.get(ch_id, {})
             rc = rx.get("rx_count", 0)
-            # Calculate uptime-based duty cycle
-            uptime_s = time.time() - self._start_time if self._start_time else 1
-            total_airtime_s = tx_timing.get("total_airtime_ms", 0) / 1000.0
-            duty_pct = round((total_airtime_s / uptime_s) * 100, 3) if uptime_s > 0 else 0
             # TODO #7: continue cumulative totals across service restarts.
             # Only monotonic counters get the restored offset; rssi_avg /
             # snr_avg describe recent reception (see below) and tx_duty_pct is
-            # computed from live airtime over live uptime, so adding historical
+            # computed from airtime over the last 60 seconds, so adding historical
             # airtime would misreport the duty cycle.
             _base = self._stats_baseline.get(ch_id, {})
             # TODO #233: rolling-window average instead of the lifetime mean.
@@ -5112,7 +5169,9 @@ class WM1303Backend:
                 "total_tx_wait_ms": tx_timing.get("total_wait_ms", 0),
                 "tx_bytes": tx_timing.get("tx_bytes", 0) + _base.get("tx_bytes", 0),
                 "tx_bytes_session": tx_timing.get("tx_bytes", 0),
-                "tx_duty_pct": duty_pct,
+                "tx_duty_pct": duty.get(ch_id, {}).get('tx_duty_pct', 0),
+                "rx_duty_pct": duty.get(ch_id, {}).get('rx_duty_pct', 0),
+                "duty_window_seconds": 60,
                 # Software LBT stats (totals restored across restart)
                 "lbt_blocked": tx.get("lbt_blocked", 0) + _base.get("lbt_blocked", 0),
                 "lbt_blocked_session": tx.get("lbt_blocked", 0),

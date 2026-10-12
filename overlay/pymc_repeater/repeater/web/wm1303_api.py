@@ -241,7 +241,12 @@ def _backup_config(path: Path):
     dest = path.parent / '{}{}.{}'.format(
         path.name, _CONFIG_BACKUP_SUFFIX, time.strftime('%Y%m%d_%H%M%S'))
     try:
-        dest.write_bytes(path.read_bytes())
+        previous = path.read_bytes()
+        with dest.open('wb') as backup:
+            # Configs can contain credentials: set the source permissions
+            # before publishing any bytes, rather than using the process umask.
+            os.fchmod(backup.fileno(), path.stat().st_mode & 0o777)
+            backup.write(previous)
     except OSError as e:
         logger.warning('_backup_config: could not back up %s: %s', path, e)
         return None
@@ -976,6 +981,9 @@ class WM1303API:
             if method == "GET":
                 return self._tx_queues_get()
 
+        if resource == "duty_cycle_history" and method == "GET":
+            return self._duty_cycle_history(**params)
+
         # -- spectrum --
         if resource == "spectrum":
             if method == "GET":
@@ -1636,6 +1644,8 @@ class WM1303API:
                 'total_tx_send_ms': ch_st.get('total_tx_send_ms', 0),
                 'tx_bytes': ch_st.get('tx_bytes', 0),
                 'tx_duty_pct': ch_st.get('tx_duty_pct', 0),
+                'rx_duty_pct': ch_st.get('rx_duty_pct', 0),
+                'duty_window_seconds': 60,
                 # Software LBT stats (prefer tx_queue stats, fallback to backend stats)
                 'lbt_blocked': ch_tx.get('lbt_blocked', 0) or ch_st.get('lbt_blocked', 0),
                 'lbt_passed': ch_tx.get('lbt_passed', 0) or ch_st.get('lbt_passed', 0),
@@ -1679,7 +1689,7 @@ class WM1303API:
             _che_rssi, _che_rssi_avg, _che_snr = _rx_signal(ch_e_st)
             _che_nf, _che_nf_timestamp, _che_nf_source = _find_noise(_che_freq, ch_e_tx)
             _che_total_airtime_ms = ch_e_st.get("total_tx_airtime_ms", 0)
-            _che_duty = round((_che_total_airtime_ms / 1000.0 / uptime_seconds) * 100, 3) if uptime_seconds > 0 else 0
+            _che_duty = ch_e_st.get('tx_duty_pct', 0)
             channels_live.append({
                 "name": _che_ui.get("name", _che_ui.get("friendly_name", "Channel E")),
                 "friendly_name": _che_ui.get("friendly_name", "Channel E"),
@@ -1707,6 +1717,8 @@ class WM1303API:
                 "total_tx_send_ms": ch_e_st.get("total_tx_send_ms", 0),
                 "tx_bytes": ch_e_st.get("tx_bytes", 0),
                 "tx_duty_pct": _che_duty,
+                "rx_duty_pct": ch_e_st.get('rx_duty_pct', 0),
+                "duty_window_seconds": 60,
                 "lbt_blocked": ch_e_tx.get("lbt_blocked", 0) or ch_e_st.get("lbt_blocked", 0),
                 "lbt_passed": ch_e_tx.get("lbt_passed", 0) or ch_e_st.get("lbt_passed", 0),
                 "lbt_skipped": ch_e_tx.get("lbt_skipped", 0) or ch_e_st.get("lbt_skipped", 0),
@@ -1742,7 +1754,7 @@ class WM1303API:
             _chf_rssi, _chf_rssi_avg, _chf_snr = _rx_signal(ch_f_st)
             _chf_nf, _chf_nf_timestamp, _chf_nf_source = _find_noise(_chf_freq, ch_f_tx)
             _chf_total_airtime_ms = ch_f_st.get("total_tx_airtime_ms", 0)
-            _chf_duty = round((_chf_total_airtime_ms / 1000.0 / uptime_seconds) * 100, 3) if uptime_seconds > 0 else 0
+            _chf_duty = ch_f_st.get('tx_duty_pct', 0)
             channels_live.append({
                 "name": _chf_ui.get("name", _chf_ui.get("friendly_name", "Channel F")),
                 "friendly_name": _chf_ui.get("friendly_name", "Channel F"),
@@ -1770,6 +1782,8 @@ class WM1303API:
                 "total_tx_send_ms": ch_f_st.get("total_tx_send_ms", 0),
                 "tx_bytes": ch_f_st.get("tx_bytes", 0),
                 "tx_duty_pct": _chf_duty,
+                "rx_duty_pct": ch_f_st.get('rx_duty_pct', 0),
+                "duty_window_seconds": 60,
                 "lbt_blocked": ch_f_tx.get("lbt_blocked", 0) or ch_f_st.get("lbt_blocked", 0),
                 "lbt_passed": ch_f_tx.get("lbt_passed", 0) or ch_f_st.get("lbt_passed", 0),
                 "lbt_skipped": ch_f_tx.get("lbt_skipped", 0) or ch_f_st.get("lbt_skipped", 0),
@@ -1800,6 +1814,7 @@ class WM1303API:
         return _j({
             "channels": channels_live,
             "uptime_seconds": uptime_seconds,
+            "duty_cycle": _bk.get_duty_cycle_stats() if _bk else None,
             "total_rx": sum(channel['rx_packets'] for channel in channels_live),
             "total_tx": sum(channel['tx_packets'] for channel in channels_live),
             "timestamp": _t.time(),
@@ -2437,6 +2452,54 @@ class WM1303API:
         })
 
     # -- spectrum ----------------------------------------------------------
+    def _duty_cycle_history(self, hours='1', **params):
+        """TX airtime / elapsed bucket time from retention-safe radio snapshots.
+
+        Cumulative snapshots include every TX consumer. Missing observations
+        stay gaps rather than fabricated zeros.
+        """
+        try:
+            hours = int(hours)
+        except (ValueError, TypeError):
+            raise cherrypy.HTTPError(400, 'hours must be an integer')
+        if hours not in (1, 6, 12, 24, 72, 168):
+            raise cherrypy.HTTPError(400, 'hours must be 1, 6, 12, 24, 72, or 168')
+        now = time.time()
+        since = now - hours * 3600
+        with _db_conn(_DB_PATH) as conn:
+            rows = tiered_channel_stats_query(
+                conn, None, since, now, auto_bucket_seconds(hours),
+                columns=['total_tx_airtime_ms', 'sample_count'])
+        channels = {}
+        totals = {}
+        for row in rows:
+            airtime = row.get('total_tx_airtime_ms')
+            if airtime is None:
+                continue
+            width = row['bucket_seconds']
+            ts = row['bucket_ts']
+            point = {'t': ts, 'bucket_seconds': width,
+                     'tx_airtime_ms': airtime,
+                     'tx_duty_pct': round(airtime / (width * 10), 3)}
+            channels.setdefault(row['channel_id'], []).append(point)
+            total = totals.setdefault(ts, {'t': ts, 'bucket_seconds': width, 'tx_airtime_ms': 0})
+            total['tx_airtime_ms'] += airtime
+        total_points = []
+        for point in sorted(totals.values(), key=lambda item: item['t']):
+            point['tx_duty_pct'] = round(point['tx_airtime_ms'] / (point['bucket_seconds'] * 10), 3)
+            total_points.append(point)
+        ui = _load_ui()
+        names = {'channel_' + chr(97 + i): ch.get('name') or ch.get('friendly_name') or 'Channel ' + chr(65 + i)
+                 for i, ch in enumerate(ui.get('channels', []))}
+        for key, label in (('channel_e', 'Channel E'), ('channel_f', 'Channel F')):
+            names[key] = ui.get(key, {}).get('name') or ui.get(key, {}).get('friendly_name') or label
+        return _j({'hours': hours, 'start_time': since, 'end_time': now,
+                   'channels': [{'id': key, 'label': names.get(key, key), 'data': data}
+                                for key, data in sorted(channels.items())],
+                   'data': total_points,
+                   'interval_tx_duty_pct': round(sum(point['tx_airtime_ms'] for point in total_points) / (hours * 36000), 3) if total_points else None,
+                   'note': 'TX airtime divided by elapsed time, estimated from channel snapshots. Missing observations are gaps; boundary buckets are approximate.'})
+
     def _spectrum_get(self):
         conf = _load_global_conf()
         sx = conf.get("SX130x_conf", {})
@@ -2482,6 +2545,9 @@ class WM1303API:
             "radio_1_freq_mhz": round(rf[1] / 1e6, 4),
             "sx1261_spi": sx1261.get("spi_path", _load_ui().get("spi_devices", {}).get("sx1261_spi_path", "/dev/spidev0.1")),
             "spectral_scan_enabled": spec_scan.get("enable", False),
+            "spectral_scan_requested": bool(_load_ui().get('spectral_scan', {}).get('enabled', False)),
+            "scan_pace_seconds": spec_scan.get('pace_s', 300),
+            "scan_channel_count": spec_scan.get('nb_chan', 0),
             "lbt_enabled": lbt.get("enable", False),
             "lbt_channels": [
                 {"freq_mhz": round(ch["freq_hz"] / 1e6, 4), "bw_khz": ch["bandwidth"] // 1000}
@@ -2510,15 +2576,22 @@ class WM1303API:
         if action == "toggle":
             enable = _request_bool(body.get("enable", False), "enable")
             ok = _toggle_spectral_scan(enable)
+            restarted = False
+            restart_error = None
             if ok:
                 try:
-                    subprocess.run(
-                        ["sudo", "systemctl", "restart", _SVC_NAME],
+                    result = subprocess.run(
+                        ["sudo", "systemctl", "--no-block", "restart", _SVC_NAME],
                         capture_output=True, timeout=15
                     )
-                except Exception:
-                    pass
-            return _j({"status": "ok" if ok else "error", "enabled": enable})
+                    restarted = result.returncode == 0
+                    if not restarted:
+                        restart_error = 'Service restart failed; restart the repeater to apply the saved scan setting.'
+                except Exception as exc:
+                    restart_error = str(exc)
+            return _j({"status": "ok" if ok else "error", "enabled": enable,
+                       "saved": ok, "restart_required": ok and not restarted,
+                       "restart_error": restart_error})
         if action == "lbt_test":
             sx = self._get_sx1261()
             if sx and getattr(sx, '_initialized', False):
@@ -2552,9 +2625,19 @@ class WM1303API:
                 data = json.loads(_SPECTRAL_RES.read_text())
                 measured = data.get('channels', {})
                 if isinstance(measured, dict):
-                    points = [{'freq_mhz': int(freq) / 1e6, 'rssi_dbm': float(sample['rssi_avg'])}
-                              for freq, sample in measured.items()
-                              if isinstance(sample, dict) and sample.get('rssi_avg') is not None]
+                    for freq, sample in measured.items():
+                        if not isinstance(sample, dict):
+                            continue
+                        try:
+                            rssi = sample.get('rssi_avg')
+                            samples = sample.get('samples', 1)
+                            if (isinstance(rssi, bool) or isinstance(samples, bool)
+                                    or not math.isfinite(float(rssi))
+                                    or not math.isfinite(float(samples)) or float(samples) <= 0):
+                                continue
+                            points.append({'freq_mhz': int(freq) / 1e6, 'rssi_dbm': float(rssi)})
+                        except (ValueError, TypeError):
+                            continue
                     if points:
                         observed_at = data.get('timestamp')
                         note = 'Latest available HAL spectral measurements'
@@ -2574,7 +2657,13 @@ class WM1303API:
             except Exception as exc:
                 logger.debug('Cannot read spectrum history: %s', exc)
         start, stop, step, region = _get_spectrum_scan_range()
+        scan = _load_global_conf().get('SX130x_conf', {}).get('sx1261_conf', {}).get('spectral_scan', {})
+        scan_start, count = scan.get('freq_start'), scan.get('nb_chan')
+        if isinstance(scan_start, (int, float)) and isinstance(count, (int, float)) and scan_start > 0 and count > 0:
+            start, stop, step = scan_start, scan_start + count * 200000, 200000
         points = [point for point in points if start <= point['freq_mhz'] * 1e6 <= stop]
+        if not points:
+            observed_at = None
         return _j({
             'status': 'ok' if points else 'unavailable',
             'timestamp': observed_at,

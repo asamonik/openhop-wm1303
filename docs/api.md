@@ -162,9 +162,42 @@ Toggle a bridge rule enabled/disabled.
 
 ## Spectrum / Noise Floor Endpoints
 
+### GET `/api/wm1303/duty_cycle_history?hours=1`
+
+Accepts `hours=1|6|12|24|72|168`. Returns `data` for total TX duty and `channels`
+for each historical channel. Points include `t`, `bucket_seconds`,
+`tx_airtime_ms`, and `tx_duty_pct` (airtime divided by bucket duration).
+`interval_tx_duty_pct` is recorded airtime divided by the selected interval;
+it is null when no measurements are available. Cumulative snapshots include
+every TX consumer and retain counter resets. Missing snapshots are gaps.
+
+`GET /api/stats` exposes `tx_duty_pct`, WM1303 `rx_duty_pct`,
+`rx_availability_pct`, and `duty_window_seconds=60`. Existing
+`utilization_percent` retains its meaning as percentage of the TX allowance
+used. `GET /api/wm1303/channels/live` exposes the same global metrics under
+`duty_cycle`, alongside per-channel RX/TX duty.
+
+`GET /api/packet_by_id` and `/api/packet_by_hash` include `scope` and
+`scope_known`. An unresolved or ambiguous scope is `unknown scope`; transport
+keys are never returned with packet details.
+
+`GET /api/repeater_info` returns only public `node_name`, `owner_info`,
+`latitude`, `longitude`, and `max_owner_info_bytes=115`. Save these fields
+through `POST /api/update_radio_config`. `owner_info` accepts an empty string
+to remove the saved text. This scoped save preserves unrelated pending settings
+and reports whether live application succeeded or a restart is required.
+
 ### GET `/api/wm1303/spectrum`
 
 Returns current spectral scan data for all channels.
+
+The response also includes `spectral_scan_requested`, `scan_pace_seconds`, and
+`scan_channel_count`. Enable/disable scans with
+`POST /api/wm1303/spectrum {"action":"toggle","enable":true|false}`. This
+saves the SSOT setting and restarts the service. A failed restart is reported
+with `restart_required` and `restart_error` while preserving the saved setting.
+`{"action":"scan"}` refreshes available HAL readings without initiating an
+immediate hardware sweep. Zero-sample and invalid RSSI readings are excluded.
 
 **Response includes:**
 - Per-channel RSSI values

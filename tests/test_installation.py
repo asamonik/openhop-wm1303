@@ -76,6 +76,20 @@ class OverlayDeploymentTests(unittest.TestCase):
 
 
 class InstallerControlFlowTests(unittest.TestCase):
+    def test_version_messages_read_checkouts_with_spaces(self):
+        with tempfile.TemporaryDirectory(prefix="wm1303 checkout ") as directory:
+            (Path(directory) / "VERSION").write_text("2.7.7\n")
+            for name in ("install.sh", "upgrade.sh"):
+                with self.subTest(script=name):
+                    line = next(line for line in (ROOT / name).read_text().splitlines()
+                                if line.lstrip().startswith('ok "v$(cat '))
+                    result = subprocess.run(
+                        ["bash", "-eu", "-c", 'ok() { printf "%s\\n" "$1"; }\n' + line],
+                        env=dict(os.environ, SCRIPT_DIR=directory),
+                        check=True, capture_output=True, text=True,
+                    )
+                    self.assertEqual(result.stdout, "v2.7.7\n")
+
     def test_upgrade_repairs_missing_repeater_distribution_without_source_changes(self):
         source = (ROOT / "upgrade.sh").read_text()
         source = source.split("    # A runnable Python alone", 1)[1].split("fi  # end VENV_REBUILD_NEEDED", 1)[0]

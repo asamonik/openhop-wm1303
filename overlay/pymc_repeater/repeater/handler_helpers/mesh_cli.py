@@ -645,11 +645,12 @@ class MeshCLI:
         # Companion apps query "owner.info" via TXT_MSG CLI 'get' command.
         # Upstream pymc_repeater does not implement this key, so it falls
         # through to '??: <key>' which the companion displays literally.
-        # We build the value dynamically from runtime device info so each
-        # repeater reports its own hardware/version. Hard-capped at 115 chars.
+        # Prefer saved public owner information; keep runtime device info as
+        # the fallback for nodes without a configured owner.
         # Companion apps use '|' as a line separator inside the value.
         elif param == "owner.info":
-            return f"> {_build_dynamic_owner_info(max_len=115)}"
+            owner = self.repeater_config.get('owner_info', '')
+            return f"> {owner.replace(chr(10), '|') if owner else _build_dynamic_owner_info(max_len=115)}"
         # ==================== end WM1303 overlay additions ====================
 
         else:
@@ -773,8 +774,8 @@ class MeshCLI:
                 section["agc_reset_interval"] = rounded
                 reply = f"OK - interval rounded to {rounded}"
             elif key == "owner.info":
-                # WM1303 reports runtime device information, not a stored label.
-                return "Error: owner.info is dynamic and read-only"
+                from repeater.config import validate_owner_info
+                section["owner_info"] = validate_owner_info(value.replace('|', '\n'))
             else:
                 return f"unknown config: {key}"
 

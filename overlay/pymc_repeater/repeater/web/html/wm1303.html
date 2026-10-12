@@ -178,6 +178,7 @@ select.inp option,select.ci option,.tp select option{background:#191e23;color:va
 <!-- v2.6.0 F2: D3.js 7 for Radar polar topology view -->
 <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
 <script src="/wm1303-access.js" defer></script>
+<script src="/wm1303-node-info.js" defer></script>
 </head>
 <body>
 <div id="toasts"></div>
@@ -255,11 +256,13 @@ select.inp option,select.ci option,.tp select option{background:#191e23;color:va
       </div>
     </div>
   </div>
-  <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-4">
+  <div class="grid gap-4 mb-4" style="grid-template-columns:repeat(auto-fit,minmax(145px,1fr))">
     <div class="gl p-4 text-center"><div class="text-3xl font-bold" style="color:#818cf8" id="st-rx">0</div><div class="text-xs mt-1" style="color:var(--txm)">Packets RX</div></div>
     <div class="gl p-4 text-center"><div class="text-3xl font-bold" style="color:#34d399" id="st-tx">0</div><div class="text-xs mt-1" style="color:var(--txm)">Packets TX</div></div>
     <div class="gl p-4 text-center"><div class="text-3xl font-bold" style="color:#f472b6" id="st-ch">0</div><div class="text-xs mt-1" style="color:var(--txm)">Active Channels</div></div>
     <div class="gl p-4 text-center"><div class="text-3xl font-bold" style="color:#fb923c" id="st-free">0</div><div class="text-xs mt-1" style="color:var(--txm)">Free/Inactive Channels</div></div>
+    <div class="gl p-4 text-center" title="Received packet airtime across all channels divided by 60 seconds; simultaneous receptions can exceed 100%"><div class="text-xs mb-2" style="color:var(--txm)">RX Duty (60s)</div><div class="text-2xl font-bold" style="color:#34d399" id="st-rx-duty">--</div></div>
+    <div class="gl p-4 text-center" title="TX packet airtime divided by 60 seconds"><div class="text-xs mb-2" style="color:var(--txm)">TX Duty (60s)</div><div class="text-2xl font-bold" style="color:#818cf8" id="st-tx-duty">--</div></div>
   </div>
   <div class="gl p-5">
     <div class="flex items-center justify-between mb-3">
@@ -523,10 +526,11 @@ select.inp option,select.ci option,.tp select option{background:#191e23;color:va
       <div class="stl mb-0" style="font-size:14px;">Radio Summary</div>
       <div class="flex gap-4 flex-wrap" style="font-size:12px;">
         <span style="color:var(--txm)">RX Packets: <b id="sum-total-rx" style="color:#22c55e">--</b></span>
-        <span style="color:var(--txm)">RX Duty Cycle: <b id="sum-rx-duty" style="color:#22c55e">--</b></span>
+        <span style="color:var(--txm)" title="Received packet airtime across all channels / 60 seconds">RX Duty (60s): <b id="sum-rx-duty" style="color:#22c55e">--</b></span>
+        <span style="color:var(--txm)" title="Estimated fraction of time not occupied by TX; not a measured receiver uptime">RX Availability (60s): <b id="sum-rx-availability" style="color:#22c55e">--</b></span>
         <span style="color:var(--txm)">TX Packets: <b id="sum-total-tx" style="color:var(--acc)">--</b></span>
         <span style="color:var(--txm)">TX Airtime: <b id="sum-total-airtime" style="color:var(--acc)">--</b></span>
-        <span style="color:var(--txm)">TX Duty Cycle: <b id="sum-duty-cycle" style="color:var(--acc)">--</b></span>
+        <span style="color:var(--txm)">TX Duty (60s): <b id="sum-duty-cycle" style="color:var(--acc)">--</b></span>
       </div>
     </div>
   </div>
@@ -727,6 +731,7 @@ select.inp option,select.ci option,.tp select option{background:#191e23;color:va
 <div id="tab-adv-config" class="tp" style="padding:16px">
   <h2 style="margin:0 0 16px 0;font-size:1.3em;color:var(--tx)">&#9881; Advanced Configuration</h2>
   <p style="color:var(--txm);margin-bottom:20px;font-size:0.9em">Adjust advanced system parameters. Changes require a service restart.</p>
+  <div id="wm1303-node-info-host"></div>
 
   <!-- Group 1: Deduplication & Cache -->
   <div style="background:var(--bg2);border:1px solid var(--bd);border-radius:12px;padding:20px;margin-bottom:16px">
@@ -1059,7 +1064,17 @@ function setBdg(id,on){
   else if(on===false){e.className='bdg ber-b';e.innerHTML='<span class="dot der"></span>&nbsp;Stopped';}
   else{e.className='bdg bmu';e.innerHTML='<span class="dot dmu"></span>&nbsp;Unknown';}
 }
+async function loadDashboardDuty(){
+  try {
+    const d=await api('GET','/api/stats');
+    txt('st-rx-duty',Number.isFinite(d.rx_duty_pct)?d.rx_duty_pct.toFixed(3)+'%':'Unavailable');
+    txt('st-tx-duty',Number.isFinite(d.tx_duty_pct)?d.tx_duty_pct.toFixed(3)+'%':'Unavailable');
+  } catch(e) {
+    txt('st-rx-duty','Unavailable');txt('st-tx-duty','Unavailable');
+  }
+}
 async function loadStatus(){
+  loadDashboardDuty();
   let badgeSet=false;
   try{
     const _ctrl=new AbortController();const _tid=setTimeout(()=>_ctrl.abort(),9000);const _sth={'Accept':'application/json'};const _stt=jwt();if(_stt)_sth.Authorization='Bearer '+_stt;const r_st=await fetch('/api/wm1303/status',{signal:_ctrl.signal,headers:_sth});clearTimeout(_tid);if(r_st.status===401)showLoginNotice();if(!r_st.ok)throw new Error('HTTP '+r_st.status);const d=await r_st.json();
@@ -1408,7 +1423,8 @@ function loadTxQueues(){
       html+='<div style="color:var(--txm)">Sent</div><div style="color:#22c55e;font-weight:500;">'+sent+'</div>';
       // Row: Failed / TX Duty
       html+='<div style="color:var(--txm)">Failed</div><div style="color:'+(failed>0?'#ef4444':'var(--txm)')+';font-weight:500;">'+failed+'</div>';
-      html+='<div style="color:var(--txm)" title="TX duty cycle">TX Duty</div><div style="font-weight:600;color:'+_dutyColor(dutyPct)+';">'+(dutyPct).toFixed(3)+' %</div>';
+      html+='<div style="color:var(--txm)" title="TX airtime divided by 60 seconds">TX Duty (60s)</div><div style="font-weight:600;color:'+_dutyColor(dutyPct)+';">'+(dutyPct).toFixed(3)+' %</div>';
+      html+='<div style="color:var(--txm)" title="Received airtime divided by 60 seconds">RX Duty (60s)</div><div style="font-weight:600;color:#22c55e;">'+(Number.isFinite(live?.rx_duty_pct)?live.rx_duty_pct.toFixed(3)+' %':'Unavailable')+'</div>';
       // Row: RSSI / SNR
       html+='<div style="color:var(--txm)">RSSI</div><div style="color:'+rssiColor+';font-weight:500;">'+rssiStr+'</div>';
       html+='<div style="color:var(--txm)">SNR</div><div style="color:'+snrColor+';font-weight:500;">'+snrStr+'</div>';
@@ -1476,21 +1492,20 @@ function loadTxQueues(){
     var eSR=document.getElementById('sum-total-rx');
     if(eSR)eSR.textContent=totalRx;
     var eDC=document.getElementById('sum-duty-cycle');
+    var duty=liveData.duty_cycle;
     if(eDC){
-      var avgDuty=totalDutySum;  // Sum of all channel TX duties (shared RF chain)
-      eDC.textContent=avgDuty.toFixed(3)+' %';
-      eDC.style.color=_dutyColor(avgDuty);
+      eDC.textContent=Number.isFinite(duty?.tx_duty_pct)?duty.tx_duty_pct.toFixed(3)+' %':'Unavailable';
+      eDC.style.color=Number.isFinite(duty?.tx_duty_pct)?_dutyColor(duty.tx_duty_pct):'var(--txm)';
+    }
     // Total TX Packets
     var eTX=document.getElementById('sum-total-tx');
     if(eTX)eTX.textContent=totalTx;
-    // RX Duty Cycle
+    // Received airtime and estimated availability are different measurements.
     var eRD=document.getElementById('sum-rx-duty');
     if(eRD){
-      var rxDuty=100.0-totalDutySum;  // RX = 100% minus total TX duty
-      eRD.textContent=rxDuty.toFixed(1)+' %';
-      eRD.style.color=rxDuty>95?'#22c55e':rxDuty>80?'#f59e0b':'#ef4444';
+      eRD.textContent=Number.isFinite(duty?.rx_duty_pct)?duty.rx_duty_pct.toFixed(3)+' %':'Unavailable';
     }
-    }
+    txt('sum-rx-availability',Number.isFinite(duty?.rx_availability_pct)?duty.rx_availability_pct.toFixed(3)+' %':'Unavailable');
   }).catch(function(e){
     console.error('loadTxQueues error:',e);
     var colors=['#60a5fa','#a78bfa','#34d399','#fbbf24','#f472b6','#fb923c'];
@@ -2450,7 +2465,7 @@ async function specLoad() {
 
 
   // Enable checkbox
-  var _sec=G('specEnableCheck');if(_sec)_sec.checked = d.spectral_scan_enabled;
+  var _sec=G('specEnableCheck');if(_sec){_sec.checked = d.spectral_scan_requested??d.spectral_scan_enabled;_sec.disabled=false;}
   var _sel=G('specEnableLabel');if(_sel)_sel.textContent = d.spectral_scan_enabled ? 'Enabled' : 'Disabled';
 
   // Channel table - removed from UI, skip
@@ -2471,6 +2486,15 @@ async function specLoad() {
     specRenderChart(d.last_scan, d.channels);
     G('specNote').style.display = 'block';
     G('specNote').textContent = d.last_scan.note || '';
+  }
+  txt('specLastUpdate',d.last_scan?.timestamp?'Measured: '+new Date(d.last_scan.timestamp*1000).toLocaleString():'No measurements available');
+  const pace=Math.max(1,d.scan_pace_seconds||300), count=d.scan_channel_count||0;
+  txt('specScanHelp',d.spectral_scan_enabled
+    ? 'Scanning is enabled. Each frequency is sampled about every '+Math.round(pace/60)+' minutes; a complete sweep takes about '+Math.ceil(pace*count/60)+' minutes and can take longer during radio activity.'
+    : 'Spectral scanning is disabled by default. Enable it here to collect frequency measurements. Changing this setting restarts the repeater; scans briefly interrupt Channel E reception.');
+  if((d.spectral_scan_requested??d.spectral_scan_enabled)!==d.spectral_scan_enabled){
+    txt('specEnableLabel','Saved; restart required');
+    txt('specScanHelp','The saved scan setting differs from the running configuration. Restart the repeater to apply it.');
   }
 
   // Issue #7.1: update spectrum title with region-aware frequency range.
@@ -5146,7 +5170,8 @@ async function saveTestNodesList(){
 
 function specRenderChart(scanData, channels) {
   const pts = scanData.scan_points || [];
-  if (pts.length === 0) return;
+  G('specEmpty').style.display=pts.length?'none':'block';
+  if (pts.length === 0) {if(specChart){specChart.destroy();specChart=null;}return;}
 
   const labels = pts.map(p => p.freq_mhz.toFixed(1));
   const rssiVals = pts.map(p => p.rssi_dbm);
@@ -5241,17 +5266,19 @@ function specSetRefresh() {
 }
 
 async function specToggleSx1261() {
-  var _ec=G('specEnableCheck');if(!_ec)return;const enabled = _ec.checked;
-  if(G('specEnableLabel'))G('specEnableLabel').textContent = enabled ? 'Enabling...' : 'Disabling...';
-  const d = await api('POST', '/api/wm1303/spectrum', {action:'toggle', enable:enabled});
-  if (d && d.status === 'ok') {
-    if(G('specEnableLabel'))G('specEnableLabel').textContent = enabled ? 'Enabled (restarting...)' : 'Disabled';
-    if(G('specScanStatus')){G('specScanStatus').textContent = enabled ? 'Enabled' : 'Disabled';G('specScanStatus').style.color = enabled ? '#10b981' : '#ef4444';}
-  } else {
-    if(G('specEnableCheck'))G('specEnableCheck').checked = !enabled;
-    if(G('specEnableLabel'))G('specEnableLabel').textContent = !enabled ? 'Enabled' : 'Disabled';
-    alert('Failed to toggle spectral scan');
-  }
+  const control=G('specEnableCheck'), enabled=control.checked;
+  control.disabled=true;
+  txt('specEnableLabel','Saving scan setting…');
+  try {
+    const d=await api('POST','/api/wm1303/spectrum',{action:'toggle',enable:enabled});
+    if(specData)specData.spectral_scan_requested=enabled;
+    txt('specEnableLabel',d.restart_required?'Saved; restart required':(enabled?'Enabled':'Disabled'));
+    txt('specScanHelp',d.restart_required?d.restart_error:'Scan setting saved. The repeater is restarting; measurements will appear after scanning resumes.');
+  } catch(e) {
+    control.checked=!enabled;
+    txt('specEnableLabel','Save failed');
+    toast('Unable to change scan setting: '+e.message,'er');
+  } finally {control.disabled=false;}
 }
 
 // Load spectrum data when tab is shown
@@ -5563,8 +5590,15 @@ showTab = function(name, btn) {
       <h3 id="specFreqTitle" style="margin:0;font-size:14px;font-weight:600;color:var(--tx)">Frequency Spectrum</h3>
       <div style="display:flex;align-items:center;gap:10px"><span style="font-size:11px;color:var(--txm)" id="specLastUpdate">No measurements yet</span><button class="btn pri sm" onclick="specScan()" id="btnSpecScan" style="padding:4px 12px;font-size:12px">Refresh measurements</button></div>
     </div>
+    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin-bottom:10px;font-size:12px">
+      <label><input id="specEnableCheck" type="checkbox" onchange="specToggleSx1261()" disabled> Enable scanning (restarts repeater)</label>
+      <span id="specEnableLabel">Loading scan status…</span>
+      <span id="specScanStatus"></span>
+    </div>
+    <p id="specScanHelp" style="font-size:12px;color:var(--txm);margin-bottom:12px"></p>
     <div style="position:relative;height:220px">
       <canvas id="spectrumChart"></canvas>
+      <div id="specEmpty" style="position:absolute;inset:0;display:none;align-content:center;text-align:center;color:var(--txm);font-size:13px">No measurements available</div>
     </div>
     <div style="margin-top:10px;display:flex;gap:16px;font-size:11px;color:var(--txm);flex-wrap:wrap">
       <span><span style="display:inline-block;width:12px;height:12px;background:#6366f1;border-radius:2px;margin-right:4px"></span>Multi-SF Channel</span>
@@ -5574,7 +5608,7 @@ showTab = function(name, btn) {
   </div>
 
   <!-- Time Range Selector -->
-  <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+  <div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin-bottom:16px">
     <h3 style="margin:0;font-size:14px;font-weight:600;color:var(--tx)">📈 Signal History</h3>
     <div style="display:flex;gap:4px">
       <button class="btn pri sm" onclick="setSigHours(1)" id="sigbtn-1">1h</button>
@@ -5585,6 +5619,17 @@ showTab = function(name, btn) {
       <button class="btn sec sm" onclick="setSigHours(168)" id="sigbtn-168">1w</button>
     </div>
     <span style="font-size:11px;color:var(--txm)" id="sigAutoRefresh">Auto-refresh: 60s</span>
+  </div>
+
+  <div class="gl" style="padding:18px;margin-bottom:16px">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px">
+      <h3 style="margin:0;font-size:14px;font-weight:600;color:var(--tx)">TX Duty Cycle</h3>
+      <span id="dutyIntervalAverage" style="font-size:12px;color:var(--txm)">Loading duty history…</span>
+    </div>
+    <div style="height:250px;position:relative"><canvas id="dutyHistoryChart"></canvas>
+      <div id="dutyHistoryEmpty" style="display:none;position:absolute;inset:0;align-content:center;text-align:center;color:var(--txm);font-size:13px">No duty-cycle measurements available for this interval</div>
+    </div>
+    <p id="dutyHistoryNote" style="font-size:11px;color:var(--txm);margin-top:10px">TX airtime as a percentage of elapsed time, across all channels. Uses the selected interval above.</p>
   </div>
 
   <!-- Signal Quality Chart (RSSI per channel) -->
@@ -5738,6 +5783,7 @@ showTab = function(name, btn) {
 var sigHours = 1;
 var sigRssiChart = null, sigSnrChart = null, sigNfChart = null;
 var sigRefreshInterval = null;
+var dutyHistChart = null;
 var SIG_COLOR_LIST = ['#3b82f6', '#8b5cf6', '#10b981', '#f59e0b', '#ec4899', '#06b6d4'];
 var SIG_DASH_LIST = [[], [6, 3], [2, 2], [8, 4, 2, 4], [4, 4], [1, 3]];
 var SIG_POINT_LIST = ['circle', 'rect', 'triangle', 'rectRot', 'star', 'crossRot'];
@@ -5769,7 +5815,40 @@ async function loadSignalData() {
   if (!cheData || !cheData.frequency) {
     try { cheData = await api('GET','/api/wm1303/channel_e'); } catch(e) {}
   }
-  await Promise.all([loadSignalQuality(), loadNoiseFloor(), loadLbtHistory(), loadTxActivity(), loadPerChannelNF(), cadChartLoad()]);
+  await Promise.all([loadSignalQuality(), loadNoiseFloor(), loadLbtHistory(), loadTxActivity(), loadPerChannelNF(), cadChartLoad(), loadDutyHistory()]);
+}
+
+async function loadDutyHistory() {
+  const hours=sigHours;
+  try {
+    const d=await api('GET','/api/wm1303/duty_cycle_history?hours='+hours);
+    if(hours!==sigHours)return;
+    if(dutyHistChart)dutyHistChart.destroy();
+    const hasData=(d.data||[]).length>0;
+    G('dutyHistoryEmpty').style.display=hasData?'none':'block';
+    txt('dutyIntervalAverage',Number.isFinite(d.interval_tx_duty_pct)?'Recorded TX / selected interval: '+d.interval_tx_duty_pct.toFixed(3)+'%':'No measurements');
+    txt('dutyHistoryNote',d.note||'TX airtime as a percentage of elapsed time.');
+    function points(rows) {
+      const result=[];
+      rows.forEach((point,index)=>{
+        const prev=rows[index-1];
+        if(prev&&point.t>prev.t+prev.bucket_seconds)result.push({x:new Date((prev.t+prev.bucket_seconds)*1000),y:null});
+        result.push({x:new Date(point.t*1000),y:point.tx_duty_pct});
+      });
+      return result;
+    }
+    const datasets=hasData?[{label:'Total TX',data:points(d.data),borderColor:'#818cf8',borderWidth:3,pointRadius:0,spanGaps:false}]:[];
+    (d.channels||[]).forEach((channel,index)=>datasets.push({label:channel.label,data:points(channel.data),borderColor:getChColor(index),borderWidth:1.5,pointRadius:0,spanGaps:false}));
+    dutyHistChart=new Chart(G('dutyHistoryChart'),{type:'line',data:{datasets},options:{responsive:true,maintainAspectRatio:false,animation:false,
+      scales:{x:{type:'time',min:d.start_time*1000,max:d.end_time*1000,time:{unit:hours<=1?'minute':hours>=72?'day':'hour'},ticks:{color:'#999',maxTicksLimit:12},grid:{color:'rgba(128,128,128,0.1)'}},y:{beginAtZero:true,title:{display:true,text:'TX duty (%)',color:'#999'},ticks:{color:'#999'},grid:{color:'rgba(128,128,128,0.1)'}}},
+      plugins:{legend:{labels:{color:'#999'}},tooltip:{callbacks:{label:item=>item.dataset.label+': '+item.parsed.y.toFixed(3)+'%'}}}}});
+  } catch(e) {
+    if(hours!==sigHours)return;
+    if(dutyHistChart){dutyHistChart.destroy();dutyHistChart=null;}
+    G('dutyHistoryEmpty').style.display='block';
+    txt('dutyIntervalAverage','Unable to load duty history');
+    txt('dutyHistoryNote',e.message);
+  }
 }
 
 async function loadSignalQuality() {
@@ -6492,7 +6571,7 @@ function renderNfCards(channels) {
 
 function startSigRefresh() {
   if (sigRefreshInterval) clearInterval(sigRefreshInterval);
-  sigRefreshInterval = setInterval(loadSignalData, 60000);
+  sigRefreshInterval = setInterval(function(){loadSignalData();specLoad();}, 60000);
 }
 
 // Hook into spectrum tab loading

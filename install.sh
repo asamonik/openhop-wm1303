@@ -1193,7 +1193,7 @@ if [ -f "${LEGACY_CONFIG_DIR}/version" ] && ! [ "${LEGACY_CONFIG_DIR}/version" -
     chown "${PI_USER}:${PI_GROUP}" "${LEGACY_CONFIG_DIR}/version" 2>/dev/null || true
     ok "Legacy ${LEGACY_CONFIG_DIR}/version re-synced to canonical version"
 fi
-ok "v$(cat \"${SCRIPT_DIR}/VERSION\")"
+ok "v$(cat "${SCRIPT_DIR}/VERSION")"
 
 
 # =============================================================================
@@ -1502,8 +1502,7 @@ print((config.get("web") or {}).get("port", 8000))
 PYWEBPORT
     )
     if command -v curl &>/dev/null; then
-        # Retry loop: 15x 2s = max 30s, matching upgrade.sh. A single attempt
-        # right after first start is almost always too early.
+        # Retry startup checks with a bounded timeout for each request.
         WEB_OK=0
         WEB_TRY=0
         for WEB_TRY in $(seq 1 15); do

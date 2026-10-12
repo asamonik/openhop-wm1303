@@ -971,6 +971,36 @@ class WebPersistenceTests(unittest.TestCase):
                 wm1303_api._save_ui(config)
                 self.assertEqual(wm1303_api._load_ui(), config)
 
+    def test_config_backups_preserve_previous_bytes_and_private_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            filename = Path(directory) / 'config.json'
+            original = b'{"password":"private"}\r\n'
+            filename.write_bytes(original)
+            filename.chmod(0o600)
+            self.assertTrue(wm1303_api._safe_write(filename, '{"password":"new"}'))
+            backups = list(filename.parent.glob('config.json.bak.*'))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_bytes(), original)
+            self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
+            self.assertEqual(filename.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(filename.read_text()), {'password': 'new'})
+
+    def test_invalid_json_and_failed_atomic_write_leave_config_intact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            filename = Path(directory) / 'config.json'
+            original = b'{"valid":true}\n'
+            filename.write_bytes(original)
+            with patch.object(wm1303_api, '_backup_config') as backup:
+                with self.assertRaises(ValueError):
+                    wm1303_api._safe_write(filename, '{')
+                backup.assert_not_called()
+            self.assertEqual(filename.read_bytes(), original)
+            with patch.object(wm1303_api, 'atomic_write_text', side_effect=PermissionError('read-only')):
+                with self.assertRaises(PermissionError):
+                    wm1303_api._safe_write(filename, '{"valid":false}')
+            self.assertEqual(filename.read_bytes(), original)
+            self.assertEqual(next(filename.parent.glob('config.json.bak.*')).read_bytes(), original)
+
     def test_debug_metrics_follow_active_store_and_preserve_counter_resets(self):
         import asyncio
         from repeater.data_acquisition.sqlite_handler import SQLiteHandler

@@ -5,6 +5,8 @@ radio_type: wm1303
 repeater:
   # Node name for logging and identification
   node_name: "mesh-repeater-01"
+  # Public owner/contact information (up to 115 UTF-8 bytes)
+  owner_info: ""
 
   # TX mode: forward | monitor | no_tx (default: forward)
   # forward = repeat on; monitor = no repeat but companions/tenants can send; no_tx = all TX off

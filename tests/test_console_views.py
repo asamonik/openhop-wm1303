@@ -4,6 +4,8 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
+import shutil
+import subprocess
 import unittest
 from unittest.mock import Mock, patch
 
@@ -18,6 +20,37 @@ spec.loader.exec_module(console_assets)
 
 
 class ConsoleViewTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('node'), 'Node.js is required for JavaScript syntax checks')
+    def test_manager_inline_scripts_parse_after_upstream_integration(self):
+        html = ROOT / 'overlay/pymc_repeater/repeater/web/html/wm1303.html'
+        check = r'''
+const fs = require('fs'), vm = require('vm');
+for (const match of fs.readFileSync(process.argv[1], 'utf8').matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)) {
+    new vm.Script(match[1]);
+}
+'''
+        subprocess.run(['node', '-e', check, str(html)], check=True, capture_output=True)
+
+    def test_dashboard_patch_keeps_api_client_and_validates_all_assets_before_writing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            assets = Path(directory) / 'assets'
+            assets.mkdir()
+            client = assets / 'system-client.js'
+            client.write_text('export const getStats = () => fetch("/api/stats");')
+            style = assets / 'Dashboard-style.css'
+            source = ';'.join(before for before, _ in console_assets.DASHBOARD_STYLE_REPLACEMENTS)
+            style.write_text(source)
+            invalid = assets / 'Dashboard-invalid.js'
+            invalid.write_text('changed upstream dashboard')
+            with self.assertRaises(ValueError):
+                console_assets.patch_console_assets(directory)
+            self.assertEqual(style.read_text(), source)
+            invalid.unlink()
+            self.assertEqual(console_assets.patch_console_assets(directory), 1)
+            self.assertEqual(console_assets.patch_console_assets(directory), 0)
+            self.assertIn('flex-direction:column', style.read_text())
+            self.assertEqual(client.read_text(), 'export const getStats = () => fetch("/api/stats");')
+
     def test_named_table_chart_search_and_sort_preserve_peer_identity(self):
         source = ";".join(before for before, _ in console_assets.NEIGHBOR_REPLACEMENTS)
         source += ";Y(e.peer_hash);getHistory({peer_hash:e.peer_hash})"

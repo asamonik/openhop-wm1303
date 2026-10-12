@@ -27,6 +27,29 @@ Neighbor Links uses advertised node names in the table, selected-link heading,
 search, sorting, and chart tooltips. Nodes without an advertised name retain
 their peer-key label, and history requests keep using the original peer key.
 
+Dashboard counters place the value below its label and wrap long numbers.
+The Console and Manager Status page show RX duty over the last 60 seconds.
+RX duty is received packet airtime summed across channels, divided by 60 seconds;
+simultaneous receptions can exceed 100%. The Manager's Radio Summary separately
+shows estimated RX availability (`100% - TX duty`), which does not measure
+receiver uptime or time spent scanning.
+
+Both dashboards use actual TX airtime divided by the last 60 seconds for TX duty.
+The Console labels TX budget usage separately: 50% budget usage with a 6% limit
+means 3% TX duty. Previous WM1303 duty values were averages since startup.
+
+Packet Details shows a scope name when the received transport code matches a
+unique configured region key. It shows `unknown scope` for unscoped packets,
+missing keys, or ambiguous matches. Route badges retain Flood/Direct/T-Flood.
+
+Edit public node name, owner/contact information, and coordinates in Console
+**Configuration → Repeater → Node & Owner Information** or Manager
+**Adv. Config → Node & Owner Information**. Owner information supports up to
+115 UTF-8 bytes. Saves preserve pending radio settings and apply live when
+available; the result reports if a restart is required. The mesh CLI's
+`get owner.info` and `set owner.info` use the same saved value. With no saved
+owner text, the CLI retains its hardware-information fallback.
+
 The Console Policies editor supports live packet policies and named channel-hash
 and public-key groups. Enforcement is disabled by default. When enabled, rules
 run in order against the original received packet and its RF metadata. The first
@@ -123,6 +146,7 @@ Spectral analysis and channel monitoring charts:
 | Chart | Description |
 |-------|-------------|
 | **RSSI History** | Per-channel RSSI values over time |
+| **TX Duty Cycle** | Total and per-channel TX duty for 1h, 6h, 12h, 24h, 3d, or 1w; uses the Signal History interval selector |
 | **SNR History** | Per-channel SNR values over time |
 | **Noise Floor** | Per-channel noise floor from spectral scan |
 | **Channel Activity** | Combined TX counts and RX Origin counts per channel (merged chart since v2.1.1) |
@@ -133,6 +157,20 @@ Spectral analysis and channel monitoring charts:
 Channel E is displayed in **orange** across all charts (since v2.0.1).
 
 Extended color palette ensures all 5 channels are visually distinct.
+
+The frequency chart requires HAL spectral scanning, which is disabled by
+default. Use **Enable scanning (restarts repeater)** above the frequency chart.
+The current HAL configuration measures one frequency every five minutes;
+an 8–9 frequency sweep takes approximately 40–45 minutes, longer during radio
+activity. Scanning briefly interrupts Channel E reception. The chart title
+shows the configured scan window rather than implying coverage of the entire
+regional band. Refresh measurements retrieves the latest readings; it does not
+perform an immediate sweep. Missing data stays unavailable.
+
+Duty history comes from cumulative channel snapshots, including TX from all
+consumers. It remains available throughout metrics retention and preserves
+missing observations as gaps. Bucket boundaries are approximate. The displayed
+interval percentage is recorded TX airtime divided by the selected interval.
 
 #### v2.1.0 Spectrum Tab Changes
 

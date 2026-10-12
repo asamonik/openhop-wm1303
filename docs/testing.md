@@ -1,5 +1,26 @@
 # Software checks and MeshCore compatibility
 
+The 2026-10-12 dashboard checks cover rolling airtime rather than lifetime
+averages or budget utilization, actual RX modulation, all six history intervals,
+counter resets, unavailable spectrum readings, and failed scan restarts.
+Owner-information checks exercise UTF-8 limits, mesh CLI reads/writes,
+scoped persistence, and failure rollback. Scope checks include unresolved and
+ambiguous transport codes; a separate check uses the reference core's real
+Packet parser and HMAC implementation.
+
+The compiled Console/Manager browser scenario verifies values below labels,
+seven-digit counters, RX duty, distinct TX duty/budget labels, scope details,
+owner saves and retained drafts after failures, and all six duty-chart intervals.
+Run it with Node.js 22, Chromium, and an upstream Console HTML directory:
+
+```bash
+npm ci --ignore-scripts
+node tests/dashboard_browser_scenario.cjs /path/to/repeater/web/html
+```
+
+These checks use fixture API responses and actual chart code, without RF
+hardware or a deployed service restart.
+
 Current task scope (2026-09-09): the Raspberry Pi is no longer available and the
 user requested that Pi verification be skipped. Further fixes are validated
 locally; references below to pending Pi checks describe earlier work and no

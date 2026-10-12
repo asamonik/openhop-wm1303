@@ -1581,7 +1581,7 @@ if [ -f "${SCRIPT_DIR}/VERSION" ]; then
         chown "${PI_USER}:${PI_GROUP}" "${LEGACY_CONFIG_DIR}/version" 2>/dev/null || true
         ok "Legacy ${LEGACY_CONFIG_DIR}/version re-synced to canonical version"
     fi
-    ok "v$(cat \"${SCRIPT_DIR}/VERSION\")"
+    ok "v$(cat "${SCRIPT_DIR}/VERSION")"
 else
     warn "VERSION file not found in repo"
 fi

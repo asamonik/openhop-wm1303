@@ -42,6 +42,44 @@ LBT_REPLACEMENTS = (
      "Missing check results do not imply zero retries. "),
 )
 
+DASHBOARD_REPLACEMENTS = (
+    ("h(B,{title:`Up Time`,value:c.value.uptimeFormatted,color:n.uptime,data:[],showChart:!1,class:`stat-card`},null,8,[`value`,`color`])",
+     "h(B,{title:`Up Time`,value:c.value.uptimeFormatted,color:n.uptime,data:[],showChart:!1,class:`stat-card`},null,8,[`value`,`color`]),"
+     "h(B,{title:`RX Duty (60s)`,value:a.stats?.rx_duty_pct==null?`N/A`:a.stats.rx_duty_pct.toFixed(3)+`%`,color:n.rx,data:[],showChart:!1,class:`stat-card`},null,8,[`value`,`color`])"),
+    ("class:`grid grid-cols-2 md:grid-cols-3 lg:grid-cols-7 gap-3 lg:gap-4 mb-5 stats-cards-container`",
+     "class:`grid gap-3 lg:gap-4 mb-5 stats-cards-container`,style:{gridTemplateColumns:`repeat(auto-fit,minmax(min(190px,calc((100% - 12px)/2)),1fr))`}"),
+)
+
+DASHBOARD_STYLE_REPLACEMENTS = (
+    ("justify-content:space-between;align-items:baseline;margin-bottom:8px;display:flex",
+     "flex-direction:column;align-items:flex-start;gap:6px;margin-bottom:8px;display:flex"),
+    ("font-variant-numeric:tabular-nums;font-size:22px;font-weight:700;line-height:1",
+     "font-variant-numeric:tabular-nums;font-size:22px;font-weight:700;line-height:1.15;overflow-wrap:anywhere;max-width:100%"),
+    ("align-items:baseline;gap:6px;display:flex",
+     "align-items:baseline;gap:6px;display:flex;flex-wrap:wrap;max-width:100%"),
+)
+
+DUTY_STORE_REPLACEMENTS = (
+    ("let t=e.utilization_percent;",
+     "let t=e.tx_duty_pct??(e.current_airtime_ms==null?null:e.current_airtime_ms/600);"),
+)
+
+DUTY_SIDEBAR_REPLACEMENTS = (
+    ("r[6]||=T(`span`,null,`Duty Cycle`,-1)",
+     "r[6]||=T(`span`,{title:`TX airtime as a percentage of the last 60 seconds`},`TX Duty (60s)`,-1)"),
+    ("d(l(y).dutyCycleUtilization.toFixed(1))+`% / `+d(l(y).dutyCycleMax.toFixed(1))+`% `",
+     "d(l(y).dutyCycleUtilization.toFixed(3))+`% / `+d(l(y).dutyCycleMax.toFixed(1))+`% limit `"),
+    ("T(`span`,un,d(l(y).dutyCycleUtilization.toFixed(3))+`% / `+d(l(y).dutyCycleMax.toFixed(1))+`% limit `,1)]),T(`div`,dn",
+     "T(`span`,un,d(l(y).dutyCycleUtilization.toFixed(3))+`% / `+d(l(y).dutyCycleMax.toFixed(1))+`% limit `,1)]),"
+     "T(`div`,{class:`text-xs text-content-muted`,title:`Percentage of the configured TX allowance used in the last 60 seconds`},`TX budget used: `+d((l(y).stats?.utilization_percent??0).toFixed(1))+`%`,1),T(`div`,dn"),
+)
+
+PACKET_SCOPE_REPLACEMENTS = (
+    ("_(`span`,le,a(W(c.packet.route)),1)",
+     "_(`span`,le,a(W(c.packet.route)),1),"
+     "_(`span`,{class:`text-xs text-content-secondary dark:text-content-muted`,style:{overflowWrap:`anywhere`}},`Scope: `+a(c.packet.scope||`unknown scope`),1)"),
+)
+
 
 def adapt_module(source, replacements):
     for before, after in replacements:
@@ -64,9 +102,17 @@ def patch_console_assets(html_dir):
         ("NeighbourLinks-*.js", NEIGHBOR_REPLACEMENTS),
         ("Configuration-*.js", POLICY_REPLACEMENTS),
         ("RfHealthCorrelation-*.js", LBT_REPLACEMENTS),
+        ("Dashboard-*.js", DASHBOARD_REPLACEMENTS),
+        ("Dashboard-*.css", DASHBOARD_STYLE_REPLACEMENTS),
+        ("system-*.js", DUTY_STORE_REPLACEMENTS),
+        ("index-*.js", DUTY_SIDEBAR_REPLACEMENTS),
+        ("PacketDetailsModal-*.js", PACKET_SCOPE_REPLACEMENTS),
     ):
         for module in sorted(assets.glob(pattern)):
             source = module.read_text(encoding="utf-8")
+            # The API client and Pinia store both ship as system-*.js.
+            if pattern == 'system-*.js' and 'dutyCycleUtilization' not in source:
+                continue
             updated = adapt_module(source, replacements)
             if updated != source:
                 pending.append((module, updated))

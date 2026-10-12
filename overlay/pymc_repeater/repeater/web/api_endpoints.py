@@ -2443,7 +2443,11 @@ class APIEndpoints:
         try:
             if not packet_hash:
                 return self._error("packet_hash parameter required")
-            packet = self._get_storage().get_packet_by_hash(packet_hash)
+            storage = self._get_storage()
+            packet = storage.get_packet_by_hash(packet_hash)
+            if packet:
+                from repeater.region_scope import packet_scope
+                packet = {**packet, **packet_scope(packet, storage)}
             return self._success(packet) if packet else self._error("Packet not found")
         except Exception as e:
             logger.error(f"Error getting packet by hash: {e}")
@@ -2467,7 +2471,11 @@ class APIEndpoints:
                 pid = int(packet_id)
             except (TypeError, ValueError):
                 return self._error("packet_id must be an integer")
-            packet = self._get_storage().get_packet_by_id(pid)
+            storage = self._get_storage()
+            packet = storage.get_packet_by_id(pid)
+            if packet:
+                from repeater.region_scope import packet_scope
+                packet = {**packet, **packet_scope(packet, storage)}
             return self._success(packet) if packet else self._error("Packet not found")
         except Exception as e:
             logger.error(f"Error getting packet by id: {e}")
@@ -2926,6 +2934,28 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    def repeater_info(self):
+        """Public node fields only; edits use update_radio_config's scoped save."""
+        self._set_cors_headers()
+        if cherrypy.request.method == 'OPTIONS':
+            return ''
+        if cherrypy.request.method != 'GET':
+            cherrypy.response.status = 405
+            return self._error('Use GET to read node information')
+        try:
+            repeater = self.config_manager.read_saved_config().get('repeater', {})
+            return self._success({
+                'node_name': repeater.get('node_name', ''),
+                'owner_info': repeater.get('owner_info', ''),
+                'latitude': repeater.get('latitude', 0),
+                'longitude': repeater.get('longitude', 0),
+                'max_owner_info_bytes': 115,
+            })
+        except Exception as exc:
+            return self._error(exc)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
     def update_radio_config(self):
         """Update radio and repeater configuration with live updates.
@@ -3056,6 +3086,11 @@ class APIEndpoints:
                     return self._error("Node name too long (max 31 bytes in UTF-8)")
                 updates["repeater"]["node_name"] = name
                 applied.append(f"name={name}")
+
+            if "owner_info" in data:
+                from repeater.config import validate_owner_info
+                updates["repeater"]["owner_info"] = validate_owner_info(data["owner_info"])
+                applied.append("owner_info")
 
             # Update latitude
             if "latitude" in data:

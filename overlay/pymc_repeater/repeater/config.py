@@ -47,6 +47,16 @@ def resolve_storage_dir(
     return storage_dir
 
 
+def validate_owner_info(value):
+    """MeshCore's owner-info text is limited to 115 UTF-8 bytes."""
+    if not isinstance(value, str):
+        raise ValueError("Owner information must be text")
+    value = value.replace('\r\n', '\n').strip()
+    if '\x00' in value or len(value.encode('utf-8')) > 115:
+        raise ValueError("Owner information must be at most 115 UTF-8 bytes and contain no NUL characters")
+    return value
+
+
 def get_node_info(config: Dict[str, Any]) -> Dict[str, Any]:
     """
     Extract node name, radio configuration, and MQTT settings from config.
