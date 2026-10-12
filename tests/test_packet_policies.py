@@ -15,7 +15,7 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / "overlay/pymc_repeater/repeater"
+SOURCE = ROOT / "overlay/openhop_repeater/repeater"
 PACKAGE = "wm1303_packet_policy_tests"
 package = ModuleType(PACKAGE)
 package.__path__ = [str(SOURCE)]

@@ -16,11 +16,12 @@ from unittest.mock import Mock, patch
 import cherrypy
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "overlay/pymc_repeater"))
+sys.path.insert(0, str(ROOT / "overlay/openhop_repeater"))
+sys.path.append(str(ROOT / "tests/fixtures/upstream"))
 
 
 def load_api():
-    source = ROOT / "overlay/pymc_repeater/repeater/web/api_endpoints.py"
+    source = ROOT / "overlay/openhop_repeater/repeater/web/api_endpoints.py"
     cls = next(n for n in ast.parse(source.read_text()).body
                if isinstance(n, ast.ClassDef) and n.name == "APIEndpoints")
     methods = {

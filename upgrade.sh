@@ -59,7 +59,7 @@ fail() {
     echo -e "  ${RED}See ${LOG_FILE} for details${NC}"
     if [ -n "${UPGRADE_BACKUP:-}" ] && [ -d "${UPGRADE_BACKUP:-}" ]; then
         echo -e "  ${YELLOW}Rollback: backups are at ${UPGRADE_BACKUP}${NC}"
-        echo -e "  ${YELLOW}  Config: cp -a ${UPGRADE_BACKUP}/pymc_repeater_config/* ${CONFIG_DIR}/${NC}"
+        echo -e "  ${YELLOW}  Config: cp -a ${UPGRADE_BACKUP}/openhop_repeater_config/* ${CONFIG_DIR}/${NC}"
         echo -e "  ${YELLOW}  DB:     cp ${UPGRADE_BACKUP}/db/*.db ${DATA_DIR}/${NC}"
     fi
     exit 1
@@ -84,7 +84,8 @@ run_quiet() {
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/config/deploy_overlay.sh"
-INSTALL_BASE="/opt/pymc_repeater"
+LEGACY_INSTALL_BASE="/opt/pymc_repeater"
+INSTALL_BASE="/opt/openhop_repeater"
 REPO_DIR="${INSTALL_BASE}/repos"
 VENV_DIR="${INSTALL_BASE}/venv"
 CONFIG_DIR="/etc/openhop_repeater"
@@ -223,7 +224,7 @@ BACKUP_DIR="${PI_HOME}/backups"
 
 info "Detected target user: ${PI_USER} (home: ${PI_HOME})"
 
-if [ ! -d "${INSTALL_BASE}" ]; then
+if [ ! -d "${INSTALL_BASE}" ] && [ ! -d "${LEGACY_INSTALL_BASE}" ]; then
     fail "Installation not found at ${INSTALL_BASE}. Run install.sh first."
 fi
 
@@ -257,13 +258,22 @@ if [ "${CURRENT_VERSION}" != "unknown" ] && [ "${UPGRADE_VERSION}" != "unknown" 
     fi
 fi
 
+# Serialize manual install/upgrade runs as well as detached GUI updates.
+exec 8>/run/lock/openhop-wm1303-install.lock
+flock -n 8 || fail "Another OpenHop install or upgrade is already running"
+
+# Check migration conflicts while the existing daemon is still running.
+python3 "${SCRIPT_DIR}/config/migrate_openhop.py" check --home "${PI_HOME}" >> "${LOG_FILE}" 2>&1 || fail "OpenHop path preflight failed; see ${LOG_FILE}"
+EXISTING_CORE_DIR=$(existing_dependency_checkout "$INSTALL_BASE" openhop_core pyMC_core)
+EXISTING_REPEATER_DIR=$(existing_dependency_checkout "$INSTALL_BASE" openhop_repeater pyMC_Repeater)
+
 # Refuse unexpected sources before package changes or service interruption.
 if [ "${SKIP_PULL}" = false ]; then
     [ ! -d "${HAL_DIR}/.git" ] || require_dependency_origin "${HAL_DIR}" "${HAL_REPO}" || fail "HAL origin check failed"
-    [ ! -d "${REPO_DIR}/pyMC_core/.git" ] || require_dependency_origin "${REPO_DIR}/pyMC_core" "${CORE_REPO}" || fail "Core origin check failed"
-    [ ! -d "${REPO_DIR}/pyMC_Repeater/.git" ] || require_dependency_origin "${REPO_DIR}/pyMC_Repeater" "${REPEATER_REPO}" || fail "Repeater origin check failed"
+    [ ! -d "${EXISTING_CORE_DIR}/.git" ] || require_dependency_origin "${EXISTING_CORE_DIR}" "${CORE_REPO}" || fail "Core origin check failed"
+    [ ! -d "${EXISTING_REPEATER_DIR}/.git" ] || require_dependency_origin "${EXISTING_REPEATER_DIR}" "${REPEATER_REPO}" || fail "Repeater origin check failed"
 else
-    for _pin_pair in "$HAL_DIR:$HAL_REVISION" "$REPO_DIR/pyMC_core:$CORE_REVISION" "$REPO_DIR/pyMC_Repeater:$REPEATER_REVISION"; do
+    for _pin_pair in "$HAL_DIR:$HAL_REVISION" "$EXISTING_CORE_DIR:$CORE_REVISION" "$EXISTING_REPEATER_DIR:$REPEATER_REVISION"; do
         _pin_dir="${_pin_pair%:*}"
         _pin_rev="${_pin_pair##*:}"
         _current_rev=$(git -c "safe.directory=$_pin_dir" -C "$_pin_dir" rev-parse HEAD) || fail "Cannot verify offline dependency $_pin_dir"
@@ -285,7 +295,7 @@ phase "Stop Service"
 step "Stopping repeater service"
 SERVICE_WAS_RUNNING=false
 # Stop both names if a partial migration left duplicate services running.
-for service_unit in openhop-repeater.service pymc-repeater.service lora_pkt_fwd.service; do
+for service_unit in openhop-plugin-manager.service openhop-repeater.service pymc-repeater.service lora_pkt_fwd.service; do
     if systemctl is-active --quiet "${service_unit}" 2>/dev/null; then
         SERVICE_WAS_RUNNING=true
         systemctl stop "${service_unit}" >> "${LOG_FILE}" 2>&1
@@ -303,50 +313,16 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 mkdir -p "${BACKUP_DIR}"
 UPGRADE_BACKUP=$(mktemp -d "${BACKUP_DIR}/pre-upgrade-${TIMESTAMP}.XXXXXX")
 
-# --- OpenHop config migration -------------------------------------------------
-# Legacy config dir /etc/pymc_repeater is superseded by /etc/openhop_repeater.
-# On the first openhop upgrade the new dir may not exist yet; copy the legacy
-# contents (preserving JWT identity in config.yaml, the version file and
-# wm1303_ui.json) WITHOUT overwriting anything already present, BEFORE the
-# backup runs so the JWT survives. The legacy dir is left intact for rollback.
-LEGACY_CONFIG_DIR="/etc/pymc_repeater"
-if [ -d "${LEGACY_CONFIG_DIR}" ] && [ "${LEGACY_CONFIG_DIR}" != "${CONFIG_DIR}" ]; then
-    mkdir -p "${CONFIG_DIR}"
-    cp -an "${LEGACY_CONFIG_DIR}/." "${CONFIG_DIR}/" >> "${LOG_FILE}" 2>&1 || fail "Legacy configuration migration failed; originals remain in ${LEGACY_CONFIG_DIR}"
-    ok "Migrated legacy config ${LEGACY_CONFIG_DIR} -> ${CONFIG_DIR} (JWT/version/wm1303_ui.json preserved)"
-fi
-
-# --- OpenHop var-tree physical migration --------------------------------------
-# Legacy /var/log/pymc_repeater and /var/lib/pymc_repeater are superseded by
-# /var/log/openhop_repeater and /var/lib/openhop_repeater. Physically move the
-# legacy content into the new location BEFORE the pre-upgrade backup runs so
-# the backup captures the migrated state. Historic logs and the SQLite DBs
-# (potentially several MB) are preserved WITHOUT duplicating them on disk.
-# If the new dir already has content, fall back to a safe copy that never
-# overwrites and leave the legacy dir intact for rollback.
-_migrate_legacy_vardir() {
-    local legacy="$1" new="$2" label="$3"
-    [ -d "${legacy}" ] || return 0
-    [ "${legacy}" = "${new}" ] && return 0
-    mkdir -p "${new}"
-    if [ -z "$(ls -A "${new}" 2>/dev/null || true)" ]; then
-        # New dir empty -> physical move via rsync -a --remove-source-files
-        # (portable, handles same-fs efficiently, works cross-fs, keeps dotfiles).
-        if rsync -a --remove-source-files "${legacy}/" "${new}/" >> "${LOG_FILE}" 2>&1; then
-            find "${legacy}" -depth -type d -empty -delete >> "${LOG_FILE}" 2>&1 || true
-            ok "Migrated legacy ${label} ${legacy} -> ${new} (physical move)"
-        else
-            fail "Legacy ${label} migration failed; inspect both ${legacy} and ${new} before retrying"
-        fi
-    else
-        # New dir already has content -> safe merge without overwrite.
-        cp -an "${legacy}/." "${new}/" >> "${LOG_FILE}" 2>&1 || fail "Legacy ${label} merge failed; originals remain in ${legacy}"
-        ok "Merged legacy ${label} ${legacy} -> ${new} (safe copy; legacy preserved for rollback)"
-    fi
-}
-mkdir -p "${LOG_DIR}" "${DATA_DIR}"
-_migrate_legacy_vardir "/var/log/pymc_repeater" "${LOG_DIR}"  "log dir"
-_migrate_legacy_vardir "/var/lib/pymc_repeater" "${DATA_DIR}" "data dir"
+# The shared migration preserves identities, WAL files and local checkouts.
+# Services are stopped; preflight is repeated immediately before the moves.
+step "Migrating installed paths to OpenHop"
+python3 "${SCRIPT_DIR}/config/migrate_openhop.py" apply --home "${PI_HOME}" >> "${LOG_FILE}" 2>&1 || fail "OpenHop migration failed; see ${LOG_FILE} for retained recovery paths"
+# Older installations may keep this integration checkout inside INSTALL_BASE.
+case "$SCRIPT_DIR" in
+    "$LEGACY_INSTALL_BASE"/*) SCRIPT_DIR="$INSTALL_BASE/${SCRIPT_DIR#"$LEGACY_INSTALL_BASE"/}" ;;
+esac
+OVERLAY_DIR="${SCRIPT_DIR}/overlay"
+ok "OpenHop paths active; any previous venv retained as venv.pre-openhop"
 
 # --- OpenHop stale-DB quarantine (v2.7.5+, TODO #228) -------------------------
 # When ${DATA_DIR}/repeater.db exists from an OLD openhop_repeater install with
@@ -374,7 +350,7 @@ _quarantine_stale_openhop_db
 step "Creating pre-upgrade backup"
 mkdir -p "${UPGRADE_BACKUP}"
 if [ -d "${CONFIG_DIR}" ]; then
-    cp -a "${CONFIG_DIR}" "${UPGRADE_BACKUP}/pymc_repeater_config/" >> "${LOG_FILE}" 2>&1
+    cp -a "${CONFIG_DIR}" "${UPGRADE_BACKUP}/openhop_repeater_config/" >> "${LOG_FILE}" 2>&1
 fi
 if [ -d "${PKTFWD_DIR}" ]; then
     cp -a "${PKTFWD_DIR}" "${UPGRADE_BACKUP}/wm1303_pf/" >> "${LOG_FILE}" 2>&1
@@ -408,11 +384,11 @@ step "Recording current version info"
     if [ -d "${HAL_DIR}/.git" ]; then
         echo "sx1302_hal: $(cd "${HAL_DIR}" && git rev-parse HEAD) ($(cd "${HAL_DIR}" && git branch --show-current))"
     fi
-    if [ -d "${REPO_DIR}/pyMC_core/.git" ]; then
-        echo "pyMC_core:  $(cd "${REPO_DIR}/pyMC_core" && git rev-parse HEAD) ($(cd "${REPO_DIR}/pyMC_core" && git branch --show-current))"
+    if [ -d "${REPO_DIR}/openhop_core/.git" ]; then
+        echo "openhop_core:  $(cd "${REPO_DIR}/openhop_core" && git rev-parse HEAD) ($(cd "${REPO_DIR}/openhop_core" && git branch --show-current))"
     fi
-    if [ -d "${REPO_DIR}/pyMC_Repeater/.git" ]; then
-        echo "pyMC_Repeater: $(cd "${REPO_DIR}/pyMC_Repeater" && git rev-parse HEAD) ($(cd "${REPO_DIR}/pyMC_Repeater" && git branch --show-current))"
+    if [ -d "${REPO_DIR}/openhop_repeater/.git" ]; then
+        echo "openhop_repeater: $(cd "${REPO_DIR}/openhop_repeater" && git rev-parse HEAD) ($(cd "${REPO_DIR}/openhop_repeater" && git branch --show-current))"
     fi
 } > "${UPGRADE_BACKUP}/version_info.txt"
 ok "Version info saved"
@@ -602,13 +578,13 @@ if update_repo "${HAL_DIR}" "${HAL_BRANCH}" "${HAL_REPO}" "${HAL_REVISION}" "${H
     HAL_UPDATED=true
 fi
 
-step "Updating pyMC_core"
-if update_repo "${REPO_DIR}/pyMC_core" "${CORE_BRANCH}" "${CORE_REPO}" "${CORE_REVISION}" "${CORE_TAG}"; then
+step "Updating openhop_core"
+if update_repo "${REPO_DIR}/openhop_core" "${CORE_BRANCH}" "${CORE_REPO}" "${CORE_REVISION}" "${CORE_TAG}"; then
     CORE_UPDATED=true
 fi
 
-step "Updating pyMC_Repeater"
-if update_repo "${REPO_DIR}/pyMC_Repeater" "${REPEATER_BRANCH}" "${REPEATER_REPO}" "${REPEATER_REVISION}" "${REPEATER_TAG}"; then
+step "Updating openhop_repeater"
+if update_repo "${REPO_DIR}/openhop_repeater" "${REPEATER_BRANCH}" "${REPEATER_REPO}" "${REPEATER_REVISION}" "${REPEATER_TAG}"; then
     REPEATER_UPDATED=true
 fi
 
@@ -633,15 +609,15 @@ step "Applying HAL overlay"
 deploy_overlay "${OVERLAY_DIR}/hal" "${HAL_DIR}" >> "${LOG_FILE}" 2>&1
 ok "HAL overlay applied"
 
-step "Applying pyMC_core overlay"
-CORE_ROOT_DIR="${REPO_DIR}/pyMC_core/src/openhop_core"
-deploy_overlay "${OVERLAY_DIR}/pymc_core/src/openhop_core" "${CORE_ROOT_DIR}" >> "${LOG_FILE}" 2>&1
-ok "pyMC_core overlay applied"
+step "Applying openhop_core overlay"
+CORE_ROOT_DIR="${REPO_DIR}/openhop_core/src/openhop_core"
+deploy_overlay "${OVERLAY_DIR}/openhop_core/src/openhop_core" "${CORE_ROOT_DIR}" >> "${LOG_FILE}" 2>&1
+ok "openhop_core overlay applied"
 
-step "Applying pyMC_Repeater overlay"
-RPT_DIR="${REPO_DIR}/pyMC_Repeater"
-deploy_overlay "${OVERLAY_DIR}/pymc_repeater/repeater" "${RPT_DIR}/repeater" >> "${LOG_FILE}" 2>&1
-ok "pyMC_Repeater overlay applied"
+step "Applying openhop_repeater overlay"
+RPT_DIR="${REPO_DIR}/openhop_repeater"
+deploy_overlay "${OVERLAY_DIR}/openhop_repeater/repeater" "${RPT_DIR}/repeater" >> "${LOG_FILE}" 2>&1
+ok "openhop_repeater overlay applied"
 
 
 chown -R ${PI_USER}:${PI_GROUP} "${REPO_DIR}"
@@ -666,7 +642,7 @@ phase "Rebuild HAL & Packet Forwarder"
 
 # Check if compiled binary is missing (e.g., after manual clean or first overlay install)
 BINARY_MISSING=false
-if [ ! -f "${PKTFWD_DIR}/lora_pkt_fwd" ] || [ ! -f "${HAL_DIR}/libloragw/libloragw.a" ]; then
+if ! packet_forwarder_uses_openhop_paths "${PKTFWD_DIR}/lora_pkt_fwd" || [ ! -f "${HAL_DIR}/libloragw/libloragw.a" ]; then
     BINARY_MISSING=true
     info "HAL binary missing — rebuild required"
 fi
@@ -757,17 +733,17 @@ if [ "$VENV_REBUILD_NEEDED" = true ]; then
     fi
     ok "Done"
 
-    step "Reinstalling pyMC_core (venv rebuild)"
-    cd "${REPO_DIR}/pyMC_core"
+    step "Reinstalling openhop_core (venv rebuild)"
+    cd "${REPO_DIR}/openhop_core"
     if ! sudo -u ${PI_USER} "${VENV_DIR}/bin/pip" --no-input install -e . >> "${LOG_FILE}" 2>&1; then
-        fail "pyMC_core install failed"
+        fail "openhop_core install failed"
     fi
     ok "Reinstalled"
 
-    step "Reinstalling pyMC_Repeater (venv rebuild)"
-    cd "${REPO_DIR}/pyMC_Repeater"
+    step "Reinstalling openhop_repeater (venv rebuild)"
+    cd "${REPO_DIR}/openhop_repeater"
     if ! sudo -u "${PI_USER}" env "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENHOP_REPEATER=${REPEATER_TAG}+wm1303" "${VENV_DIR}/bin/pip" --no-input install -e . >> "${LOG_FILE}" 2>&1; then
-        fail "pyMC_Repeater install failed"
+        fail "openhop_repeater install failed"
     fi
     ok "Reinstalled"
 
@@ -819,14 +795,14 @@ if [ "$VENV_REBUILD_NEEDED" = true ]; then
 else
     # Normal path: only reinstall packages that changed
     if [ "$CORE_UPDATED" = true ] || [ "$FORCE_REBUILD" = true ]; then
-        step "Reinstalling pyMC_core"
-        cd "${REPO_DIR}/pyMC_core"
+        step "Reinstalling openhop_core"
+        cd "${REPO_DIR}/openhop_core"
         if ! sudo -u ${PI_USER} "${VENV_DIR}/bin/pip" --no-input install -e . >> "${LOG_FILE}" 2>&1; then
-            fail "pyMC_core install failed"
+            fail "openhop_core install failed"
         fi
         ok "Reinstalled"
     else
-        step "Skipping pyMC_core reinstall (no changes)"
+        step "Skipping openhop_core reinstall (no changes)"
         ok "Skipped"
     fi
 
@@ -834,36 +810,41 @@ else
     # imports via cwd/PYTHONPATH can mask missing distribution metadata/deps.
     if [ "$REPEATER_UPDATED" = true ] || [ "$FORCE_REBUILD" = true ] || \
         ! sudo -u "${PI_USER}" "${VENV_DIR}/bin/python3" -I -c 'from importlib.metadata import version; version("openhop_repeater")' >> "${LOG_FILE}" 2>&1; then
-        step "Reinstalling pyMC_Repeater"
-        cd "${REPO_DIR}/pyMC_Repeater"
+        step "Reinstalling openhop_repeater"
+        cd "${REPO_DIR}/openhop_repeater"
         if ! sudo -u "${PI_USER}" env "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENHOP_REPEATER=${REPEATER_TAG}+wm1303" "${VENV_DIR}/bin/pip" --no-input install -e . >> "${LOG_FILE}" 2>&1; then
-            fail "pyMC_Repeater install failed"
+            fail "openhop_repeater install failed"
         fi
         ok "Reinstalled"
     else
-        step "Skipping pyMC_Repeater reinstall (no changes)"
+        step "Skipping openhop_repeater reinstall (no changes)"
         ok "Skipped"
     fi
 fi  # end VENV_REBUILD_NEEDED
 
+# Preserve additional dependencies from the pre-migration environment.
+step "Restoring additional installed packages"
+sudo -u "${PI_USER}" "${VENV_DIR}/bin/python3" "${SCRIPT_DIR}/config/restore_venv_packages.py" "${INSTALL_BASE}/.pre-openhop-packages.json" >> "${LOG_FILE}" 2>&1 || fail "Additional package restoration failed; old venv and inventory are retained"
+ok "Additional packages checked"
+
 step "Restoring the local WM1303 core package"
 # Reinstalling the repeater can resolve its upstream Git core dependency over
 # our editable fork. Restore the local core after dependency resolution.
-if ! sudo -u "${PI_USER}" "${VENV_DIR}/bin/pip" --no-input install --no-deps -e "${REPO_DIR}/pyMC_core" >> "${LOG_FILE}" 2>&1; then
+if ! sudo -u "${PI_USER}" "${VENV_DIR}/bin/pip" --no-input install --no-deps -e "${REPO_DIR}/openhop_core" >> "${LOG_FILE}" 2>&1; then
     fail "Could not restore the WM1303 core package"
 fi
 ok "Local core active"
 
 # Verify overlays are accessible after all pip installs.
 # On Python 3.13 `pip install -e .` may fall back to a non-editable install for
-# pymc_core: site-packages then contains *copies* of the repo files and our
+# openhop_core: site-packages then contains *copies* of the repo files and our
 # overlay changes to e.g. hardware/__init__.py are invisible. The blocks below
 # detect this case via the import path and rsync the full overlay tree on top.
-step "Verifying pyMC_core overlay is accessible"
-PYMC_CORE_IMPORT_PATH=$(sudo -u "${PI_USER}" "${VENV_DIR}/bin/python3" -I -c "from importlib.metadata import version; version('openhop_core'); import openhop_core.hardware; print(openhop_core.hardware.__file__)" 2>> "${LOG_FILE}") || fail "Core distribution or hardware imports failed"
-if echo "$PYMC_CORE_IMPORT_PATH" | grep -q "site-packages"; then
-    SITE_CORE_DIR=$(dirname "$(dirname "$PYMC_CORE_IMPORT_PATH")")
-    deploy_overlay "${OVERLAY_DIR}/pymc_core/src/openhop_core" "${SITE_CORE_DIR}" >> "${LOG_FILE}" 2>&1
+step "Verifying openhop_core overlay is accessible"
+CORE_IMPORT_PATH=$(sudo -u "${PI_USER}" "${VENV_DIR}/bin/python3" -I -c "from importlib.metadata import version; version('openhop_core'); import openhop_core.hardware; print(openhop_core.hardware.__file__)" 2>> "${LOG_FILE}") || fail "Core distribution or hardware imports failed"
+if echo "$CORE_IMPORT_PATH" | grep -q "site-packages"; then
+    SITE_CORE_DIR=$(dirname "$(dirname "$CORE_IMPORT_PATH")")
+    deploy_overlay "${OVERLAY_DIR}/openhop_core/src/openhop_core" "${SITE_CORE_DIR}" >> "${LOG_FILE}" 2>&1
     chown -R ${PI_USER}:${PI_GROUP} "${SITE_CORE_DIR}"
     ok "Re-applied overlay to site-packages (rsync)"
 else
@@ -879,16 +860,18 @@ else
     fail "WM1303Backend import failed (check ${LOG_FILE})"
 fi
 
-step "Verifying pyMC_Repeater overlay is accessible"
+step "Verifying openhop_repeater overlay is accessible"
 REPEATER_IMPORT_PATH=$(sudo -u "${PI_USER}" "${VENV_DIR}/bin/python3" -I -c "from importlib.metadata import version; version('openhop_repeater'); import repeater.config; print(repeater.config.__file__)" 2>> "${LOG_FILE}") || fail "Repeater distribution or configuration imports failed"
 if echo "$REPEATER_IMPORT_PATH" | grep -q "site-packages"; then
     SITE_REPEATER_DIR=$(dirname "$REPEATER_IMPORT_PATH")
-    deploy_overlay "${OVERLAY_DIR}/pymc_repeater/repeater" "${SITE_REPEATER_DIR}" >> "${LOG_FILE}" 2>&1
+    deploy_overlay "${OVERLAY_DIR}/openhop_repeater/repeater" "${SITE_REPEATER_DIR}" >> "${LOG_FILE}" 2>&1
     chown -R ${PI_USER}:${PI_GROUP} "${SITE_REPEATER_DIR}"
     ok "Re-applied overlay to site-packages (rsync)"
 else
     ok "Editable install active"
 fi
+
+rm -f "${INSTALL_BASE}/.rebuild-venv"
 
 # Clean Python bytecode caches
 step "Cleaning Python bytecode caches"
@@ -1143,7 +1126,7 @@ import json, runpy, sys
 from pathlib import Path
 
 # Load only the stdlib writer, without importing the installed repeater app.
-atomic_write_text = runpy.run_path(str(Path(sys.argv[1]) / "overlay/pymc_repeater/repeater/atomic_file.py"))["atomic_write_text"]
+atomic_write_text = runpy.run_path(str(Path(sys.argv[1]) / "overlay/openhop_repeater/repeater/atomic_file.py"))["atomic_write_text"]
 try:
     tmpl_path = Path(sys.argv[1]) / "config/wm1303_ui.json"
     live_path = sys.argv[2]
@@ -1199,7 +1182,7 @@ PYMERGE
 import json, runpy, sys
 from pathlib import Path
 
-atomic_write_text = runpy.run_path(str(Path(sys.argv[1]) / "overlay/pymc_repeater/repeater/atomic_file.py"))["atomic_write_text"]
+atomic_write_text = runpy.run_path(str(Path(sys.argv[1]) / "overlay/openhop_repeater/repeater/atomic_file.py"))["atomic_write_text"]
 try:
     path = sys.argv[2]
     with open(path, encoding="utf-8") as f:
@@ -1250,7 +1233,7 @@ PYNORM
 import runpy, sys, yaml
 from pathlib import Path
 
-atomic_write_text = runpy.run_path(str(Path(sys.argv[1]) / "overlay/pymc_repeater/repeater/atomic_file.py"))["atomic_write_text"]
+atomic_write_text = runpy.run_path(str(Path(sys.argv[1]) / "overlay/openhop_repeater/repeater/atomic_file.py"))["atomic_write_text"]
 
 live_path = sys.argv[2]
 try:
@@ -1327,7 +1310,7 @@ PYMIGRATE
 import runpy, sys, yaml
 from pathlib import Path
 
-atomic_write_text = runpy.run_path(str(Path(sys.argv[1]) / "overlay/pymc_repeater/repeater/atomic_file.py"))["atomic_write_text"]
+atomic_write_text = runpy.run_path(str(Path(sys.argv[1]) / "overlay/openhop_repeater/repeater/atomic_file.py"))["atomic_write_text"]
 def deep_merge(base, override):
     added = []
     for key, val in base.items():
@@ -1415,7 +1398,7 @@ ok "Service file updated (user: ${PI_USER})"
 # Keep upgrades consistent with install.sh: BCM2835 hardware watchdog module +
 # systemd RuntimeWatchdogSec so a full OS freeze reboots the Pi automatically.
 # The service-level watchdog (Type=notify + WatchdogSec) comes from the updated
-# pymc-repeater.service file copied just above.
+# openhop-repeater.service file copied just above.
 step "Enabling BCM2835 hardware watchdog module"
 WDT_MODCONF="/etc/modules-load.d/bcm2835_wdt.conf"
 if [ -f "${WDT_MODCONF}" ] && grep -q '^bcm2835_wdt' "${WDT_MODCONF}" 2>/dev/null; then
@@ -1508,24 +1491,6 @@ step "Updating version file"
 if [ -f "${SCRIPT_DIR}/VERSION" ]; then
     cp "${SCRIPT_DIR}/VERSION" "${CONFIG_DIR}/version" >> "${LOG_FILE}" 2>&1
     chown ${PI_USER}:${PI_GROUP} "${CONFIG_DIR}/version"
-    # NOTE: The v2.6.2 dual-write shim to ${LEGACY_CONFIG_DIR}/version was
-    # removed in v2.6.3 now that the overlay code reads via
-    # openhop_core.paths.resolve_config_path(), which handles both
-    # /etc/openhop_repeater/ (canonical) and /etc/pymc_repeater/ (legacy
-    # fallback). The Phase 1 legacy config-dir migration earlier in this
-    # script (cp -an ${LEGACY_CONFIG_DIR}/. ${CONFIG_DIR}/) still ensures
-    # that devices upgraded from v2.5.x get their old version file copied
-    # into ${CONFIG_DIR}/ before this step overwrites it with the new value.
-    # Hardening: if a stale legacy version marker still exists (left behind
-    # by an old install), re-sync it with the canonical version so
-    # audits/tools can never read a wrong value again. Never CREATE the
-    # legacy file — only refresh an existing one, and skip when legacy and
-    # canonical resolve to the same file (e.g. symlinked config dirs).
-    if [ -f "${LEGACY_CONFIG_DIR}/version" ] && ! [ "${LEGACY_CONFIG_DIR}/version" -ef "${CONFIG_DIR}/version" ]; then
-        cp "${SCRIPT_DIR}/VERSION" "${LEGACY_CONFIG_DIR}/version" >> "${LOG_FILE}" 2>&1 || true
-        chown "${PI_USER}:${PI_GROUP}" "${LEGACY_CONFIG_DIR}/version" 2>/dev/null || true
-        ok "Legacy ${LEGACY_CONFIG_DIR}/version re-synced to canonical version"
-    fi
     ok "v$(cat "${SCRIPT_DIR}/VERSION")"
 else
     warn "VERSION file not found in repo"
@@ -1971,8 +1936,8 @@ sudo "${PKTFWD_DIR}/reset_lgw.sh" deep_reset 60 >> "${LOG_FILE}" 2>&1
 ok "Hardware drain reset complete"
 
 step "Verifying complete core and repeater overlay deployment"
-[ "$(overlay_diff_count "${OVERLAY_DIR}/pymc_core/src/openhop_core" "${CORE_ROOT_DIR}")" = 0 ] || fail "Core overlay deployment is incomplete"
-[ "$(overlay_diff_count "${OVERLAY_DIR}/pymc_repeater/repeater" "${RPT_DIR}/repeater")" = 0 ] || fail "Repeater overlay deployment is incomplete"
+[ "$(overlay_diff_count "${OVERLAY_DIR}/openhop_core/src/openhop_core" "${CORE_ROOT_DIR}")" = 0 ] || fail "Core overlay deployment is incomplete"
+[ "$(overlay_diff_count "${OVERLAY_DIR}/openhop_repeater/repeater" "${RPT_DIR}/repeater")" = 0 ] || fail "Repeater overlay deployment is incomplete"
 ok "All overlay files match"
 
 step "Starting openhop-repeater service"
@@ -2131,8 +2096,8 @@ echo -e "  Version:          ${CYAN}${VERSION_STR}${NC}"
 echo -e "  Backup location:  ${CYAN}${UPGRADE_BACKUP}${NC}"
 echo -e "  HAL updated:      ${CYAN}${HAL_UPDATED}${NC}"
 echo -e "  HAL overlay diff: ${CYAN}${HAL_OVERLAY_CHANGED}${NC}"
-echo -e "  pyMC_core updated: ${CYAN}${CORE_UPDATED}${NC}"
-echo -e "  pyMC_Repeater updated: ${CYAN}${REPEATER_UPDATED}${NC}"
+echo -e "  openhop_core updated: ${CYAN}${CORE_UPDATED}${NC}"
+echo -e "  openhop_repeater updated: ${CYAN}${REPEATER_UPDATED}${NC}"
 echo -e "  HAL rebuilt:      ${CYAN}$( [ "$FORCE_REBUILD" = true ] || [ "$HAL_UPDATED" = true ] || [ "$HAL_OVERLAY_CHANGED" = true ] || [ "$BINARY_MISSING" = true ] && echo 'yes' || echo 'no')${NC}"
 echo -e "  Full log:         ${CYAN}${LOG_FILE}${NC}"
 echo ""

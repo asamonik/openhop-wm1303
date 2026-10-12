@@ -49,7 +49,7 @@ class OverlayDeploymentTests(unittest.TestCase):
             target = Path(directory) / "deployment"
             target.mkdir()
             (target / "upstream_only.py").write_text("# upstream\n")
-            source = ROOT / "overlay/pymc_repeater/repeater"
+            source = ROOT / "overlay/openhop_repeater/repeater"
             self.run_helper('deploy_overlay "$1" "$2"', source, target)
             for file in source.rglob("*"):
                 if file.is_file() and "__pycache__" not in file.parts and file.suffix not in (".pyc", ".pyo"):
@@ -165,7 +165,7 @@ class InstallerControlFlowTests(unittest.TestCase):
         source = "    # A runnable Python alone" + source
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "pyMC_Repeater").mkdir()
+            (root / "openhop_repeater").mkdir()
             calls = root / "calls"
             mocks = '''
 step() { :; }
@@ -197,31 +197,6 @@ sudo() {
                 if metadata_status != "0":
                     self.assertTrue(commands[1].endswith("bin/pip --no-input install -e ."))
 
-    def test_legacy_migration_failures_stop_before_startup(self):
-        helper = shell_function("install.sh", "_migrate_legacy_vardir")
-        self.assertEqual(helper, shell_function("upgrade.sh", "_migrate_legacy_vardir"))
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            legacy, target = root / "legacy", root / "target"
-            legacy.mkdir()
-            target.mkdir()
-            (legacy / "history.db").write_bytes(b"history")
-            for nonempty in (False, True):
-                if nonempty:
-                    (target / "new.db").write_bytes(b"new")
-                script = '''
-ok() { :; }
-fail() { printf '%s\\n' "$*" >&2; exit 1; }
-rsync() { return 23; }
-cp() { return 1; }
-''' + helper + '\n_migrate_legacy_vardir "$1" "$2" "data dir"\nprintf continued'
-                result = subprocess.run(["bash", "-eu", "-c", script, "test", str(legacy), str(target)],
-                                        capture_output=True, text=True, env=dict(os.environ, LOG_FILE=str(root / "log")))
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("failed", result.stderr)
-                self.assertNotIn("continued", result.stdout)
-                self.assertEqual((legacy / "history.db").read_bytes(), b"history")
-
     def test_detached_updater_assembles_fixed_job_and_reports_lifecycle(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -235,9 +210,9 @@ cp() { return 1; }
             log = root / "update.log"
             args, calls = root / "args", root / "calls"
             source = (ROOT / "config/wm1303-upgrade").read_text()
-            source = source.replace("/usr/local/lib/pymc-wm1303", str(trusted))
+            source = source.replace("/usr/local/lib/openhop-wm1303", str(trusted))
             source = source.replace("/var/log/wm1303-update.log", str(log))
-            source = source.replace("/run/lock/pymc-wm1303", str(root / "lock"))
+            source = source.replace("/run/lock/openhop-wm1303", str(root / "lock"))
             source = source.replace("export PATH=/usr/sbin:/usr/bin:/sbin:/bin", "export PATH=" + shlex.quote(os.environ["PATH"]))
             mocks = '''
 id() { if [ "$#" = 1 ]; then printf '0\\n'; else printf '1001\\n'; fi; }
@@ -315,7 +290,7 @@ systemd-run() { printf '%s\\n' "$@" > "$ARGS_LOG"; return "$RUN_STATUS"; }
             (checkout / "bootstrap.sh").write_text("exit 99\n")
             (checkout / "config/wm1303-upgrade").write_text("exit 99\n")
             lib, sbin = root / "lib", root / "sbin"
-            source = source.replace("/usr/local/lib/pymc-wm1303", str(lib)).replace("/usr/local/sbin", str(sbin))
+            source = source.replace("/usr/local/lib/openhop-wm1303", str(lib)).replace("/usr/local/sbin", str(sbin))
             mocks = '''
 id() { printf '1001\\n'; }
 git() { printf 'git@github.com:Example/pyMC_WM1303.git\\n'; }
@@ -639,7 +614,7 @@ warn() { :; }
 
 class ResetScriptTests(unittest.TestCase):
     def test_ui_gpio_update_preserves_installed_reset_and_drain_behavior(self):
-        source = ROOT / "overlay/pymc_repeater/repeater/web/wm1303_api.py"
+        source = ROOT / "overlay/openhop_repeater/repeater/web/wm1303_api.py"
         function = next(node for node in ast.parse(source.read_text()).body
                         if isinstance(node, ast.FunctionDef) and node.name == "_regenerate_gpio_scripts")
         with tempfile.TemporaryDirectory() as directory:

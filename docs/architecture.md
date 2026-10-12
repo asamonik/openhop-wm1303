@@ -147,7 +147,7 @@ Since v2.0.0 the system operates as a **5-channel platform**:
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                         │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │              pyMC Repeater UI (Vue.js app)                      │    │
+│  │              OpenHop Repeater UI (Vue.js app)                      │    │
 │  │  Existing MeshCore functionality: nodes, mesh, messaging        │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -163,7 +163,7 @@ Since v2.0.0 the system operates as a **5-channel platform**:
 │       │                │                    │                    │
 │       │           UDP :1730            ┌────┴────────┐           │
 │       │                                │             │           │
-│   SX1302/SX1261                   pymc_core    pymc_repeater     │
+│   SX1302/SX1261                   openhop_core    openhop_repeater     │
 │   (hardware)                      (library)    (application)     │
 │                                       │             │            │
 │                                       │        Bridge Engine     │
@@ -182,7 +182,7 @@ Since v2.0.0 the system operates as a **5-channel platform**:
 │                                         WebSocket                │
 │                                              │                   │
 │                                      WM1303 Manager UI           │
-│                                      pyMC Repeater UI            │
+│                                      OpenHop Repeater UI            │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -191,8 +191,8 @@ Since v2.0.0 the system operates as a **5-channel platform**:
 | Layer | Language | Components |
 |-------|----------|------------|
 | HAL / Concentrator | **C** | libloragw (SX1302 HAL), lora_pkt_fwd (packet forwarder) |
-| Backend / Logic | **Python 3** | WM1303 Backend, Bridge Engine, Channel E Bridge, TX Queue, pymc_core, pymc_repeater |
-| Web UI | **HTML / JavaScript / CSS** | WM1303 Manager (wm1303.html), pyMC Repeater UI (Vue.js) |
+| Backend / Logic | **Python 3** | WM1303 Backend, Bridge Engine, Channel E Bridge, TX Queue, openhop_core, openhop_repeater |
+| Web UI | **HTML / JavaScript / CSS** | WM1303 Manager (wm1303.html), OpenHop Repeater UI (Vue.js) |
 | Configuration | **JSON / YAML** | global_conf.json, bridge_conf.json, wm1303_ui.json, config.yaml |
 | System Scripts | **Shell (sh)** | install.sh, upgrade.sh, bootstrap.sh, reset_lgw.sh, power_cycle_lgw.sh |
 | Build System | **Make** | HAL and packet forwarder compilation |
@@ -270,10 +270,10 @@ Bridge Engine decision → Repeater handler (hop +1, path update)
 HAL spectral scan thread (pace_s=1, nb_scan=100)
     → SX1261 spectral scan via /dev/spidev0.1
     → Scan during TX-free windows only
-    → Results to /tmp/pymc_spectral_results.json
+    → Results to /tmp/openhop_spectral_results.json
 
 NoiseFloorMonitor (every 30s, does NOT pause TX queues)
-    → Read /tmp/pymc_spectral_results.json
+    → Read /tmp/openhop_spectral_results.json
     → Per-channel frequency matching (freq ± BW/2)
     → RSSI values → Rolling buffer (20 samples) per TX queue
     → Noise floor values persisted to database
@@ -315,17 +315,17 @@ This applies to:
 ## Directory Structure (Installed System)
 
 ```
-/opt/pymc_repeater/                    # Main installation directory
+/opt/openhop_repeater/                    # Main installation directory
 ├── repos/
-│   ├── pyMC_core/                     # MeshCore core library (dev branch)
-│   │   └── src/pymc_core/
+│   ├── openhop_core/                     # OpenHop core (pinned release)
+│   │   └── src/openhop_core/
 │   │       └── hardware/
 │   │           ├── wm1303_backend.py  # WM1303 concentrator backend
 │   │           ├── virtual_radio.py   # VirtualLoRaRadio per-channel abstraction
 │   │           ├── tx_queue.py        # Per-channel TX queue
 │   │           ├── sx1261_driver.py   # SX1261 companion radio driver
 │   │           └── sx1302_hal.py      # HAL wrapper
-│   └── pyMC_Repeater/                 # Repeater application (dev branch)
+│   └── openhop_repeater/                 # OpenHop Repeater (pinned release)
 │       └── repeater/
 │           ├── main.py                # Main daemon (with bridge init)
 │           ├── bridge_engine.py       # Cross-channel packet routing
@@ -339,7 +339,7 @@ This applies to:
 │               └── html/
 │                   └── wm1303.html    # WM1303 Manager UI
 │
-/etc/pymc_repeater/                    # Runtime configuration
+/etc/openhop_repeater/                    # Runtime configuration
 ├── config.yaml                        # Repeater config
 ├── wm1303_ui.json                     # WM1303 SSOT config
 └── version                            # Deployed version
@@ -351,7 +351,7 @@ This applies to:
 └── spectral_scan/                     # Scan result storage
 │
 /tmp/                                  # Transient runtime files
-├── pymc_spectral_results.json         # Latest spectral scan output
+├── openhop_spectral_results.json         # Latest spectral scan output
 └── various runtime state files
 ```
 

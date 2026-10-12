@@ -8,7 +8,7 @@ The WM1303 software stack combines modified upstream projects with overlay files
 
 1. **C layer** — Modified SX1302 HAL and packet forwarder
 2. **Python layer** — WM1303 backend, bridge engine, TX queues, and API
-3. **Web layer** — WM1303 Manager UI and pyMC Repeater UI integration
+3. **Web layer** — WM1303 Manager UI and OpenHop Repeater UI integration
 
 ## Upstream Sources & Overlay Strategy
 
@@ -84,7 +84,7 @@ The main coordinator (~2970 lines). Responsibilities:
 
 Per-channel radio abstraction (~198 lines):
 
-- Implements the standard `LoRaRadio` interface used by pymc_core/repeater
+- Implements the standard `LoRaRadio` interface used by openhop_core/repeater
 - Each instance represents one logical channel (A, B, C, or D)
 - Async RX queue with thread-safe enqueue from UDP handler thread
 - Per-channel noise floor estimation from RSSI history
@@ -131,7 +131,7 @@ Cross-channel packet routing engine (~865 lines):
 | Rule-based routing | Source → target channel mapping with packet-type filtering |
 | Deduplication | SHA256 full-packet hash with 15s TTL |
 | Packet type filtering | Per-rule: all, advert, text, position, etc. |
-| Repeater handler | Hop count +1, path bytes update via pymc_repeater |
+| Repeater handler | Hop count +1, path bytes update via openhop_repeater |
 | TX batch window | 2-second window for concurrent queuing |
 | Channel aliases | Dynamic alias resolution (channel_a, ch-1, n1, etc.) |
 | Dedup event logging | Ring buffer (500 entries) + SQLite background writer |
@@ -145,14 +145,14 @@ Dedicated bridge component for Channel E packet routing:
 - Handles Channel E packet injection into the bridge
 - Manages Channel E-specific packet forwarding
 
-### Modifications to Upstream pymc_core
+### Modifications to Upstream openhop_core
 
 | File | Changes |
 |------|---------|
 | `__init__.py` | Conditional imports for WM1303Backend + VirtualLoRaRadio |
 | (hardware/) | Added: wm1303_backend.py, virtual_radio.py, tx_queue.py, sx1261_driver.py, sx1302_hal.py |
 
-### Modifications to Upstream pymc_repeater
+### Modifications to Upstream openhop_repeater
 
 | File | Lines Added | Changes |
 |------|------------|--------|
@@ -207,7 +207,7 @@ See [`ui.md`](./ui.md).
 
 ### systemd Service
 
-The WM1303 repeater runs as a systemd service (`pymc-repeater.service`):
+The WM1303 repeater runs as a systemd service (`openhop-repeater.service`):
 
 - Automatic start on boot
 - Restart on failure
@@ -217,8 +217,8 @@ The WM1303 repeater runs as a systemd service (`pymc-repeater.service`):
 ### Process Hierarchy
 
 ```
-systemd → pymc-repeater.service
-    → Python (pymc_repeater main.py)
+systemd → openhop-repeater.service
+    → Python (openhop_repeater main.py)
         → WM1303Backend
             → lora_pkt_fwd (child process)
             → UDP handler thread
@@ -231,7 +231,7 @@ systemd → pymc-repeater.service
         → Channel E Bridge
         → CherryPy HTTP server
             → WM1303 API
-            → pyMC Repeater API
+            → OpenHop Repeater API
             → WebSocket server
 ```
 
@@ -248,7 +248,7 @@ SQLite databases for persistent storage:
 | `noise_floor` / `noise_floor_history` | Per-channel noise floor snapshots |
 | `dedup_events` | Bridge dedup/echo event history |
 | `channel_stats` | Periodic channel counter snapshots |
-| Standard pymc_repeater tables | Nodes, messages, etc. |
+| Standard openhop_repeater tables | Nodes, messages, etc. |
 
 ### spectrum_history.db (7-day retention)
 

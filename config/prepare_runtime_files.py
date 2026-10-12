@@ -9,10 +9,10 @@ import sys
 
 
 RUNTIME_FILES = (
-    "pymc_spectral_results.json",
-    "pymc_wm1303_bridge_conf.json",
-    "pymc_cad_config.json",
-    "pymc_channel_e_bridge_conf.json",
+    "openhop_spectral_results.json",
+    "openhop_wm1303_bridge_conf.json",
+    "openhop_cad_config.json",
+    "openhop_channel_e_bridge_conf.json",
 )
 
 
@@ -42,6 +42,16 @@ def main() -> None:
     gid = grp.getgrnam(sys.argv[2]).gr_gid
     for filename in RUNTIME_FILES:
         prepare_runtime_file(Path("/tmp") / filename, uid, gid)
+        # Radio services have stopped and the HAL is rebuilt before this call.
+        # Old IPC snapshots are disposable; persistent state lives under /var.
+        for suffix in ("", ".tmp"):
+            legacy = Path("/tmp") / (filename.replace("openhop_", "pymc_", 1) + suffix)
+            try:
+                info = legacy.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid in (0, uid):
+                legacy.unlink()
 
 
 if __name__ == "__main__":

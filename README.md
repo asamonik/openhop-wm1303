@@ -8,6 +8,9 @@ Based on [Hans van Meer's WM1303 integration](https://github.com/HansvanMeer/pyM
 [OpenHop core](https://github.com/openhop-dev/openhop_core), and
 [OpenHop Repeater](https://github.com/openhop-dev/openhop_repeater).
 The installer uses the revisions in [config/dependencies.conf](config/dependencies.conf).
+This repository adds WM1303 hardware support to the current stable OpenHop
+releases. Existing pyMC installation paths migrate automatically; see the
+[migration details](docs/installation.md#migration-from-pymc-installation-paths).
 
 ## Hardware
 

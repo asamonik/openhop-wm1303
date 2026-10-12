@@ -97,7 +97,7 @@ Channel E is documented and exposed with the same type of channel settings as th
 
 > **Note:** CAD is mandatory since v2.1.0 and cannot be disabled. There is no CAD toggle in the UI.
 
-The configuration is sourced from **`/etc/pymc_repeater/wm1303_ui.json`**, keeping it aligned with the SSOT model used throughout the project.
+The configuration is sourced from **`/etc/openhop_repeater/wm1303_ui.json`**, keeping it aligned with the SSOT model used throughout the project.
 
 ## Bridge integration
 

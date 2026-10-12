@@ -14,7 +14,7 @@ The WM1303 system uses multiple configuration files with a **Single Source of Tr
 | `config.yaml` | `/etc/openhop_repeater/config.yaml` | Repeater-level config (radio type, identity) | Repeater UI, manual |
 | `bridge_conf.json` | `~/wm1303_pf/bridge_conf.json` | **Generated** — HAL/forwarder config | Auto-generated on service start |
 | `global_conf.json` | `~/wm1303_pf/global_conf.json` | **Copy** of bridge_conf.json | Auto-generated |
-| `pymc_wm1303_bridge_conf.json` | `/tmp/pymc_wm1303_bridge_conf.json` | Active forwarder configuration snapshot | Backend at startup |
+| `openhop_wm1303_bridge_conf.json` | `/tmp/openhop_wm1303_bridge_conf.json` | Active forwarder configuration snapshot | Backend at startup |
 | `version` | `/etc/openhop_repeater/version` | Deployed WM1303 version number | Install/upgrade scripts |
 
 `~` means the installed service user's home. Legacy `/etc/pymc_repeater` data is
@@ -49,7 +49,7 @@ Service start / restart
     → _generate_bridge_conf() reads wm1303_ui.json
     → Generates bridge_conf.json (HAL/forwarder config)
     → Copies bridge_conf.json → global_conf.json
-    → Backend publishes /tmp/pymc_wm1303_bridge_conf.json
+    → Backend publishes /tmp/openhop_wm1303_bridge_conf.json
     → lora_pkt_fwd loads that active snapshot
 ```
 
@@ -62,7 +62,7 @@ Service start / restart
 
 ## config.yaml
 
-The standard pyMC Repeater configuration file. WM1303-specific additions:
+The standard OpenHop Repeater configuration file. WM1303-specific additions:
 
 ```yaml
 radio_type: wm1303
@@ -550,7 +550,7 @@ During installation:
 1. Template `config.yaml.template` is copied to `/etc/openhop_repeater/config.yaml`
 2. Default `wm1303_ui.json` is copied to `/etc/openhop_repeater/wm1303_ui.json`; the bootstrap wizard selects region and sync-word defaults, not active radio channels
 3. `bridge_conf.json` and `global_conf.json` are generated on first service start
-4. Service generates the JWT token for pyMC Repeater authentication
+4. Service generates the JWT token for OpenHop Repeater authentication
 
 ## Configuration During Upgrade
 

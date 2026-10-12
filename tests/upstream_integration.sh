@@ -27,8 +27,13 @@ clone_pinned_fixture() {
 
 clone_pinned_fixture "$CORE_REPO" "$CORE_REVISION" "$CORE_TAG" "$WM1303_TEST_DIR/core"
 clone_pinned_fixture "$REPEATER_REPO" "$REPEATER_REVISION" "$REPEATER_TAG" "$WM1303_TEST_DIR/repeater"
-deploy_overlay "$WM1303_TEST_ROOT/overlay/pymc_core/src/openhop_core" "$WM1303_TEST_DIR/core/src/openhop_core"
-deploy_overlay "$WM1303_TEST_ROOT/overlay/pymc_repeater/repeater" "$WM1303_TEST_DIR/repeater/repeater"
+# Lightweight unit tests borrow only these unchanged upstream helpers. They are
+# fixtures, never deployed over OpenHop; verify them against the selected release.
+for fixture in "$WM1303_TEST_ROOT"/tests/fixtures/upstream/repeater/*.py; do
+    cmp "$fixture" "$WM1303_TEST_DIR/repeater/repeater/${fixture##*/}"
+done
+deploy_overlay "$WM1303_TEST_ROOT/overlay/openhop_core/src/openhop_core" "$WM1303_TEST_DIR/core/src/openhop_core"
+deploy_overlay "$WM1303_TEST_ROOT/overlay/openhop_repeater/repeater" "$WM1303_TEST_DIR/repeater/repeater"
 if command -v uv >/dev/null 2>&1; then
     uv venv --python "${WM1303_TEST_PYTHON_VERSION:-python3}" "$WM1303_TEST_DIR/venv"
 else

@@ -6,10 +6,10 @@
 
 The WM1303 system is built from **four repositories**: three pinned canonical dependencies and this integration layer.
 
-The official upstream of `pyMC_core` and `pyMC_Repeater` has moved. Previously the canonical sources lived under the `pyMC-dev` GitHub organization; they have since been migrated to:
-
-- **https://github.com/openhop-dev/openhop_core** (was `pyMC-dev/pymc-core`)
-- **https://github.com/openhop-dev/openhop_repeater** (was `pyMC-dev/pymc-repeater`)
+The upstream repositories are [OpenHop core](https://github.com/openhop-dev/openhop_core)
+and [OpenHop Repeater](https://github.com/openhop-dev/openhop_repeater).
+The latest published releases were checked on 2026-10-12: core 1.1.3 and repeater
+1.1.4. Keep exact release commits pinned so a device upgrade uses a tested pair.
 
 The installer now consumes canonical OpenHop core 1.1.3, OpenHop Repeater 1.1.4,
 and Semtech HAL 2.1.0. Exact commits and matching release tags are recorded in
@@ -41,11 +41,14 @@ Overlays replace complete files, including `main.py`, `engine.py`, and
 `packet_router.py`. Updates to the underlying dependencies therefore do not automatically
 bring fixes into those files. Compare changed upstream interfaces and run the
 [regression checks](testing.md) whenever updating the dependency versions.
+Unchanged upstream modules and presets are supplied by the pinned release,
+not copied from this overlay. The three upstream helpers used by standalone
+tests are test fixtures only and are checked against the release during integration.
 
 Use the WM1303-aware Console updater or this repository's `bootstrap.sh` /
 `upgrade.sh` to update WM1303 systems. The Console launches the same workflow in
 a separate systemd job, using root-owned bootstrap/config copies installed under
-`/usr/local/lib/pymc-wm1303`. It captures and preserves the installed integration
+`/usr/local/lib/openhop-wm1303`. It captures and preserves the installed integration
 fork's GitHub owner/repository and follows `main`; the standalone bootstrap
 defaults to this fork (`asamonik/openhop-wm1303`) unless `WM1303_REPO_URL` explicitly
 selects another GitHub fork named `openhop-wm1303` or `pyMC_WM1303`.
@@ -60,7 +63,8 @@ Manual update commands keep using their existing configured remote transport.
 
 Generic OpenHop package updates do not reapply these overlays or rebuild the
 HAL. The Python distribution names are `openhop_core` and `openhop_repeater`,
-despite the retained `pyMC_core` and `pyMC_Repeater` checkout directory names.
+and the checkout directory names now match those distributions. The Python
+import packages remain `openhop_core` and `repeater`, as defined upstream.
 The repeater requires core 1.1.3; the scripts install the compatible local core
 and restore its editable WM1303 overlay after package installation.
 
@@ -106,7 +110,7 @@ openhop-wm1303/overlay/
 │   ├── packet_forwarder/inc/ → Packet forwarder headers
 │   └── packet_forwarder/Makefile → Modified Makefile
 │
-├── pymc_core/              → copied into pyMC_core/
+├── openhop_core/              → copied into openhop_core/
 │   └── src/openhop_core/
 │       ├── meshcore_wire.py     → Firmware-compatible wire helpers
 │       ├── paths.py             → Canonical/legacy path resolution
@@ -118,7 +122,7 @@ openhop-wm1303/overlay/
 │           ├── sx1261_driver.py → SX1261 companion radio driver
 │           └── sx1302_hal.py    → HAL wrapper
 │
-└── pymc_repeater/          → copied into pyMC_Repeater/
+└── openhop_repeater/          → copied into openhop_repeater/
     └── repeater/
         ├── main.py              → Modified main (bridge init, SSOT loading)
         ├── bridge_engine.py     → Cross-channel packet routing
@@ -200,8 +204,8 @@ Important file groups include:
 openhop-wm1303/
 ├── overlay/                 # Source overlays (see above)
 │   ├── hal/
-│   ├── pymc_core/
-│   └── pymc_repeater/
+│   ├── openhop_core/
+│   └── openhop_repeater/
 ├── config/                  # Configuration templates
 │   ├── wm1303_ui.json       # Default SSOT config
 │   ├── config.yaml.template # Repeater config template

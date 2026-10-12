@@ -13,15 +13,16 @@ import cherrypy
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "overlay/pymc_repeater"))
-sys.path.insert(0, str(ROOT / "overlay/pymc_core/src"))
+sys.path.insert(0, str(ROOT / "overlay/openhop_repeater"))
+sys.path.append(str(ROOT / "tests/fixtures/upstream"))
+sys.path.insert(0, str(ROOT / "overlay/openhop_core/src"))
 
 from repeater.config_manager import ConfigManager
 
 
 class MeshPasswordTests(unittest.TestCase):
     def setUp(self):
-        source = ROOT / "overlay/pymc_repeater/repeater/web/api_endpoints.py"
+        source = ROOT / "overlay/openhop_repeater/repeater/web/api_endpoints.py"
         definition = next(node for node in ast.parse(source.read_text()).body
                           if isinstance(node, ast.ClassDef) and node.name == "APIEndpoints")
         definition.body = [node for node in definition.body

@@ -239,6 +239,6 @@ echo "\n=== User Groups ===" && groups $(whoami)
 If you're still experiencing issues after following this guide:
 
 1. Run the diagnostic script above and save the output
-2. Check the packet forwarder logs: `sudo journalctl -u pymc-repeater -n 100`
+2. Check the packet forwarder logs: `sudo journalctl -u openhop-repeater -n 100`
 3. Generate a debug bundle via the WM1303 Manager UI (Status tab → Debug Bundle)
 4. Open an issue on GitHub with the diagnostic output and your board model/configuration

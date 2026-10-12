@@ -17,20 +17,21 @@ from unittest.mock import AsyncMock, Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "overlay/pymc_repeater"))
-sys.path.insert(0, str(ROOT / "overlay/pymc_core/src"))
+sys.path.insert(0, str(ROOT / "overlay/openhop_repeater"))
+sys.path.append(str(ROOT / "tests/fixtures/upstream"))
+sys.path.insert(0, str(ROOT / "overlay/openhop_core/src"))
 
 # An installed regular openhop_core package takes precedence over this
 # namespace overlay. Canonically load these checkout helpers before importing
 # the bridge so its task context and scheduler always use the same module.
 wire_spec = importlib.util.spec_from_file_location(
-    "openhop_core.meshcore_wire", ROOT / "overlay/pymc_core/src/openhop_core/meshcore_wire.py")
+    "openhop_core.meshcore_wire", ROOT / "overlay/openhop_core/src/openhop_core/meshcore_wire.py")
 wire = importlib.util.module_from_spec(wire_spec)
 sys.modules[wire_spec.name] = wire
 wire_spec.loader.exec_module(wire)
 
 tx_spec = importlib.util.spec_from_file_location(
-    "openhop_core.hardware.tx_queue", ROOT / "overlay/pymc_core/src/openhop_core/hardware/tx_queue.py")
+    "openhop_core.hardware.tx_queue", ROOT / "overlay/openhop_core/src/openhop_core/hardware/tx_queue.py")
 tx = importlib.util.module_from_spec(tx_spec)
 sys.modules[tx_spec.name] = tx
 tx_spec.loader.exec_module(tx)
@@ -51,7 +52,7 @@ def load_hardware(name):
     base.LoRaRadio = object
     spec = importlib.util.spec_from_file_location(
         "wm1303_test_hardware." + name,
-        ROOT / "overlay/pymc_core/src/openhop_core/hardware" / (name + ".py"))
+        ROOT / "overlay/openhop_core/src/openhop_core/hardware" / (name + ".py"))
     result = importlib.util.module_from_spec(spec)
     with patch.dict(sys.modules, {parent.__name__: parent, base.__name__: base}):
         spec.loader.exec_module(result)
@@ -624,7 +625,7 @@ class BackendHelperTests(unittest.TestCase):
     def test_companion_normalizes_radio_coding_rates_without_mutating_host(self):
         spec = importlib.util.spec_from_file_location(
             "companion_radio_settings",
-            ROOT / "overlay/pymc_repeater/repeater/companion/radio_settings.py")
+            ROOT / "overlay/openhop_repeater/repeater/companion/radio_settings.py")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         for encoded, expected in (("4/5", 5), ("4/8", 8), (5, 5), (8, 8), (1, 5), (4, 8)):

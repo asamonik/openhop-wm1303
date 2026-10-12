@@ -10,7 +10,8 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'overlay/pymc_repeater'))
+sys.path.insert(0, str(ROOT / 'overlay/openhop_repeater'))
+sys.path.append(str(ROOT / "tests/fixtures/upstream"))
 from repeater.region_scope import apply_default_advert_scope, resolve_default_region
 
 
@@ -54,7 +55,7 @@ class RegionScopeTests(unittest.TestCase):
             ('main.py', 'RepeaterDaemon', 'send_advert'),
             ('web/api_endpoints.py', 'APIEndpoints', '_send_room_server_advert_async'),
         ):
-            source = ROOT / 'overlay/pymc_repeater/repeater' / file
+            source = ROOT / 'overlay/openhop_repeater/repeater' / file
             tree = ast.parse(source.read_text())
             cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == class_name)
             method = next(n for n in cls.body if isinstance(n, ast.AsyncFunctionDef) and n.name == method_name)
@@ -96,7 +97,7 @@ class RegionScopeTests(unittest.TestCase):
 
 
     def test_room_cli_advert_uses_default_scope_and_nonempty_name(self):
-        source = ROOT / 'overlay/pymc_repeater/repeater/handler_helpers/room_server.py'
+        source = ROOT / 'overlay/openhop_repeater/repeater/handler_helpers/room_server.py'
         fn = next(n for n in ast.walk(ast.parse(source.read_text()))
                   if isinstance(n, ast.AsyncFunctionDef) and n.name == 'send_room_advert')
         packet = SimpleNamespace(header=17, transport_codes=[0, 0])

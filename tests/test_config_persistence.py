@@ -13,8 +13,9 @@ from unittest.mock import Mock, patch
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "overlay/pymc_repeater"))
-sys.path.insert(0, str(ROOT / "overlay/pymc_core/src"))
+sys.path.insert(0, str(ROOT / "overlay/openhop_repeater"))
+sys.path.append(str(ROOT / "tests/fixtures/upstream"))
+sys.path.insert(0, str(ROOT / "overlay/openhop_core/src"))
 
 from repeater.atomic_file import atomic_write_text
 from repeater.config import load_config, save_config

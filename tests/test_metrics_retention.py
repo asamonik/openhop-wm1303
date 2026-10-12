@@ -7,7 +7,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'overlay/pymc_repeater'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'overlay/openhop_repeater'))
+sys.path.append(str(Path(__file__).resolve().parents[1] / "tests/fixtures/upstream"))
 from repeater import metrics_retention as retention
 from repeater.web.tiered_query import tiered_channel_query
 

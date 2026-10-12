@@ -13,7 +13,7 @@ import cherrypy
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PATCHER = ROOT / "overlay/pymc_repeater/repeater/web/console_assets.py"
+PATCHER = ROOT / "overlay/openhop_repeater/repeater/web/console_assets.py"
 spec = importlib.util.spec_from_file_location("console_assets", PATCHER)
 console_assets = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(console_assets)
@@ -22,7 +22,7 @@ spec.loader.exec_module(console_assets)
 class ConsoleViewTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('node'), 'Node.js is required for JavaScript syntax checks')
     def test_manager_inline_scripts_parse_after_upstream_integration(self):
-        html = ROOT / 'overlay/pymc_repeater/repeater/web/html/wm1303.html'
+        html = ROOT / 'overlay/openhop_repeater/repeater/web/html/wm1303.html'
         check = r'''
 const fs = require('fs'), vm = require('vm');
 for (const match of fs.readFileSync(process.argv[1], 'utf8').matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)) {

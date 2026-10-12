@@ -179,7 +179,7 @@ static cad_config_t cad_config = { .enable = false, .nb_channels = 0 };
 static sx1261_cad_result_t cad_results[CAD_MAX_CHANNELS];
 
 /**
- * @brief Read CAD channel configuration from /tmp/pymc_cad_config.json
+ * @brief Read CAD channel configuration from /tmp/openhop_cad_config.json
  * @return number of channels loaded, or 0 if no config
  */
 static int cad_read_config(void) {
@@ -188,7 +188,7 @@ static int cad_read_config(void) {
     JSON_Array *ch_array = NULL;
     int nb_ch, i;
 
-    root_val = json_parse_file("/tmp/pymc_cad_config.json");
+    root_val = json_parse_file("/tmp/openhop_cad_config.json");
     if (root_val == NULL) {
         cad_config.enable = false;
         cad_config.nb_channels = 0;
@@ -5257,7 +5257,7 @@ void thread_spectral_scan(void) {
                 }
 
                 /* --- Write JSON results file (spectral + CAD) --- */
-                FILE *fp = fopen("/tmp/pymc_spectral_results.json.tmp", "w");
+                FILE *fp = fopen("/tmp/openhop_spectral_results.json.tmp", "w");
                 if (fp != NULL) {
                     fprintf(fp, "{\n  \"timestamp\": %ld,\n  \"channels\": {\n",
                             (long)time(NULL));
@@ -5295,8 +5295,8 @@ void thread_spectral_scan(void) {
                     fprintf(fp, "\n}\n");
                     fclose(fp);
                     /* Atomic rename to avoid partial reads */
-                    rename("/tmp/pymc_spectral_results.json.tmp",
-                           "/tmp/pymc_spectral_results.json");
+                    rename("/tmp/openhop_spectral_results.json.tmp",
+                           "/tmp/openhop_spectral_results.json");
                     printf("INFO: spectral sweep complete (%d channels%s), results written\n",
                            written,
                            cad_config.enable ? " + CAD" : "");
@@ -5309,7 +5309,7 @@ void thread_spectral_scan(void) {
                     }
                     pthread_mutex_unlock(&mx_concent);
                 } else {
-                    printf("ERROR: could not open /tmp/pymc_spectral_results.json.tmp for writing\n");
+                    printf("ERROR: could not open /tmp/openhop_spectral_results.json.tmp for writing\n");
                 }
 
                 /* Reset sweep accumulator */

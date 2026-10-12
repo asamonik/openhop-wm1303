@@ -302,7 +302,7 @@ cd "${INSTALL_DIR}"
 IS_UPGRADE=0
 # Detect an existing install via either the new openhop-repeater unit or the
 # legacy pymc-repeater unit (pre-openhop migration).
-if [ -d "/opt/pymc_repeater" ] && {
+if { [ -d "/opt/openhop_repeater" ] || [ -d "/opt/pymc_repeater" ]; } && {
     [ -f "${CONFIG_DIR}/config.yaml" ] || [ -f "/etc/pymc_repeater/config.yaml" ] ||
     systemctl is-enabled openhop-repeater &>/dev/null || systemctl is-enabled pymc-repeater &>/dev/null;
 }; then

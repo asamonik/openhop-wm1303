@@ -8,7 +8,8 @@ import unittest
 import shutil
 from unittest.mock import Mock, patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'overlay/pymc_repeater'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'overlay/openhop_repeater'))
+sys.path.append(str(Path(__file__).resolve().parents[1] / "tests/fixtures/upstream"))
 from repeater.web import update_endpoints as updates
 
 

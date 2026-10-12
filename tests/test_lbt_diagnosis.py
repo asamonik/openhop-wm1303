@@ -13,14 +13,15 @@ from unittest.mock import Mock, patch
 import cherrypy
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "overlay/pymc_repeater"))
+sys.path.insert(0, str(ROOT / "overlay/openhop_repeater"))
+sys.path.append(str(ROOT / "tests/fixtures/upstream"))
 
 from repeater.data_acquisition.sqlite_handler import SQLiteHandler
 
 
 def load_api():
     """Load the real endpoint without optional upstream radio dependencies."""
-    source = ROOT / "overlay/pymc_repeater/repeater/web/api_endpoints.py"
+    source = ROOT / "overlay/openhop_repeater/repeater/web/api_endpoints.py"
     tree = ast.parse(source.read_text())
     cls = next(node for node in tree.body
                if isinstance(node, ast.ClassDef) and node.name == "APIEndpoints")

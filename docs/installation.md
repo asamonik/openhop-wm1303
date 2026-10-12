@@ -94,8 +94,8 @@ untrusted networks.
 Clones canonical dependencies at the jointly verified revisions in `config/dependencies.conf`:
 
 ```
-/opt/pymc_repeater/repos/pyMC_core/       ← OpenHop core 1.1.3, pinned
-/opt/pymc_repeater/repos/pyMC_Repeater/   ← OpenHop Repeater 1.1.4, pinned
+/opt/openhop_repeater/repos/openhop_core/       ← OpenHop core 1.1.3, pinned
+/opt/openhop_repeater/repos/openhop_repeater/   ← OpenHop Repeater 1.1.4, pinned
 ~/sx1302_hal/                          ← Semtech HAL 2.1.0, pinned
 ```
 
@@ -105,8 +105,8 @@ Copies overlay files from this repository into the cloned repos:
 
 - HAL source files → `sx1302_hal/libloragw/` (including `sx1261_spi.c`)
 - HAL packet forwarder files → `sx1302_hal/packet_forwarder/`
-- openhop_core files → `pyMC_core/src/openhop_core/`
-- pymc_repeater files → `pyMC_Repeater/repeater/`
+- openhop_core files → `openhop_core/src/openhop_core/`
+- openhop_repeater files → `openhop_repeater/repeater/`
 
 Complete overlay trees are copied, including new modules and UI assets, while
 unrelated upstream files are retained. Published fork repositories are unchanged;
@@ -121,7 +121,7 @@ the installed checkouts contain the overlaid file replacements.
 - Copies binary to `~/wm1303_pf/`
 - Copies configuration files
 
-#### Step 9: Install pyMC Core and Repeater
+#### Step 9: Install OpenHop Core and Repeater
 
 - Creates Python virtual environment
 - Installs the pinned OpenHop core 1.1.3 checkout in editable mode
@@ -258,7 +258,7 @@ job, so updating can stop and restart the repeater without killing its updater.
 The Console connection will temporarily drop and retry during the build. Reopen it after the restart if needed to
 read the persisted job status and log.
 
-The root-owned configuration in `/usr/local/lib/pymc-wm1303/updater.conf` captures
+The root-owned configuration in `/usr/local/lib/openhop-wm1303/updater.conf` captures
 the installed service user, integration checkout, and its GitHub repository.
 Updates follow that repository's `main` branch, including an explicitly installed
 fork named `openhop-wm1303` or `pyMC_WM1303`; they do not silently switch forks or rewrite remotes.
@@ -342,6 +342,52 @@ During upgrade:
 - **Deep merge** handles nested dictionaries (e.g., new Channel E sub-keys)
 - **bridge_conf.json is regenerated** on service restart from the merged SSOT
 
+## Migration from pyMC installation paths
+
+Both install and upgrade now use `/opt/openhop_repeater`, with dependency
+checkouts at `repos/openhop_core` and `repos/openhop_repeater`. The Python
+packages remain upstream's `openhop_core` and `repeater`; the service starts
+`python -m repeater.main`. Configuration, logs and persistent data live under
+`/etc/openhop_repeater`, `/var/log/openhop_repeater` and `/var/lib/openhop_repeater`.
+
+Run the normal bootstrap or upgrade command. It checks for migration conflicts
+before stopping services, then stops the repeater, plugin manager and packet
+forwarder. It moves legacy directories, including local Git changes and stash
+history, and rewrites known absolute paths in YAML/JSON configuration and systemd
+overrides. Existing identities and JWT secrets are preserved. Custom storage
+locations outside the legacy directories are unchanged.
+
+When both configuration trees exist, canonical settings win; missing files are
+copied and the old tree is retained as `pymc_repeater.pre-openhop`. Conflicting
+database histories or checkout files stop migration for manual reconciliation.
+Database main files and WAL/SHM journals are treated together, never merged from
+unrelated histories. Configuration symlinks require manual migration before
+running the installer.
+
+Relocation rebuilds the virtual environment because its entrypoints and editable
+package paths contain absolute filenames. The previous environment remains at
+`venv.pre-openhop` (with a numeric suffix if needed). Its package inventory is
+saved in `.pre-openhop-packages.json`; missing additional packages are restored
+after installing the tested OpenHop dependencies. A dependency conflict stops
+the upgrade with the old environment retained. The migration marker makes an
+interrupted run retryable; rerun the same upgrade command.
+
+Python and the rebuilt HAL communicate through `/tmp/openhop_*.json`. Upgrades
+rebuild an older binary automatically. `install.sh --skip-build` is accepted
+only when the existing forwarder contains the new runtime filenames. Temporary
+legacy snapshots are removed after the radio services stop.
+
+The updater's trusted files move to `/usr/local/lib/openhop-wm1303`. Existing
+integration checkouts (including `~/pyMC_WM1303`), Git remotes, upstream browser
+authentication keys, and legacy modem aliases remain supported. These identify
+existing user checkouts or upstream interfaces; they are not pyMC dependencies.
+
+Modified configuration files and service definitions have `.pre-openhop`
+recovery copies. Upgrade also retains its usual `~/backups/pre-upgrade-*`
+snapshot. Do not start an older service definition against moved paths: restore
+the matching directories/configuration or reinstall the older release into its
+expected layout first. Recovery copies are not automatically deleted.
+
 ## Troubleshooting
 
 ### Service fails to start
@@ -380,10 +426,10 @@ Should show `32768`. If not, reboot the Pi.
 ## Directory Structure (After Installation)
 
 ```
-/opt/pymc_repeater/                    # Main installation
+/opt/openhop_repeater/                    # Main installation
 ├── repos/
-│   ├── pyMC_core/                     # Pinned OpenHop core (historical path retained)
-│   └── pyMC_Repeater/                 # Pinned OpenHop Repeater (historical path retained)
+│   ├── openhop_core/                     # Pinned OpenHop core
+│   └── openhop_repeater/                 # Pinned OpenHop Repeater
 │
 /etc/openhop_repeater/                 # Configuration (legacy files are migrated)
 ├── config.yaml
@@ -407,7 +453,7 @@ Should show `32768`. If not, reboot the Pi.
 └── 090_wm1303-<uid>                   # Selected service user's sudo rule
 │
 /usr/local/sbin/wm1303-upgrade         # Root-owned fixed start/status/log launcher
-/usr/local/lib/pymc-wm1303/            # Root-owned bootstrap.sh and updater.conf
+/usr/local/lib/openhop-wm1303/            # Root-owned bootstrap.sh and updater.conf
 /var/log/wm1303-update.log             # Persistent latest-update log (root only)
 │
 /etc/modprobe.d/

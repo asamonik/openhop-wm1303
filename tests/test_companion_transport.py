@@ -13,7 +13,7 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location(
     "companion_thread_frames",
     Path(__file__).resolve().parents[1]
-    / "overlay/pymc_repeater/repeater/companion/thread_frames.py",
+    / "overlay/openhop_repeater/repeater/companion/thread_frames.py",
 )
 module = importlib.util.module_from_spec(spec)
 with patch.dict(sys.modules, {

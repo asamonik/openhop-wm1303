@@ -4,11 +4,11 @@
 
 ## Overview
 
-The WM1303 API provides REST endpoints for managing the concentrator, channels, bridge rules, spectral data, and system status. All endpoints are mounted under `/api/wm1303/` on the pyMC Repeater HTTP server (port 8000).
+The WM1303 API provides REST endpoints for managing the concentrator, channels, bridge rules, spectral data, and system status. All endpoints are mounted under `/api/wm1303/` on the OpenHop Repeater HTTP server (port 8000).
 
 ## Authentication
 
-All API endpoints require a valid **JWT token** from the pyMC Repeater authentication system. The token is obtained during the initial pyMC Repeater setup and stored in the repeater configuration.
+All API endpoints require a valid **JWT token** from the OpenHop Repeater authentication system. The token is obtained during the initial OpenHop Repeater setup and stored in the repeater configuration.
 
 ## Base URL
 
@@ -311,7 +311,7 @@ Returns Raspberry Pi system information.
 
 ### POST `/api/wm1303/system/restart`
 
-Restart the pymc-repeater service.
+Restart the openhop-repeater service.
 
 ### POST `/api/wm1303/system/restart-pktfwd`
 

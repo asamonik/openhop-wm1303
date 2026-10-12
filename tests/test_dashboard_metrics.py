@@ -172,7 +172,7 @@ class PacketScopeTests(unittest.TestCase):
 
 class NodeInformationTests(unittest.TestCase):
     def test_owner_save_preserves_pending_settings_and_failed_save_keeps_live_value(self):
-        source = ROOT / 'overlay/pymc_repeater/repeater/web/api_endpoints.py'
+        source = ROOT / 'overlay/openhop_repeater/repeater/web/api_endpoints.py'
         cls = next(node for node in ast.parse(source.read_text()).body if isinstance(node, ast.ClassDef) and node.name == 'APIEndpoints')
         cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in (
             '_success', '_error', 'repeater_info', 'update_radio_config')]

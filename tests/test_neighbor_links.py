@@ -15,11 +15,12 @@ import cherrypy
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "overlay/pymc_repeater"))
+sys.path.insert(0, str(ROOT / "overlay/openhop_repeater"))
+sys.path.append(str(ROOT / "tests/fixtures/upstream"))
 
 
 def load_class(relative_path, class_name, methods):
-    source = ROOT / "overlay/pymc_repeater/repeater" / relative_path
+    source = ROOT / "overlay/openhop_repeater/repeater" / relative_path
     cls = next(node for node in ast.parse(source.read_text()).body
                if isinstance(node, ast.ClassDef) and node.name == class_name)
     cls.body = [node for node in cls.body

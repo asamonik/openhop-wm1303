@@ -7,7 +7,7 @@ without requiring a manual power cycle.
 | Layer | Scope | Mechanism | Recovers from |
 |-------|-------|-----------|---------------|
 | **A — OS watchdog** | Whole system | BCM2835 hardware timer (`/dev/watchdog0`) fed by systemd via `RuntimeWatchdogSec` | A complete OS freeze (kernel lock-up, total hang) → the board reboots automatically |
-| **B — Service watchdog** | `pymc-repeater` service | `systemd` `Type=notify` + `WatchdogSec` fed by the backend with `sd_notify WATCHDOG=1` | A hung application/backend that is still "running" but no longer working → systemd restarts the service |
+| **B — Service watchdog** | `openhop-repeater` service | `systemd` `Type=notify` + `WatchdogSec` fed by the backend with `sd_notify WATCHDOG=1` | A hung application/backend that is still "running" but no longer working → systemd restarts the service |
 
 These two layers are complementary: layer B catches a stuck application quickly
 (restart only), while layer A is the last line of defence if the entire OS stops
@@ -59,7 +59,7 @@ value that keeps being refreshed, and `KEEPALIVEPING` active.
 
 ## Layer B — Service watchdog
 
-The `pymc-repeater.service` unit runs as `Type=notify` with `WatchdogSec=60`.
+The `openhop-repeater.service` unit runs as `Type=notify` with `WatchdogSec=60`.
 The backend's existing RX-watchdog loop sends a periodic keep-alive
 (`sd_notify WATCHDOG=1`, roughly every 5 seconds) and a one-time `READY=1` once
 the service has finished starting. If `systemd` does not receive a keep-alive
@@ -88,10 +88,10 @@ environment, and it is a safe no-op when the process is not started by systemd
 
 ```bash
 # Service must be active, of Type=notify, with a watchdog interval set
-systemctl show pymc-repeater.service -p Type -p WatchdogUSec -p NRestarts -p SubState
+systemctl show openhop-repeater.service -p Type -p WatchdogUSec -p NRestarts -p SubState
 
 # Confirm READY=1 was sent at startup
-journalctl -u pymc-repeater.service -b | grep "sd_notify READY=1 sent"
+journalctl -u openhop-repeater.service -b | grep "sd_notify READY=1 sent"
 ```
 
 A healthy service shows `Type=notify`, `WatchdogUSec=1min`, `SubState=running`,

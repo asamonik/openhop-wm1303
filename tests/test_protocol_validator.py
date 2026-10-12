@@ -11,7 +11,7 @@ import sys
 import unittest
 
 
-SOURCE = Path(__file__).resolve().parents[1] / "overlay/pymc_repeater/repeater/protocol_validator.py"
+SOURCE = Path(__file__).resolve().parents[1] / "overlay/openhop_repeater/repeater/protocol_validator.py"
 SPEC = importlib.util.spec_from_file_location("wm1303_protocol_validator_test", SOURCE)
 validator = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = validator

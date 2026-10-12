@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class LogStreamTests(unittest.TestCase):
     def test_concurrent_log_writes_snapshot_and_stream_reconnection(self):
-        source = ROOT / 'overlay/pymc_repeater/repeater/web/http_server.py'
+        source = ROOT / 'overlay/openhop_repeater/repeater/web/http_server.py'
         cls = next(n for n in ast.parse(source.read_text()).body
                    if isinstance(n, ast.ClassDef) and n.name == 'LogBuffer')
         namespace = dict(logging=logging, deque=deque, datetime=datetime, time=time,
@@ -42,7 +42,7 @@ class LogStreamTests(unittest.TestCase):
         rows[-1]['message'] = 'must not modify buffer'
         self.assertNotEqual(buffer.snapshot()[-1]['message'], rows[-1]['message'])
 
-        source = ROOT / 'overlay/pymc_repeater/repeater/web/api_endpoints.py'
+        source = ROOT / 'overlay/openhop_repeater/repeater/web/api_endpoints.py'
         cls = next(n for n in ast.parse(source.read_text()).body
                    if isinstance(n, ast.ClassDef) and n.name == 'APIEndpoints')
         methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in ('logs', 'logs_stream')]

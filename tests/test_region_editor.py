@@ -15,7 +15,8 @@ from unittest.mock import Mock, patch
 import cherrypy
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'overlay/pymc_repeater'))
+sys.path.insert(0, str(ROOT / 'overlay/openhop_repeater'))
+sys.path.append(str(ROOT / "tests/fixtures/upstream"))
 from repeater.data_acquisition.sqlite_handler import SQLiteHandler
 
 
@@ -27,7 +28,7 @@ class RegionEditorTests(unittest.TestCase):
             self.db = SQLiteHandler(Path(tmp.name))
         self.addCleanup(self.db.close_thread_connection)
         self.custom_key = base64.b64encode(b'k' * 16).decode()
-        source = ROOT / 'overlay/pymc_repeater/repeater/web/api_endpoints.py'
+        source = ROOT / 'overlay/openhop_repeater/repeater/web/api_endpoints.py'
         cls = next(n for n in ast.parse(source.read_text()).body
                    if isinstance(n, ast.ClassDef) and n.name == 'APIEndpoints')
         names = {'_success', '_error', '_region_error', '_invalidate_region_cache',

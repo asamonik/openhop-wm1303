@@ -3,9 +3,9 @@
 set -euo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
-UPDATER_DIR=/usr/local/lib/pymc-wm1303
+UPDATER_DIR=/usr/local/lib/openhop-wm1303
 UPDATER_LOG=/var/log/wm1303-update.log
-UPDATER_LOCK_DIR=/run/lock/pymc-wm1303
+UPDATER_LOCK_DIR=/run/lock/openhop-wm1303
 UPDATER_UNIT=wm1303-update.service
 
 die() { printf '%s\n' "$*" >&2; exit 1; }

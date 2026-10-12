@@ -11,14 +11,15 @@ import unittest
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "overlay/pymc_repeater"))
-sys.path.insert(0, str(ROOT / "overlay/pymc_core/src"))
+sys.path.insert(0, str(ROOT / "overlay/openhop_repeater"))
+sys.path.append(str(ROOT / "tests/fixtures/upstream"))
+sys.path.insert(0, str(ROOT / "overlay/openhop_core/src"))
 
 def storage_module():
     name = "repeater.data_acquisition"
     spec = importlib.util.spec_from_file_location(
         name + "._wm_storage_test",
-        ROOT / "overlay/pymc_repeater/repeater/data_acquisition/storage_collector.py",
+        ROOT / "overlay/openhop_repeater/repeater/data_acquisition/storage_collector.py",
     )
     module = importlib.util.module_from_spec(spec)
     collaborators = {
@@ -40,7 +41,7 @@ def storage_module():
 class StorageLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_rrd_rate_totals_cache_and_counter_restart(self):
         spec = importlib.util.spec_from_file_location(
-            "_wm_rrd_test", ROOT / "overlay/pymc_repeater/repeater/data_acquisition/rrdtool_handler.py"
+            "_wm_rrd_test", ROOT / "overlay/openhop_repeater/repeater/data_acquisition/rrdtool_handler.py"
         )
         module = importlib.util.module_from_spec(spec)
         native = SimpleNamespace(

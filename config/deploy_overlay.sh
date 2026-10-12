@@ -75,6 +75,24 @@ checkout_dependency_revision() {
     sudo -u "$PI_USER" git -C "$target_dir" checkout --detach "$revision" || return 1
 }
 
+existing_dependency_checkout() {
+    # Used only before migration, including --skip-pull verification.
+    local base="$1" canonical="$2" legacy="$3" candidate
+    for candidate in "$base/repos/$canonical" "$base/repos/$legacy" \
+        "/opt/pymc_repeater/repos/$canonical" "/opt/pymc_repeater/repos/$legacy"; do
+        if [ -d "$candidate/.git" ]; then
+            printf '%s\n' "$candidate"
+            return
+        fi
+    done
+    printf '%s/repos/%s\n' "$base" "$canonical"
+}
+
+packet_forwarder_uses_openhop_paths() {
+    [ -f "$1" ] && grep -aq '/tmp/openhop_cad_config.json' "$1" && \
+        grep -aq '/tmp/openhop_spectral_results.json' "$1"
+}
+
 install_plugin_manager_service() {
     local source_dir="$1" service_user="$2" service_group="$3"
     local unit=/etc/systemd/system/openhop-plugin-manager.service
@@ -147,7 +165,7 @@ wm1303_repository_slug() {
 }
 
 install_wm1303_updater() {
-    local source_dir="$1" service_user="$2" lib_dir=/usr/local/lib/pymc-wm1303
+    local source_dir="$1" service_user="$2" lib_dir=/usr/local/lib/openhop-wm1303
     local staged_config staged_bootstrap staged_launcher service_uid origin repository
     service_uid=$(id -u "$service_user") || return 1
     [ "$service_uid" != 0 ] || return 1

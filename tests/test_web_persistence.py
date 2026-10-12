@@ -11,8 +11,9 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "overlay/pymc_repeater"))
-sys.path.insert(0, str(ROOT / "overlay/pymc_core/src"))
+sys.path.insert(0, str(ROOT / "overlay/openhop_repeater"))
+sys.path.append(str(ROOT / "tests/fixtures/upstream"))
+sys.path.insert(0, str(ROOT / "overlay/openhop_core/src"))
 
 with patch("subprocess.check_output", return_value=""), \
         patch("threading.Thread.start"), \
@@ -25,7 +26,7 @@ class WebPersistenceTests(unittest.TestCase):
         import ast
         import asyncio
         import cherrypy
-        source = ROOT / 'overlay/pymc_repeater/repeater/web/api_endpoints.py'
+        source = ROOT / 'overlay/openhop_repeater/repeater/web/api_endpoints.py'
         cls = next(n for n in ast.parse(source.read_text()).body
                    if isinstance(n, ast.ClassDef) and n.name == 'APIEndpoints')
         cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef)
@@ -110,7 +111,7 @@ class WebPersistenceTests(unittest.TestCase):
         from repeater.config import get_node_info
         from repeater.config_manager import ConfigManager
 
-        source = ROOT / 'overlay/pymc_repeater/repeater/web/api_endpoints.py'
+        source = ROOT / 'overlay/openhop_repeater/repeater/web/api_endpoints.py'
         cls = next(n for n in ast.parse(source.read_text()).body
                    if isinstance(n, ast.ClassDef) and n.name == 'APIEndpoints')
         cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef)
@@ -192,7 +193,7 @@ class WebPersistenceTests(unittest.TestCase):
         import yaml
         from repeater.config_manager import ConfigManager
 
-        source = ROOT / 'overlay/pymc_repeater/repeater/web/api_endpoints.py'
+        source = ROOT / 'overlay/openhop_repeater/repeater/web/api_endpoints.py'
         definition = next(node for node in ast.parse(source.read_text()).body
                           if isinstance(node, ast.ClassDef) and node.name == 'APIEndpoints')
         methods = {'_success', '_error', '_require_post', 'set_mode', 'set_duty_cycle',
@@ -326,7 +327,7 @@ class WebPersistenceTests(unittest.TestCase):
         import yaml
         from repeater.config_manager import ConfigManager
 
-        source = ROOT / 'overlay/pymc_repeater/repeater/web/api_endpoints.py'
+        source = ROOT / 'overlay/openhop_repeater/repeater/web/api_endpoints.py'
         api_class = next(node for node in ast.parse(source.read_text()).body
                          if isinstance(node, ast.ClassDef) and node.name == 'APIEndpoints')
         api_class.body = [node for node in api_class.body if isinstance(node, ast.FunctionDef)
@@ -421,7 +422,7 @@ class WebPersistenceTests(unittest.TestCase):
         from repeater.companion_storage import companion_limits_from_settings, legacy_owner_from_settings
         from repeater.config_manager import ConfigManager
 
-        path = ROOT / 'overlay/pymc_repeater/repeater/web/api_endpoints.py'
+        path = ROOT / 'overlay/openhop_repeater/repeater/web/api_endpoints.py'
         api_class = next(node for node in ast.parse(path.read_text()).body
                          if isinstance(node, ast.ClassDef) and node.name == 'APIEndpoints')
         api_class.body = [node for node in api_class.body if isinstance(node, ast.FunctionDef)
@@ -527,7 +528,7 @@ class WebPersistenceTests(unittest.TestCase):
         import yaml
         from repeater.config_manager import ConfigManager
 
-        web = ROOT / 'overlay/pymc_repeater/repeater/web'
+        web = ROOT / 'overlay/openhop_repeater/repeater/web'
         spec = importlib.util.spec_from_file_location('repeater.web._auth_flow_test', web / 'auth_endpoints.py')
         auth_module = importlib.util.module_from_spec(spec)
         with patch.dict(sys.modules, {'repeater.web.auth.middleware': SimpleNamespace(require_auth=lambda f: f)}):
@@ -608,7 +609,7 @@ class WebPersistenceTests(unittest.TestCase):
         import ast
         # Execute the actual chart methods without importing/starting the
         # unrelated Console authentication, companion and hardware services.
-        path = ROOT / 'overlay/pymc_repeater/repeater/web/api_endpoints.py'
+        path = ROOT / 'overlay/openhop_repeater/repeater/web/api_endpoints.py'
         tree = ast.parse(path.read_text())
         api_class = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'APIEndpoints')
         methods = {'_success', '_error', '_get_time_range', '_process_gauge_data', 'metrics_graph_data'}
@@ -647,7 +648,7 @@ class WebPersistenceTests(unittest.TestCase):
 
         # Execute the actual lifecycle class, with a real isolated routing tree
         # and mocked listener/auth workers. No port, service or updater is used.
-        source = ROOT / 'overlay/pymc_repeater/repeater/web/http_server.py'
+        source = ROOT / 'overlay/openhop_repeater/repeater/web/http_server.py'
         definition = next(node for node in ast.parse(source.read_text()).body
                           if isinstance(node, ast.ClassDef) and node.name == 'HTTPStatsServer')
         states = SimpleNamespace(STOPPED='stopped', STARTED='started', EXITING='exiting')

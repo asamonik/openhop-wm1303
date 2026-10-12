@@ -80,7 +80,7 @@ def load_overlay(name):
         module("repeater.web.http_server", HTTPStatsServer=object, _log_buffer=[])
         module("repeater.web.packet_trace", trace_event=object)
         module("openhop_core.hardware", wm1303_backend=object, tx_queue=object)
-    spec = importlib.util.spec_from_file_location("wm1303_test_" + name, ROOT / "overlay/pymc_repeater/repeater" / (name + ".py"))
+    spec = importlib.util.spec_from_file_location("wm1303_test_" + name, ROOT / "overlay/openhop_repeater/repeater" / (name + ".py"))
     result = importlib.util.module_from_spec(spec)
     with patch.dict(sys.modules, modules):
         spec.loader.exec_module(result)

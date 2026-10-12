@@ -9,9 +9,9 @@ Type=simple
 User=__PI_USER__
 Group=__PI_GROUP__
 WorkingDirectory=/var/lib/openhop_repeater
-Environment="PYTHONPATH=/opt/pymc_repeater/repos/pyMC_Repeater:/opt/pymc_repeater/repos/pyMC_core/src"
-ExecCondition=/opt/pymc_repeater/venv/bin/python3 -I -c "import sys,yaml; c=yaml.safe_load(open(sys.argv[1])) or {}; p=c.get('plugins'); sys.exit(1 if isinstance(p, dict) and p.get('enabled') is False else 0)" /etc/openhop_repeater/config.yaml
-ExecStart=/opt/pymc_repeater/venv/bin/python3 -m repeater.plugins --config /etc/openhop_repeater/config.yaml
+Environment="PYTHONPATH=/opt/openhop_repeater/repos/openhop_repeater:/opt/openhop_repeater/repos/openhop_core/src"
+ExecCondition=/opt/openhop_repeater/venv/bin/python3 -I -c "import sys,yaml; c=yaml.safe_load(open(sys.argv[1])) or {}; p=c.get('plugins'); sys.exit(1 if isinstance(p, dict) and p.get('enabled') is False else 0)" /etc/openhop_repeater/config.yaml
+ExecStart=/opt/openhop_repeater/venv/bin/python3 -m repeater.plugins --config /etc/openhop_repeater/config.yaml
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30

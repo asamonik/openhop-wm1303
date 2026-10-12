@@ -10,13 +10,13 @@ const {execFileSync} = require('node:child_process');
 const puppeteer = require('puppeteer-core');
 
 const root = path.resolve(__dirname, '..');
-const overlayHtml = path.join(root, 'overlay/pymc_repeater/repeater/web/html');
+const overlayHtml = path.join(root, 'overlay/openhop_repeater/repeater/web/html');
 const originalHtml = process.argv[2];
 if (!originalHtml || !fs.existsSync(path.join(originalHtml, 'index.html'))) throw new Error('Supply the upstream compiled Console HTML directory');
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'wm1303-dashboard-'));
 const htmlDir = path.join(temporary, 'html');
 fs.cpSync(originalHtml, htmlDir, {recursive: true});
-execFileSync(path.join(root, '.venv/bin/python'), [path.join(root, 'overlay/pymc_repeater/repeater/web/console_assets.py'), htmlDir]);
+execFileSync(process.env.WM1303_TEST_PYTHON || 'python3', [path.join(root, 'overlay/openhop_repeater/repeater/web/console_assets.py'), htmlDir]);
 const requests = [], saves = [], errors = [];
 let scanEnabled = false, scopeKnown = true, failOwnerSave = false;
 const now = Math.floor(Date.now() / 1000);

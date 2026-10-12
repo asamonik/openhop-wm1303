@@ -1,5 +1,36 @@
 # Software checks and MeshCore compatibility
 
+## OpenHop path migration (2026-10-12)
+
+The latest published core 1.1.3 and repeater 1.1.4 releases still match the
+dependency pins. Fresh checkouts from the canonical GitHub repositories were
+used to validate the renamed `overlay/openhop_core` and
+`overlay/openhop_repeater` trees. Unchanged upstream files are no longer
+deployed as overlays. Three small helpers needed for standalone tests live
+under `tests/fixtures/upstream`; integration checks compare them with the pinned
+release before applying overlays.
+
+Final checks for the migration:
+
+- 313 local regressions pass with the real overlaid packages, including 23
+  migration checks using temporary device roots. They cover new installs,
+  retries, preserved identities, committed SQLite WAL data, database conflicts,
+  virtual environment retirement, additional packages, systemd overrides,
+  canonical config precedence, and rejected configuration symlinks.
+- 1,823 upstream core tests and 69 upstream repeater tests pass. The four
+  existing contact-store exclusions described below are unchanged.
+- All 12 companion TCP scenarios, three HTTP/authentication scenarios, and the
+  simulated-radio daemon startup/shutdown scenario pass.
+- The complete overlaid HAL builds, with existing compiler warnings. Its
+  packet-forwarder binary passes the canonical IPC filename check.
+- Desktop/mobile Console and Manager browser checks pass on Node.js 22.
+  Python lint, shell syntax, and whitespace checks pass.
+
+No services were installed on this development machine and no physical radio
+was operated. Device migration and RF behavior still need validation on the
+target Raspberry Pi. Recovery behavior is documented in the
+[installation guide](installation.md#migration-from-pymc-installation-paths).
+
 ## Canonical OpenHop dependency update (2026-10-12)
 
 The integration now pins OpenHop core 1.1.3 (`e07722e`), OpenHop Repeater 1.1.4

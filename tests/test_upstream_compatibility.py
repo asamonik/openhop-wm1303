@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class ScopeQueryLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_shutdown_cancels_and_joins_scope_queries_and_closes_admission(self):
-        source = ROOT / 'overlay/pymc_repeater/repeater/handler_helpers/neighbor_scopes.py'
+        source = ROOT / 'overlay/openhop_repeater/repeater/handler_helpers/neighbor_scopes.py'
         definition = next(node for node in ast.parse(source.read_text()).body
                           if isinstance(node, ast.ClassDef) and node.name == 'NeighborScopeHelper')
         definition.body = [node for node in definition.body
