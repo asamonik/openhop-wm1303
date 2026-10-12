@@ -1,10 +1,13 @@
 import asyncio
 import copy
 import logging
+import math
 import secrets
 import struct
 import time
 from collections import OrderedDict, deque
+from collections.abc import Mapping
+from enum import Enum
 from typing import Optional, Tuple
 
 from openhop_core.node.handlers.base import BaseHandler
@@ -25,10 +28,15 @@ from openhop_core.protocol.constants import (
     ROUTE_TYPE_TRANSPORT_DIRECT,
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
-from openhop_core.protocol.packet_utils import PacketHeaderUtils, PacketTimingUtils, PathUtils
+from openhop_core.protocol.packet_utils import (
+    PacketHeaderUtils,
+    PacketTimingUtils,
+    PathUtils,
+)
 
 from repeater.airtime import AirtimeManager
 from repeater.data_acquisition import StorageCollector
+from repeater.modem_config import normalize_modem_config, redact_modem_tokens_in_place
 
 logger = logging.getLogger("RepeaterHandler")
 
@@ -60,19 +68,28 @@ class ForwardResult(tuple):
 
 
 class RepeaterHandler(BaseHandler):
-
     @staticmethod
     def payload_type() -> int:
 
         return 0xFF  # Special marker (not a real payload type)
 
-    def __init__(self, config: dict, dispatcher, local_hash: int, *, local_hash_bytes=None, send_advert_func=None):
+    def __init__(
+        self,
+        config: dict,
+        dispatcher,
+        local_hash: int,
+        *,
+        local_hash_bytes=None,
+        send_advert_func=None,
+        periodic_advert_tick_func=None,
+    ):
 
         self.config = config
         self.dispatcher = dispatcher
         self.local_hash = local_hash
         self.local_hash_bytes = local_hash_bytes or bytes([local_hash])
         self.send_advert_func = send_advert_func
+        self.periodic_advert_tick_func = periodic_advert_tick_func
         self.airtime_mgr = AirtimeManager(config)
         self.tx_airtime_managed_by_radio = False
         self.seen_packets = OrderedDict()
@@ -86,26 +103,38 @@ class RepeaterHandler(BaseHandler):
         if _max_cache_cfg is None:
             try:
                 import json as _json
-                _ui_path = resolve_config_path('wm1303_ui.json')
+
+                _ui_path = resolve_config_path("wm1303_ui.json")
                 if _ui_path.exists():
                     _ui = _json.loads(_ui_path.read_text()) or {}
                     _max_cache_cfg = _ui.get("adv_config", {}).get("max_cache_size")
             except Exception:
                 pass
-        self.max_cache_size = int(_max_cache_cfg) if _max_cache_cfg is not None else 1000
+        self.max_cache_size = (
+            int(_max_cache_cfg) if _max_cache_cfg is not None else 1000
+        )
         self.max_duplicates_per_packet = 20
         self.tx_delay_factor = config.get("delays", {}).get("tx_delay_factor", 1.0)
-        self.direct_tx_delay_factor = config.get("delays", {}).get("direct_tx_delay_factor", 0.5)
-        logger.info("TX delay factors are airtime multipliers (flood=%s, direct=%s)",
-                    self.tx_delay_factor, self.direct_tx_delay_factor)
+        self.direct_tx_delay_factor = config.get("delays", {}).get(
+            "direct_tx_delay_factor", 0.5
+        )
+        logger.info(
+            "TX delay factors are airtime multipliers (flood=%s, direct=%s)",
+            self.tx_delay_factor,
+            self.direct_tx_delay_factor,
+        )
         self.multi_acks = self._normalize_multi_acks(config)
-        self.use_score_for_tx = config.get("repeater", {}).get("use_score_for_tx", False)
+        self.use_score_for_tx = config.get("repeater", {}).get(
+            "use_score_for_tx", False
+        )
         self.score_threshold = config.get("repeater", {}).get("score_threshold", 0.3)
         self.max_flood_hops = config.get("repeater", {}).get("max_flood_hops", 64)
         self.send_advert_interval_hours = config.get("repeater", {}).get(
             "send_advert_interval_hours", 10
         )
-        self.advert_interval_minutes = config.get("repeater", {}).get("advert_interval_minutes", 120)
+        self.advert_interval_minutes = config.get("repeater", {}).get(
+            "advert_interval_minutes", 120
+        )
         self.last_advert_time = time.time()
         self.last_local_advert_time = self.last_advert_time
         self._flood_advert_retry_at = 0
@@ -129,7 +158,9 @@ class RepeaterHandler(BaseHandler):
                 f"BW={self.radio_config['bandwidth']}Hz, CR={self.radio_config['coding_rate']}"
             )
         else:
-            raise RuntimeError("Radio object not available - cannot initialize repeater")
+            raise RuntimeError(
+                "Radio object not available - cannot initialize repeater"
+            )
 
         # Statistics tracking for dashboard
         self.rx_count = 0
@@ -149,9 +180,10 @@ class RepeaterHandler(BaseHandler):
 
         # Storage collector for persistent packet logging
         try:
-
             local_identity = dispatcher.local_identity if dispatcher else None
-            self.storage = StorageCollector(config, local_identity, repeater_handler=self)
+            self.storage = StorageCollector(
+                config, local_identity, repeater_handler=self
+            )
             logger.info("StorageCollector initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize StorageCollector: {e}")
@@ -192,7 +224,10 @@ class RepeaterHandler(BaseHandler):
         self._start_background_tasks()
 
     async def __call__(
-        self, packet: Packet, metadata: Optional[dict] = None, local_transmission: bool = False
+        self,
+        packet: Packet,
+        metadata: Optional[dict] = None,
+        local_transmission: bool = False,
     ) -> bool:
 
         if metadata is None:
@@ -208,7 +243,9 @@ class RepeaterHandler(BaseHandler):
             elif route_type in (ROUTE_TYPE_DIRECT, ROUTE_TYPE_TRANSPORT_DIRECT):
                 self.recv_direct_count += 1
             try:
-                rx_airtime_ms = self.airtime_mgr.calculate_airtime(packet.get_raw_length())
+                rx_airtime_ms = self.airtime_mgr.calculate_airtime(
+                    packet.get_raw_length()
+                )
                 self.airtime_mgr.record_rx(rx_airtime_ms)
             except Exception:
                 pass
@@ -238,9 +275,16 @@ class RepeaterHandler(BaseHandler):
         transmitted = False
         tx_delay_ms = 0.0
         drop_reason = None
+        tx_radio_id = None
         lbt_attempts = 0
         lbt_backoff_delays_ms = None
         lbt_channel_busy = False
+        rx_radio_id = (
+            metadata.get("rx_radio_id")
+            or getattr(packet, "_rx_radio_id", None)
+            or getattr(packet, "rx_radio_id", None)
+        )
+        preferred_tx_radio_id = self._resolve_bridge_pair_tx_radio(rx_radio_id)
 
         original_path_hashes = packet.get_path_hashes_hex()
         path_hash_size = packet.get_path_hash_size()
@@ -277,16 +321,23 @@ class RepeaterHandler(BaseHandler):
             # gate. The callback consumes failures even if the primary TX fails.
             extra_tx_tasks = []
             for extra_pkt, extra_delay in getattr(result, "extras", ()):
-                extra_airtime = self.airtime_mgr.calculate_airtime(extra_pkt.get_raw_length())
-                extra_task = await self.schedule_retransmit(extra_pkt, extra_delay, extra_airtime)
+                extra_airtime = self.airtime_mgr.calculate_airtime(
+                    extra_pkt.get_raw_length()
+                )
+                extra_task = await self.schedule_retransmit(
+                    extra_pkt, extra_delay, extra_airtime, preferred_tx_radio_id=preferred_tx_radio_id
+                )
                 extra_task.add_done_callback(self._record_multi_ack_result)
                 extra_tx_tasks.append(extra_task)
 
             # Check duty-cycle before scheduling TX
             airtime_ms = self.airtime_mgr.calculate_airtime(fwd_pkt.get_raw_length())
 
-            can_tx, wait_time = ((True, 0.0) if getattr(self, "tx_airtime_managed_by_radio", False)
-                                 else self.airtime_mgr.can_transmit(airtime_ms))
+            can_tx, wait_time = (
+                (True, 0.0)
+                if getattr(self, "tx_airtime_managed_by_radio", False)
+                else self.airtime_mgr.can_transmit(airtime_ms)
+            )
 
             # LBT metadata (set after any TX path that awaits send)
             tx_metadata = None
@@ -305,7 +356,11 @@ class RepeaterHandler(BaseHandler):
                     self.forwarded_count += 1
                     transmitted = True
                     tx_task = await self.schedule_retransmit(
-                        fwd_pkt, deferred_delay, airtime_ms, local_transmission=True
+                        fwd_pkt,
+                        deferred_delay,
+                        airtime_ms,
+                        local_transmission=True,
+                        preferred_tx_radio_id=preferred_tx_radio_id,
                     )
                     try:
                         tx_succeeded = await tx_task
@@ -322,6 +377,9 @@ class RepeaterHandler(BaseHandler):
                         drop_reason = "Duty cycle limit"
                     tx_metadata = getattr(fwd_pkt, "_tx_metadata", None)
                     if tx_metadata:
+                        tx_radio_id = tx_metadata.get("radio_id") or tx_metadata.get(
+                            "tx_radio_id"
+                        )
                         lbt_attempts = tx_metadata.get("lbt_attempts", 0)
                         lbt_backoff_delays_ms = tx_metadata.get(
                             "lbt_backoff_delays_ms", []
@@ -345,7 +403,11 @@ class RepeaterHandler(BaseHandler):
                 self.forwarded_count += 1
                 transmitted = True
                 tx_task = await self.schedule_retransmit(
-                    fwd_pkt, delay, airtime_ms, local_transmission=local_transmission
+                    fwd_pkt,
+                    delay,
+                    airtime_ms,
+                    local_transmission=local_transmission,
+                    preferred_tx_radio_id=preferred_tx_radio_id,
                 )
                 try:
                     tx_succeeded = await tx_task
@@ -362,6 +424,9 @@ class RepeaterHandler(BaseHandler):
                     drop_reason = "Duty cycle limit"
                 tx_metadata = getattr(fwd_pkt, "_tx_metadata", None)
                 if tx_metadata:
+                    tx_radio_id = tx_metadata.get("radio_id") or tx_metadata.get(
+                        "tx_radio_id"
+                    )
                     lbt_attempts = tx_metadata.get("lbt_attempts", 0)
                     lbt_backoff_delays_ms = tx_metadata.get("lbt_backoff_delays_ms", [])
                     lbt_channel_busy = tx_metadata.get("lbt_channel_busy", False)
@@ -416,7 +481,9 @@ class RepeaterHandler(BaseHandler):
                 self.direct_dup_count += 1
 
         display_hashes = (
-            original_path_hashes if original_path_hashes else packet.get_path_hashes_hex()
+            original_path_hashes
+            if original_path_hashes
+            else packet.get_path_hashes_hex()
         )
         path_hash = self._path_hash_display(display_hashes)
         src_hash, dst_hash = self._packet_record_src_dst(packet, payload_type)
@@ -438,10 +505,12 @@ class RepeaterHandler(BaseHandler):
             is_duplicate=is_dupe,
             forwarded_path=forwarded_path_hashes,
             tx_delay_ms=tx_delay_ms,
+            rx_radio_id=rx_radio_id,
+            tx_radio_id=tx_radio_id,
             lbt_attempts=lbt_attempts,
             lbt_backoff_delays_ms=lbt_backoff_delays_ms,
             lbt_channel_busy=lbt_channel_busy,
-            packet_hash=pkt_hash_full,
+            packet_hash=packet.calculate_packet_hash().hex().upper(),
         )
 
         # Store packet record to persistent storage
@@ -449,9 +518,15 @@ class RepeaterHandler(BaseHandler):
         if self.storage:
             try:
                 # Only skip LetsMesh for actual invalid/bad packets
-                invalid_reasons = ["Invalid advert packet", "Empty payload", "Path too long"]
+                invalid_reasons = [
+                    "Invalid advert packet",
+                    "Empty payload",
+                    "Path too long",
+                ]
                 skip_letsmesh = drop_reason in invalid_reasons if drop_reason else False
-                self.storage.record_packet(packet_record, skip_letsmesh_if_invalid=skip_letsmesh)
+                self.storage.record_packet(
+                    packet_record, skip_letsmesh_if_invalid=skip_letsmesh
+                )
             except Exception as e:
                 logger.error(f"Failed to store packet record: {e}")
 
@@ -512,7 +587,9 @@ class RepeaterHandler(BaseHandler):
         header_info = PacketHeaderUtils.parse_header(packet.header)
         payload_type = header_info["payload_type"]
         route_type = header_info["route_type"]
-        if payload_type == PAYLOAD_TYPE_TRACE and not metadata.get("_repeater_drop_reason"):
+        if payload_type == PAYLOAD_TYPE_TRACE and not metadata.get(
+            "_repeater_drop_reason"
+        ):
             return
         original_path_hashes = packet.get_path_hashes_hex()
         path_hash_size = packet.get_path_hash_size()
@@ -529,6 +606,11 @@ class RepeaterHandler(BaseHandler):
             path_hash,
             src_hash,
             dst_hash,
+            rx_radio_id=(
+                metadata.get("rx_radio_id")
+                or getattr(packet, "_rx_radio_id", None)
+                or getattr(packet, "rx_radio_id", None)
+            ),
             packet_hash=packet.calculate_packet_hash().hex().upper(),
             drop_reason=metadata.get("_repeater_drop_reason"),
         )
@@ -564,18 +646,31 @@ class RepeaterHandler(BaseHandler):
         src_hash, dst_hash = self._packet_record_src_dst(packet, payload_type)
 
         packet_record = self._build_packet_record(
-            packet, payload_type, route_type_parsed, rssi, snr,
-            original_path_hashes, path_hash_size, path_hash,
-            src_hash, dst_hash,
+            packet,
+            payload_type,
+            route_type_parsed,
+            rssi,
+            snr,
+            original_path_hashes,
+            path_hash_size,
+            path_hash,
+            src_hash,
+            dst_hash,
             transmitted=False,
             drop_reason="Duplicate",
             is_duplicate=True,
+            rx_radio_id=(
+                getattr(packet, "_rx_radio_id", None)
+                or getattr(packet, "rx_radio_id", None)
+            ),
             packet_hash=packet.calculate_packet_hash().hex().upper(),
         )
 
         if self.storage:
             try:
-                self.storage.record_packet(packet_record, skip_letsmesh_if_invalid=False)
+                self.storage.record_packet(
+                    packet_record, skip_letsmesh_if_invalid=False
+                )
             except Exception as e:
                 logger.error(f"Failed to store duplicate record: {e}")
 
@@ -644,6 +739,9 @@ class RepeaterHandler(BaseHandler):
         is_duplicate: bool = False,
         forwarded_path=None,
         tx_delay_ms: float = 0.0,
+        rx_radio_id: Optional[str] = None,
+        tx_radio_id: Optional[str] = None,
+        airtime_ms: Optional[float] = None,
         lbt_attempts: int = 0,
         lbt_backoff_delays_ms=None,
         lbt_channel_busy: bool = False,
@@ -671,6 +769,11 @@ class RepeaterHandler(BaseHandler):
                 snr, payload_len, self.radio_config["spreading_factor"]
             ),
             "tx_delay_ms": tx_delay_ms,
+            "rx_radio_id": rx_radio_id
+            or getattr(packet, "_rx_radio_id", None)
+            or getattr(packet, "rx_radio_id", None),
+            "tx_radio_id": tx_radio_id,
+            "airtime_ms": airtime_ms,
             "transmitted": transmitted,
             "is_duplicate": is_duplicate,
             "packet_hash": pkt_hash[:16],
@@ -681,7 +784,9 @@ class RepeaterHandler(BaseHandler):
             "original_path": original_path_hashes or None,
             "forwarded_path": forwarded_path,
             "path_hash_size": path_hash_size,
-            "raw_packet": packet.write_to().hex() if hasattr(packet, "write_to") else None,
+            "raw_packet": packet.write_to().hex()
+            if hasattr(packet, "write_to")
+            else None,
             "lbt_attempts": lbt_attempts,
             "lbt_backoff_delays_ms": lbt_backoff_delays_ms,
             "lbt_channel_busy": lbt_channel_busy,
@@ -1277,12 +1382,115 @@ class RepeaterHandler(BaseHandler):
             packet.drop_reason = f"Unknown route type: {route_type}"
             return None
 
+    # A local transmit whose radio link has dropped waits this long for it to come
+    # back before giving up, polling at LOCAL_TX_LINK_POLL_S. Kept well inside the
+    # companion client's own command timeout (meshcore_py: 15s), which is already
+    # partly spent on the TX delay by the time we get here.
+    DEFAULT_LOCAL_TX_LINK_WAIT_S = 5.0
+    # Hard ceiling regardless of configuration: the companion client is already
+    # waiting on this send, and an unbounded (or infinite) value would hold its
+    # command open forever rather than reporting a failure it can act on.
+    MAX_LOCAL_TX_LINK_WAIT_S = 30.0
+    LOCAL_TX_LINK_POLL_S = 0.1
+
+    def _local_tx_link_wait_s(self) -> float:
+        """Configured ceiling for waiting out a radio-link outage on a local TX."""
+        delays = self.config.get("delays") or {}
+        try:
+            wait = float(
+                delays.get(
+                    "local_tx_link_wait_seconds", self.DEFAULT_LOCAL_TX_LINK_WAIT_S
+                )
+            )
+        except (TypeError, ValueError):
+            return self.DEFAULT_LOCAL_TX_LINK_WAIT_S
+        if not math.isfinite(wait):
+            logger.warning(
+                "local_tx_link_wait_seconds=%r is not a finite number; using %.1fs",
+                wait,
+                self.DEFAULT_LOCAL_TX_LINK_WAIT_S,
+            )
+            return self.DEFAULT_LOCAL_TX_LINK_WAIT_S
+        return min(max(0.0, wait), self.MAX_LOCAL_TX_LINK_WAIT_S)
+
+    def _resolve_tx_radio(self, radio_id: Optional[str] = None):
+        """The radio a send will actually use, or None when that cannot be told.
+
+        Attribute access on a FabricRadio passes through to its *default* endpoint
+        (rf_fabric/fabric.py), so reading link state off it while the send targets
+        another radio_id answers about the wrong radio -- suppressing a healthy one,
+        or waving through a dead one. Resolve the named endpoint instead, and return
+        None rather than guess: no answer leaves the send to proceed as before.
+        """
+        radio = getattr(self.dispatcher, "radio", None)
+        if radio is None:
+            return None
+        fabric = getattr(radio, "fabric", None)
+        if fabric is None and hasattr(radio, "get_radio"):
+            fabric = radio  # an RFFabric handed to the dispatcher directly
+        radios = getattr(fabric, "radios", None) if fabric is not None else None
+        # isinstance, not truthiness: RFFabric.radios is an OrderedDict, so this
+        # recognises a real multi-endpoint fabric without mistaking a stand-in
+        # attribute on a single-radio wrapper for one.
+        if not isinstance(radios, Mapping) or len(radios) <= 1:
+            return radio  # one radio, and it is the one that transmits
+        if not radio_id:
+            # The fabric picks its endpoint at send time, so there is nothing here
+            # to inspect. Say so rather than answer about whichever radio happens
+            # to be the default -- a wrong "down" would suppress a healthy send.
+            return None
+        getter = getattr(fabric, "get_radio", None)
+        if getter is None:
+            return None
+        try:
+            return getter(str(radio_id))
+        except Exception:
+            return None
+
+    def _radio_link_down(self, radio_id: Optional[str] = None) -> bool:
+        """True when the radio this send will use reports its link unusable.
+
+        Only radios that track a link state answer this -- a KISS modem over serial
+        does, a directly-driven SX1262 has none to lose -- so it reads False for the
+        rest and leaves their timing untouched.
+        """
+        radio = self._resolve_tx_radio(radio_id)
+        if radio is None:
+            return False
+        # Identity checks, not truthiness: a radio that does not track link state
+        # answers with something that is neither True nor False (or nothing at all),
+        # and that has to read as "no opinion" rather than "down".
+        if getattr(radio, "is_connected", None) is False:
+            return True
+        return getattr(radio, "is_degraded", None) is True
+
+    async def _await_radio_link(
+        self, timeout: float, radio_id: Optional[str] = None
+    ) -> bool:
+        """Wait up to *timeout* seconds for the radio link, True if it is usable."""
+        if not self._radio_link_down(radio_id):
+            return True
+        if timeout <= 0:
+            return False
+        logger.info("Local TX: radio link down, waiting up to %.1fs for it", timeout)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            await asyncio.sleep(self.LOCAL_TX_LINK_POLL_S)
+            if not self._radio_link_down(radio_id):
+                logger.info("Local TX: radio link back, transmitting now")
+                return True
+        logger.warning(
+            "Local TX: radio link still down after %.1fs, giving up", timeout
+        )
+        return False
+
     async def schedule_retransmit(
         self,
         fwd_pkt: Packet,
         delay: float,
         airtime_ms: float = 0.0,
         local_transmission: bool = False,
+        preferred_tx_radio_id: Optional[str] = None,
     ):
         """Schedule a packet retransmission with delay and return the task.
 
@@ -1302,15 +1510,32 @@ class RepeaterHandler(BaseHandler):
             #   attempt 0 — initial try (no pre-sleep)
             #   attempt 1 — retry after 1s backoff outside the lock
             for attempt in range(2 if local_transmission else 1):
-                if attempt > 0:
-                    # Back-off OUTSIDE the lock — other tasks can transmit here.
-                    logger.info("Retrying local TX in 1s (lock released during backoff)...")
+                if attempt > 0 and not self._radio_link_down(preferred_tx_radio_id):
+                    # A transient failure with the link still up: back off OUTSIDE
+                    # the lock — other tasks can transmit here.
+                    logger.info(
+                        "Retrying local TX in 1s (lock released during backoff)..."
+                    )
                     await asyncio.sleep(1.0)
+
+                # A dropped link is not a transient failure to back off from. A KISS
+                # modem that falls off USB re-enumerates and re-handshakes in ~2s, so
+                # the flat backoff above would land inside the outage and spend the
+                # retry on a link that is still down — which is exactly what turned
+                # one modem hiccup into a failed message. Wait for the link instead.
+                if local_transmission and not await self._await_radio_link(
+                    self._local_tx_link_wait_s(), preferred_tx_radio_id
+                ):
+                    return False
 
                 async with self._tx_lock:
                     mode = self.config.get("repeater", {}).get("mode", "forward")
-                    if mode == "no_tx" or (mode == "monitor" and not local_transmission):
-                        fwd_pkt.drop_reason = "No TX mode" if mode == "no_tx" else "Repeat disabled"
+                    if mode == "no_tx" or (
+                        mode == "monitor" and not local_transmission
+                    ):
+                        fwd_pkt.drop_reason = (
+                            "No TX mode" if mode == "no_tx" else "Repeat disabled"
+                        )
                         return False
                     # ── Authoritative duty-cycle gate ──────────────────────────
                     # The upfront can_transmit() call in __call__ is advisory: it
@@ -1323,21 +1548,40 @@ class RepeaterHandler(BaseHandler):
                     # record_tx() are effectively atomic — no TOCTOU window.
                     # Re-checked every attempt because airtime state may change
                     # while we wait for the lock or sleep through backoff.
-                    if airtime_ms > 0 and not getattr(self, "tx_airtime_managed_by_radio", False):
+                    if airtime_ms > 0 and not getattr(
+                        self, "tx_airtime_managed_by_radio", False
+                    ):
                         can_tx_now, _ = self.airtime_mgr.can_transmit(airtime_ms)
                         if not can_tx_now:
                             logger.warning(
                                 "Packet dropped at TX time: duty-cycle exceeded "
-                                "(airtime=%.1fms)", airtime_ms,
+                                "(airtime=%.1fms)",
+                                airtime_ms,
                             )
                             return False
 
                     try:
-                        sent = await self.dispatcher.send_packet(fwd_pkt, wait_for_ack=False)
-                        if sent is False:
+                        if preferred_tx_radio_id:
+                            try:
+                                sent = await self.dispatcher.send_packet(
+                                    fwd_pkt,
+                                    wait_for_ack=False,
+                                    radio_id=preferred_tx_radio_id,
+                                )
+                            except TypeError:
+                                sent = await self.dispatcher.send_packet(
+                                    fwd_pkt, wait_for_ack=False
+                                )
+                        else:
+                            sent = await self.dispatcher.send_packet(
+                                fwd_pkt, wait_for_ack=False
+                            )
+                        if not sent:
                             raise RuntimeError("Dispatcher could not transmit packet")
                         self._record_packet_sent(fwd_pkt)
-                        if airtime_ms > 0 and not getattr(self, "tx_airtime_managed_by_radio", False):
+                        if airtime_ms > 0 and not getattr(
+                            self, "tx_airtime_managed_by_radio", False
+                        ):
                             self.airtime_mgr.record_tx(airtime_ms)
                         packet_size = fwd_pkt.get_raw_length()
                         logger.info(
@@ -1353,6 +1597,38 @@ class RepeaterHandler(BaseHandler):
                             raise
 
         return asyncio.create_task(delayed_send())
+
+    def _resolve_bridge_pair_tx_radio(
+        self, rx_radio_id: Optional[str]
+    ) -> Optional[str]:
+        """Return deterministic pair TX radio for bridge mode (A->B, B->A).
+
+        This applies only when fabric.tx_mode=bridge and exactly two radios are
+        registered. For all other layouts, return None and let the dispatcher/
+        fabric choose via existing logic.
+        """
+        fabric_cfg = self.config.get("fabric")
+        if not isinstance(fabric_cfg, dict):
+            return None
+        if str(fabric_cfg.get("tx_mode", "default")).strip().lower() != "bridge":
+            return None
+        if not rx_radio_id:
+            return None
+
+        radio = getattr(self.dispatcher, "radio", None)
+        fabric = getattr(radio, "fabric", None)
+        radios = getattr(fabric, "radios", None)
+        if radios is None:
+            return None
+
+        ids = list(radios.keys())
+        if len(ids) != 2:
+            return None
+
+        rx_id = str(rx_radio_id)
+        if rx_id not in ids:
+            return None
+        return ids[1] if ids[0] == rx_id else ids[0]
 
     def _record_packet_sent(self, packet: Packet) -> None:
         """Record a packet send for flood/direct stats (forwarded and originated)."""
@@ -1377,6 +1653,8 @@ class RepeaterHandler(BaseHandler):
         return self._cached_noise_floor
 
     def get_stats(self) -> dict:
+        runtime_config = normalize_modem_config(self.config, warn=False)
+        redact_modem_tokens_in_place(runtime_config)
 
         uptime_seconds = time.time() - self.start_time
 
@@ -1390,9 +1668,13 @@ class RepeaterHandler(BaseHandler):
 
         # Calculate actual hourly rates (packets in last 3600 seconds)
         now = time.time()
-        packets_last_hour = [p for p in self.recent_packets if now - p["timestamp"] < 3600]
+        packets_last_hour = [
+            p for p in self.recent_packets if now - p["timestamp"] < 3600
+        ]
         rx_per_hour = len(packets_last_hour)
-        forwarded_per_hour = sum(1 for p in packets_last_hour if p.get("transmitted", False))
+        forwarded_per_hour = sum(
+            1 for p in packets_last_hour if p.get("transmitted", False)
+        )
 
         # Use cached value sampled by the background timer to avoid serial I/O on stats requests.
         noise_floor_dbm = self.get_cached_noise_floor()
@@ -1442,10 +1724,15 @@ class RepeaterHandler(BaseHandler):
                     "send_advert_interval_hours": repeater_config.get(
                         "send_advert_interval_hours", 10
                     ),
+                    "direct_advert_interval_hours": repeater_config.get(
+                        "direct_advert_interval_hours", 0
+                    ),
                     "latitude": repeater_config.get("latitude", 0.0),
                     "longitude": repeater_config.get("longitude", 0.0),
                     "max_flood_hops": repeater_config.get("max_flood_hops", 3),
-                    "advert_interval_minutes": repeater_config.get("advert_interval_minutes", 120),
+                    "advert_interval_minutes": repeater_config.get(
+                        "advert_interval_minutes", 120
+                    ),
                     "advert_rate_limit": repeater_config.get("advert_rate_limit", {}),
                     "advert_penalty_box": repeater_config.get("advert_penalty_box", {}),
                     "advert_adaptive": repeater_config.get("advert_adaptive", {}),
@@ -1453,24 +1740,48 @@ class RepeaterHandler(BaseHandler):
                 "radio": self.config.get(
                     "radio", {}
                 ),  # Read from live config, not cached radio_config
+                "radios": runtime_config.get("radios") or [],
+                "fabric": self.config.get("fabric") or {},
+                "radio_type": runtime_config.get("radio_type"),
+                "sx1262": self.config.get("sx1262", {}),
+                "ch341": self.config.get("ch341", {}),
+                "kiss": self.config.get("kiss", {}),
+                "modem_usb": runtime_config.get("modem_usb", {}),
+                "modem_tcp": runtime_config.get("modem_tcp", {}),
                 "duty_cycle": {
                     "max_airtime_percent": max_duty_cycle_percent,
-                    "enforcement_enabled": duty_cycle_config.get("enforcement_enabled", True),
+                    "enforcement_enabled": duty_cycle_config.get(
+                        "enforcement_enabled", True
+                    ),
                 },
                 "delays": {
                     "tx_delay_factor": delays_config.get("tx_delay_factor", 1.0),
-                    "direct_tx_delay_factor": delays_config.get("direct_tx_delay_factor", 0.5),
+                    "direct_tx_delay_factor": delays_config.get(
+                        "direct_tx_delay_factor", 0.5
+                    ),
                     "rx_delay_base": delays_config.get("rx_delay_base", 0.0),
                 },
                 "web": self.config.get("web", {}),  # Include web configuration
                 "mesh": {
-                    "loop_detect": self.config.get("mesh", {}).get("loop_detect", "off"),
-                    "global_flood_allow": self.config.get("mesh", {}).get("global_flood_allow", self.config.get("mesh", {}).get("unscoped_flood_allow", True)),
-                    "unscoped_flood_allow": self.config.get("mesh", {}).get("global_flood_allow", self.config.get("mesh", {}).get("unscoped_flood_allow", True)),
-                    "path_hash_mode": self.config.get("mesh", {}).get("path_hash_mode", 0),
+                    "loop_detect": self.config.get("mesh", {}).get(
+                        "loop_detect", "off"
+                    ),
+                    "global_flood_allow": self.config.get("mesh", {}).get(
+                        "global_flood_allow",
+                        self.config.get("mesh", {}).get("unscoped_flood_allow", True),
+                    ),
+                    "unscoped_flood_allow": self.config.get("mesh", {}).get(
+                        "global_flood_allow",
+                        self.config.get("mesh", {}).get("unscoped_flood_allow", True),
+                    ),
+                    "path_hash_mode": self.config.get("mesh", {}).get(
+                        "path_hash_mode", 0
+                    ),
                 },
                 "letsmesh": self.config.get("letsmesh", {}),
-                "mqtt_brokers": self.config.get("mqtt_brokers", {}),  # FIX: openhop mqtt->mqtt_brokers rename; UI Observer tab reads brokers from stats.config.mqtt_brokers
+                "mqtt_brokers": self.config.get(
+                    "mqtt_brokers", {}
+                ),  # FIX: openhop mqtt->mqtt_brokers rename; UI Observer tab reads brokers from stats.config.mqtt_brokers
             },
             "public_key": None,
         }
@@ -1479,13 +1790,17 @@ class RepeaterHandler(BaseHandler):
         # Utilization is a percentage of the configured allowance. Duty is a
         # percentage of elapsed time; keep both so downstream clients can label
         # them correctly without changing the TX enforcement budget.
-        stats['tx_duty_pct'] = round(stats.get('current_airtime_ms', 0) / 600, 3)
-        stats['duty_window_seconds'] = 60
-        get_duty = getattr(radio, 'get_duty_cycle_stats', None)
+        stats["tx_duty_pct"] = round(stats.get("current_airtime_ms", 0) / 600, 3)
+        stats["duty_window_seconds"] = 60
+        get_duty = getattr(radio, "get_duty_cycle_stats", None)
         if callable(get_duty):
             duty = get_duty()
-            stats.update({key: duty[key] for key in (
-                'tx_duty_pct', 'rx_duty_pct', 'rx_availability_pct')})
+            stats.update(
+                {
+                    key: duty[key]
+                    for key in ("tx_duty_pct", "rx_duty_pct", "rx_availability_pct")
+                }
+            )
         return stats
 
     def _start_background_tasks(self):
@@ -1499,18 +1814,24 @@ class RepeaterHandler(BaseHandler):
                 current_time = time.time()
 
                 # Check noise floor recording (every 30 seconds)
-                if current_time - self.last_noise_measurement >= self.noise_floor_interval:
+                if (
+                    current_time - self.last_noise_measurement
+                    >= self.noise_floor_interval
+                ):
                     await self._record_noise_floor_async()
                     await self._record_crc_errors_async()
                     self.last_noise_measurement = current_time
 
-                # Check advert sending (every N hours)
-                can_advertise = (self.send_advert_func is not None
-                                 and self.config.get("repeater", {}).get("mode") != "no_tx")
-                if self.send_advert_interval_hours > 0 and can_advertise:
+                can_advertise = self.config.get("repeater", {}).get("mode") != "no_tx"
+                tick = getattr(self, 'periodic_advert_tick_func', None)
+                if tick and can_advertise:
+                    await tick()
+                elif self.send_advert_interval_hours > 0 and self.send_advert_func and can_advertise:
                     interval_seconds = self.send_advert_interval_hours * 3600
-                    if (current_time - self.last_advert_time >= interval_seconds
-                            and current_time >= self._flood_advert_retry_at):
+                    if (
+                        current_time - self.last_advert_time >= interval_seconds
+                        and current_time >= self._flood_advert_retry_at
+                    ):
                         if await self._send_periodic_advert_async():
                             self.last_advert_time = time.time()
                         self._flood_advert_retry_at = time.time() + 60
@@ -1518,10 +1839,13 @@ class RepeaterHandler(BaseHandler):
                 # Local adverts are zero-hop and use the separately saved
                 # minute interval. A failed send retries after one minute,
                 # instead of silently waiting another full advert interval.
-                if self.advert_interval_minutes > 0 and can_advertise:
+                if (self.advert_interval_minutes > 0 and can_advertise
+                        and not self.config.get('repeater', {}).get('direct_advert_interval_hours', 0)):
                     interval_seconds = self.advert_interval_minutes * 60
-                    if (current_time - self.last_local_advert_time >= interval_seconds
-                            and current_time >= self._local_advert_retry_at):
+                    if (
+                        current_time - self.last_local_advert_time >= interval_seconds
+                        and current_time >= self._local_advert_retry_at
+                    ):
                         if await self._send_periodic_advert_async(zero_hop=True):
                             self.last_local_advert_time = time.time()
                         self._local_advert_retry_at = time.time() + 60

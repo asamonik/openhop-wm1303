@@ -4,31 +4,32 @@
 
 ## Repository Overview
 
-The WM1303 system is built from **four repositories**. Three are forks of upstream projects; one (this repo) contains the integration layer.
+The WM1303 system is built from **four repositories**: three pinned canonical dependencies and this integration layer.
 
 The official upstream of `pyMC_core` and `pyMC_Repeater` has moved. Previously the canonical sources lived under the `pyMC-dev` GitHub organization; they have since been migrated to:
 
 - **https://github.com/openhop-dev/openhop_core** (was `pyMC-dev/pymc-core`)
 - **https://github.com/openhop-dev/openhop_repeater** (was `pyMC-dev/pymc-repeater`)
 
-The installer consumes the Hans van Meer forks (`HansvanMeer/pyMC_core` and
-`HansvanMeer/pyMC_Repeater`). The official upstream repositories below are listed
-for reference; they are not substitutes for the WM1303 integration.
+The installer now consumes canonical OpenHop core 1.1.3, OpenHop Repeater 1.1.4,
+and Semtech HAL 2.1.0. Exact commits and matching release tags are recorded in
+[`config/dependencies.conf`](../config/dependencies.conf). OpenHop is the renamed
+continuation of pyMC, not a separate application. The WM1303 integration remains
+a separate Git project and is still required for concentrator hardware.
 
 | Repository | Type | Branch | Purpose |
 |-----------|------|--------|---------|
 | [HansvanMeer/pyMC_WM1303](https://github.com/HansvanMeer/pyMC_WM1303) | **This repo** | `main` | Installation, overlays, config, docs, scripts |
-| [HansvanMeer/sx1302_hal](https://github.com/HansvanMeer/sx1302_hal) | Fork | `master` | SX1302 HAL v2.10 — C library + packet forwarder |
-| [openhop-dev/openhop_core](https://github.com/openhop-dev/openhop_core) | **Upstream (official)** | `main` | MeshCore core Python library |
-| [HansvanMeer/pyMC_core](https://github.com/HansvanMeer/pyMC_core) | Fork (mirrors upstream) | `dev` | WM1303-tuned fork of openhop_core |
-| [openhop-dev/openhop_repeater](https://github.com/openhop-dev/openhop_repeater) | **Upstream (official)** | `main` | MeshCore repeater application |
-| [HansvanMeer/pyMC_Repeater](https://github.com/HansvanMeer/pyMC_Repeater) | Fork (mirrors upstream) | `dev` | WM1303-tuned fork of openhop_repeater |
+| [Lora-net/sx1302_hal](https://github.com/Lora-net/sx1302_hal) | Canonical dependency | pinned `master` revision | HAL 2.1.0 plus WM1303 overlays |
+| [openhop-dev/openhop_core](https://github.com/openhop-dev/openhop_core) | Canonical dependency | `v1.1.3` + exact commit | MeshCore core plus WM1303 overlays |
+| [openhop-dev/openhop_repeater](https://github.com/openhop-dev/openhop_repeater) | Canonical dependency | `1.1.4` + exact commit | Repeater and matching dashboard plus WM1303 overlays |
 
 ### Important Rule
 
 **WM1303 changes belong in this integration's overlays.** Installation does not
 push changes to the published forks. It replaces and adds files in the local
-dependency checkouts; upgrades reset those checkouts and reapply the overlays.
+dependency checkouts; upgrades retain edits in Git stash, check out the pinned
+revision, and reapply the overlays.
 Do not keep unique source changes only in the deployed dependency directories.
 
 OpenHop Repeater's supported hardware is based on single-radio SX1262
@@ -37,7 +38,7 @@ SX1302/SX1303 concentrators. This repository supplies that hardware integration
 and the multi-channel bridge; installing upstream alone does not replace it.
 
 Overlays replace complete files, including `main.py`, `engine.py`, and
-`packet_router.py`. Updates to the underlying forks therefore do not automatically
+`packet_router.py`. Updates to the underlying dependencies therefore do not automatically
 bring fixes into those files. Compare changed upstream interfaces and run the
 [regression checks](testing.md) whenever updating the dependency versions.
 
@@ -46,9 +47,9 @@ Use the WM1303-aware Console updater or this repository's `bootstrap.sh` /
 a separate systemd job, using root-owned bootstrap/config copies installed under
 `/usr/local/lib/pymc-wm1303`. It captures and preserves the installed integration
 fork's GitHub owner/repository and follows `main`; the standalone bootstrap
-defaults to HansvanMeer unless `WM1303_REPO_URL` explicitly selects another
-GitHub fork named `pyMC_WM1303`. Dependency fork selection remains fixed by the
-scripts above.
+defaults to this fork (`asamonik/pyMC_WM1303`) unless `WM1303_REPO_URL` explicitly
+selects another GitHub fork named `pyMC_WM1303`. Dependency revisions come from
+the integration's lock file, not the currently latest upstream branch tip.
 
 The detached Console job fetches the validated integration fork's `main` over
 HTTPS without rewriting an SSH origin. It assumes a public fork, or unattended
@@ -58,14 +59,33 @@ Manual update commands keep using their existing configured remote transport.
 Generic OpenHop package updates do not reapply these overlays or rebuild the
 HAL. The Python distribution names are `openhop_core` and `openhop_repeater`,
 despite the retained `pyMC_core` and `pyMC_Repeater` checkout directory names.
-Installing the repeater can replace the editable core through its upstream Git
-dependency, so the scripts restore the local WM1303 core afterward.
+The repeater requires core 1.1.3; the scripts install the compatible local core
+and restore its editable WM1303 overlay after package installation.
 
 Before fetching existing checkouts, the scripts validate `origin` against the
 expected integration/dependency repository. GitHub HTTPS, `git@github.com:...`, and
 `ssh://git@github.com/...` forms are equivalent. A mismatch stops the update;
-the remote is never silently rewritten. `upgrade.sh --skip-pull` explicitly
-uses the existing local dependency sources instead.
+the remote is never silently rewritten. The three historical Hans van Meer
+dependency origins are also recognized; revisions are fetched from the canonical
+URL while the original SSH/HTTPS remote is preserved. Other origins are refused.
+Release tags must resolve to the locked SHA before any working-tree changes.
+The overlaid Python distribution is labelled `1.1.4+wm1303`, based on that
+verified tag, rather than SCM guessing the next upstream release from dirty
+overlay files. Core retains its upstream package version, 1.1.3.
+`upgrade.sh --skip-pull` is allowed only when all three checkouts already match
+the lock file; otherwise it stops before service interruption.
+
+Local source edits and untracked files are retained in each dependency's Git
+stash before checkout. They are not automatically reapplied, since they may be
+old overlays; inspect `git stash list` / `git stash show --include-untracked`
+to recover them. Installed configuration, identities and SQLite data remain in
+their existing directories and follow the normal upgrade backup procedure.
+
+The built-in dashboard now uses the matching OpenHop release. Existing external
+Console paths remain valid, and the WM1303 presentation adapters support both
+the previous build and the pinned built-in build. The optional plugin-manager
+service uses the WM1303 venv and service account; no plugin is downloaded or
+installed automatically. `plugins.enabled: false` disables its startup.
 
 ## Overlay Strategy
 
@@ -124,7 +144,7 @@ pyMC_WM1303/overlay/
 
 ## HAL Overlay Details
 
-The HAL overlay modifies the Semtech SX1302 HAL v2.10:
+The HAL overlay modifies the Semtech SX1302 HAL 2.1.0:
 
 | Overlay File | Changes |
 |-------------|--------|

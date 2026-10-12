@@ -1,5 +1,70 @@
 # Software checks and MeshCore compatibility
 
+## Canonical OpenHop dependency update (2026-10-12)
+
+The integration now pins OpenHop core 1.1.3 (`e07722e`), OpenHop Repeater 1.1.4
+(`13eb8b2`) and Semtech HAL (`4b42025`). The HAL revision is unchanged from the
+previous fork; all WM1303 C modifications remain in the overlay.
+
+The Python overlay reconciliation preserves scoped atomic configuration saves,
+the ordered storage writer, identity/companion persistence, packet policies,
+WM1303 TX scheduling, measured duty cycles, and owned shutdown. It incorporates
+the current ACL role numbering, ACK admission, return-path teaching, live
+frontend selection, measured packet provenance, region-map refresh, and
+neighbour scope discovery. Newly introduced scope queries are cancelled and
+joined during shutdown. Known legacy dependency remotes can migrate; other
+origins, failed fetches and mismatched release tags stop before checkout.
+
+Run the complete disposable real-package check, also used in CI:
+
+```bash
+bash tests/upstream_integration.sh
+# Optionally build the overlaid native HAL without running its hardware tools:
+WM1303_TEST_BUILD_HAL=1 bash tests/upstream_integration.sh
+```
+
+The script clones the exact pins, applies the complete overlays, installs both
+editable packages, checks isolated imports, runs local regressions, companion
+TCP and HTTP/authentication scenarios, and selected upstream contract suites.
+It also initializes the actual overlaid daemon with simulated radio I/O and
+checks its owned shutdown, without opening a live radio or installed service.
+It retains its temporary directory for inspection and never installs services
+or touches radio hardware. It uses uv when available, otherwise standard venv
+and pip. The source updates use release tags from the canonical repository,
+not mutable development branches or separate version-tag mirrors.
+
+When network access is unavailable, set `WM1303_TEST_SOURCE_CACHE` to a directory
+containing previously verified `core`, `repeater`, and optionally `hal` Git
+checkouts. The script still clones fresh fixtures and validates the exact commits
+and tags. With uv's dependency/build cache populated, `WM1303_TEST_OFFLINE=1`
+also disables package-index access; `WM1303_TEST_PYTHON_VERSION=3.12` selects the
+already available interpreter. An offline run does not verify fresh downloads.
+
+The upstream core suite has four explicit exclusions for pre-existing WM1303
+contact-store contracts: detached contact objects, anonymous/transient contacts
+not consuming permanent contact capacity, and channel-index preservation. These are covered by this
+integration's own tests; every other upstream core test is run. This is not a
+claim that the unmodified vanilla test suite passes without those differences.
+
+The matching OpenHop dashboard passed desktop/mobile browser checks for
+seven-digit counters, stacked labels, RX duty, TX duty versus budget use,
+packet scopes, owner saves, and all six history intervals. The previous
+compiled Console remains supported. Hardware/RF behavior and third-party plugin
+applications have not been verified on a Raspberry Pi.
+
+Final local results: 288 regressions pass with the real overlaid packages
+(the lightweight run passes 286 and skips two package-only checks), 1,823
+upstream core tests pass with the four documented contract exclusions, and
+69 upstream repeater contract tests pass. All 12 companion TCP scenarios,
+three HTTP/authentication scenarios, and the simulated-radio daemon smoke test
+pass. Both dashboard builds pass the browser checks, and the complete overlaid
+HAL builds successfully with existing compiler warnings. DNS failed during
+fresh-download retries; the final clean-fixture run used previously verified Git
+objects and cached Python dependencies, with exact revision/tag checks intact.
+
+Historical reference snapshots below describe earlier checks, not the currently
+selected dependency revisions.
+
 The 2026-10-12 dashboard checks cover rolling airtime rather than lifetime
 averages or budget utilization, actual RX modulation, all six history intervals,
 counter resets, unavailable spectrum readings, and failed scan restarts.

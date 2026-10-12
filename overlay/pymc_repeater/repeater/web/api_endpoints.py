@@ -5,6 +5,7 @@ import os
 import re
 import time
 from copy import deepcopy
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
@@ -175,6 +176,7 @@ logger = logging.getLogger("HTTPServer")
 
 
 class APIEndpoints:
+    SCOPE_QUERY_HTTP_TIMEOUT = 45.0
 
     def __init__(
         self,
@@ -213,6 +215,8 @@ class APIEndpoints:
 
         # Create nested update object for /api/update/* routes
         self.update = UpdateAPIEndpoints()
+        from .plugin_endpoints import PluginAPIEndpoints
+        self.plugins = PluginAPIEndpoints(self.config, self._config_path)
 
     def _is_cors_enabled(self):
         return self.config.get("web", {}).get("cors_enabled", False)
@@ -1287,9 +1291,13 @@ class APIEndpoints:
             if not updates:
                 return self._error("No configuration updates provided")
 
-            # Use ConfigManager to update and save configuration
-            # Web changes (CORS, web_path) don't require live update
-            result = self.config_manager.update_and_save(updates=updates, live_update=False)
+            if not isinstance(updates, dict) or not isinstance(updates.get('web'), dict):
+                return self._error('Web configuration updates must contain a web mapping')
+            if 'web_path' in updates['web']:
+                updates = deepcopy(updates)
+                updates['web']['web_path'] = self._normalize_web_path_for_persistence(updates['web']['web_path'])
+            result = self.config_manager.update_and_save(updates=updates, live_update=True,
+                                                         live_update_sections=['web'])
 
             if result.get("success"):
                 logger.info(f"Web configuration updated: {list(updates.keys())}")
@@ -6588,3 +6596,659 @@ class APIEndpoints:
 </html>"""
         cherrypy.response.headers["Content-Type"] = "text/html"
         return html.encode("utf-8")
+
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def serial_ports(self):
+        """Discover available serial/USB modem device paths."""
+        try:
+            devices = []
+
+            # Preferred: pyserial provides stable metadata (VID/PID, product, serial number).
+            try:
+                from serial.tools import list_ports
+
+                for port in list_ports.comports():
+                    label_parts = [port.device]
+                    if getattr(port, "description", None):
+                        label_parts.append(str(port.description))
+                    if getattr(port, "hwid", None) and str(port.hwid) != "n/a":
+                        label_parts.append(str(port.hwid))
+                    devices.append(
+                        {
+                            "device": str(port.device),
+                            "description": " - ".join(label_parts),
+                        }
+                    )
+            except Exception:
+                # Fallback for environments where pyserial is unavailable.
+                import glob
+
+                for pattern in (
+                    "/dev/ttyACM*",
+                    "/dev/ttyUSB*",
+                    "/dev/ttyS*",
+                    "/dev/serial/by-id/*",
+                ):
+                    for dev in glob.glob(pattern):
+                        devices.append({"device": str(dev), "description": str(dev)})
+
+            # Docker deployments may mount the host device namespace separately.
+            import glob
+
+            if os.path.isdir("/host/dev"):
+                for pattern in (
+                    "/host/dev/ttyACM*",
+                    "/host/dev/ttyUSB*",
+                    "/host/dev/serial/by-id/*",
+                ):
+                    try:
+                        for dev in glob.glob(pattern):
+                            devices.append({"device": str(dev), "description": str(dev)})
+                    except (OSError, PermissionError):
+                        continue
+
+            # De-duplicate by resolved target. Prefer stable host by-id aliases.
+            dedup = {}
+            for item in devices:
+                dev = item.get("device")
+                if not dev or (os.path.islink(dev) and not os.path.exists(dev)):
+                    continue
+                try:
+                    target = os.path.realpath(dev)
+                except (OSError, PermissionError):
+                    continue
+                preferred = str(dev).startswith("/host/dev/serial/by-id/")
+                existing = dedup.get(target)
+                if existing is None or preferred:
+                    # Docker reads `devices:` entries as host:container[:perms] and
+                    # cannot escape a colon inside the path, so a /dev/serial/by-id/
+                    # name carrying an ESP32-S3 MAC serial is unusable in a
+                    # container. Flag it so the UI can offer a symlink instead.
+                    item["docker_safe"] = ":" not in dev
+                    dedup[target] = item
+
+            sorted_devices = sorted(dedup.values(), key=lambda x: x["device"])
+            return self._success(sorted_devices)
+        except Exception as e:
+            logger.error(f"Error discovering serial ports: {e}")
+            return self._error(str(e))
+
+    @staticmethod
+    def _read_ui_version(html_dir: str) -> Optional[str]:
+        """Best-effort version for a static UI tree (VERSION / version.json / package.json)."""
+        if not html_dir or not os.path.isdir(html_dir):
+            return None
+        version_file = os.path.join(html_dir, "VERSION")
+        if os.path.isfile(version_file):
+            try:
+                value = open(version_file, "r", encoding="utf-8").read().strip()
+                return value or None
+            except OSError:
+                pass
+        for name in ("version.json", "package.json"):
+            candidate = os.path.join(html_dir, name)
+            if not os.path.isfile(candidate):
+                continue
+            try:
+                import json as _json
+
+                data = _json.loads(open(candidate, "r", encoding="utf-8").read())
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict):
+                ver = data.get("version")
+                if isinstance(ver, str) and ver.strip():
+                    return ver.strip()
+            elif isinstance(data, str) and data.strip():
+                return data.strip()
+        return None
+
+    def _plugin_ui_frontends(self) -> list:
+        """Installed application-UI plugins usable as primary web frontends."""
+        out = []
+        try:
+            from repeater.config import resolve_storage_dir
+            from repeater.plugins.manifest import ui_subtree
+            from repeater.plugins.storage import PluginStorage, resolve_plugins_root
+        except Exception as exc:
+            logger.debug("plugin UI frontends unavailable: %s", exc)
+            return out
+
+        try:
+            storage_dir = resolve_storage_dir(self.config, config_path=self._config_path)
+            plugins_root = resolve_plugins_root(self.config, storage_dir=storage_dir)
+            storage = PluginStorage(plugins_root)
+        except Exception as exc:
+            logger.debug("plugin storage resolve failed: %s", exc)
+            return out
+
+        for plugin_id in storage.list_plugin_ids():
+            try:
+                state = storage.read_state(plugin_id) or {}
+                manifest = storage.load_current_manifest(plugin_id)
+                if manifest is None or manifest.ui is None:
+                    continue
+                paths = storage.paths_for(plugin_id)
+                if paths.current_link.exists() or paths.current_link.is_symlink():
+                    # Keep a stable filesystem path under "current" so saved
+                    # web.web_path does not pin to a specific release version.
+                    release_root = paths.current_link
+                else:
+                    version = state.get("version") or (manifest.version if manifest else None)
+                    if not version:
+                        continue
+                    release_root = paths.release_dir(str(version))
+                if not release_root.is_dir():
+                    continue
+                entry = str(manifest.ui.entry or "").replace("\\", "/")
+                ui_subtree(entry)
+                entry_parts = tuple(p for p in entry.split("/") if p)
+                if not entry_parts:
+                    continue
+                if len(entry_parts) > 1:
+                    doc_root = release_root.joinpath(*entry_parts[:-1])
+                    entry_name = entry_parts[-1]
+                else:
+                    doc_root = release_root
+                    entry_name = entry_parts[0]
+                if not doc_root.is_dir():
+                    continue
+                index_path = doc_root / entry_name
+                available = bool(state.get("enabled", False)) and index_path.is_file()
+                version = str(state.get("version") or manifest.version or "") or None
+                out.append(
+                    {
+                        "id": f"plugin:{plugin_id}",
+                        "plugin_id": plugin_id,
+                        "kind": "plugin",
+                        "name": manifest.name or plugin_id,
+                        "description": (manifest.description or "Application UI plugin").strip()
+                        or "Application UI plugin",
+                        "path": str(doc_root),
+                        "version": version,
+                        "enabled": bool(state.get("enabled", False)),
+                        "available": available,
+                        "source": state.get("source") or "local",
+                    }
+                )
+            except Exception as exc:
+                logger.debug("skip plugin frontend %s: %s", plugin_id, exc)
+                continue
+        return out
+
+    def _plugin_id_from_web_path(self, web_path: str) -> Optional[str]:
+        value = str(web_path or "").strip()
+        if not value:
+            return None
+        if value.startswith("plugin:"):
+            plugin_id = value.split(":", 1)[1].strip()
+            return plugin_id or None
+        if value.startswith("/plugins/"):
+            suffix = value[len("/plugins/") :].strip("/")
+            plugin_id = suffix.split("/", 1)[0] if suffix else ""
+            return plugin_id or None
+
+        try:
+            from repeater.config import resolve_storage_dir
+            from repeater.plugins.storage import resolve_plugins_root
+
+            storage_dir = resolve_storage_dir(self.config, config_path=self._config_path)
+            plugins_root = resolve_plugins_root(self.config, storage_dir=storage_dir).resolve()
+            rel = Path(value).expanduser().resolve(strict=False).relative_to(plugins_root)
+            parts = rel.parts
+            if len(parts) >= 2 and parts[1] in {"current", "releases"}:
+                return parts[0] or None
+        except Exception:
+            return None
+        return None
+
+    def _normalize_web_path_for_persistence(self, web_path):
+        if web_path is None:
+            return None
+        value = str(web_path).strip()
+        if not value:
+            return None
+
+        plugin_id = self._plugin_id_from_web_path(value)
+        if plugin_id:
+            return f"plugin:{plugin_id}"
+
+        abs_value = os.path.abspath(value)
+        for item in self._plugin_ui_frontends():
+            if item.get("kind") != "plugin":
+                continue
+            item_path = item.get("path")
+            if not item_path:
+                continue
+            if os.path.abspath(str(item_path)) == abs_value:
+                item_plugin_id = str(item.get("plugin_id") or "").strip()
+                if item_plugin_id:
+                    return f"plugin:{item_plugin_id}"
+        return value
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def web_frontends(self):
+        """List selectable primary web frontends (built-in, Console, UI plugins)."""
+        self._set_cors_headers()
+
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+        if cherrypy.request.method not in ("GET", "HEAD"):
+            raise cherrypy.HTTPError(405, "Method Not Allowed")
+
+        try:
+            web_cfg = (self.config or {}).get("web") or {}
+            current_path = web_cfg.get("web_path")
+            if isinstance(current_path, str):
+                current_path = current_path.strip() or None
+            else:
+                current_path = None
+
+            try:
+                from repeater import __version__ as repeater_version
+            except Exception:
+                repeater_version = None
+
+            default_html = os.path.join(os.path.dirname(__file__), "html")
+            frontends = [
+                {
+                    "id": "builtin",
+                    "kind": "builtin",
+                    "name": "Default Frontend",
+                    "description": "Built-in Repeater web interface",
+                    "path": None,
+                    "version": repeater_version,
+                    "available": True,
+                    "enabled": True,
+                }
+            ]
+
+            console_path = "/opt/pymc_console/web/html"
+            console_exists = os.path.isdir(console_path)
+            frontends.append(
+                {
+                    "id": "console",
+                    "kind": "console",
+                    "name": "openHop Console",
+                    "description": "Alternative web interface for Repeater",
+                    "path": console_path,
+                    "version": self._read_ui_version(console_path) if console_exists else None,
+                    "available": console_exists,
+                    "enabled": console_exists,
+                }
+            )
+
+            frontends.extend(self._plugin_ui_frontends())
+
+            selected_id = "builtin"
+            if current_path:
+                # Prefer exact path match; fall back to path prefix for console.
+                matched = None
+                plugin_id = self._plugin_id_from_web_path(current_path)
+                if plugin_id:
+                    candidate_id = f"plugin:{plugin_id}"
+                    if any(item.get("id") == candidate_id for item in frontends):
+                        matched = candidate_id
+                for item in frontends:
+                    if matched is not None:
+                        break
+                    path = item.get("path")
+                    if not path:
+                        continue
+                    if os.path.abspath(str(path)) == os.path.abspath(str(current_path)):
+                        matched = item["id"]
+                        break
+                if matched is None and (
+                    current_path == console_path
+                    or str(current_path).startswith("/opt/pymc_console/")
+                ):
+                    matched = "console"
+                if matched is None:
+                    # Unknown custom path — surface as selected custom entry
+                    frontends.append(
+                        {
+                            "id": "custom",
+                            "kind": "custom",
+                            "name": "Custom path",
+                            "description": "Configured web_path not matching a known frontend",
+                            "path": current_path,
+                            "version": self._read_ui_version(current_path),
+                            "available": os.path.isdir(current_path),
+                            "enabled": True,
+                        }
+                    )
+                    matched = "custom"
+                selected_id = matched
+
+            for item in frontends:
+                item["selected"] = item["id"] == selected_id
+
+            return self._success(
+                {
+                    "frontends": frontends,
+                    "selected_id": selected_id,
+                    "web_path": current_path,
+                    "default_html_dir": default_html,
+                }
+            )
+        except Exception as e:
+            logger.error(f"Error listing web frontends: {e}")
+            return self._error(str(e))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def publish_neighbors(self):
+        """Run one neighbours discovery + publish cycle now.
+
+        POST /api/publish_neighbors
+
+        The HTTP equivalent of the ``discover.scopes`` mesh CLI command. A cycle
+        runs for minutes -- a discovery window plus one serialized scope query per
+        neighbour -- so this schedules it on the event loop and returns
+        immediately rather than holding the request open. Poll ``mqtt_status``
+        for the outcome.
+        """
+        self._set_cors_headers()
+
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        future = None
+        try:
+            self._require_post()
+            publisher = getattr(self.daemon_instance, "neighbors_publisher", None)
+            if not publisher:
+                return self._error("Neighbors publisher not available")
+            if not publisher.enabled():
+                return self._error(
+                    "Neighbours publishing is disabled - enable it and opt a broker in first"
+                )
+            if self.event_loop is None:
+                return self._error("Event loop not available")
+
+            import asyncio
+
+            # trigger_cycle owns the already-running check and tracks the task so
+            # shutdown can cancel it. Doing either here would race: this runs on a
+            # cherrypy thread while the cycle lives on the event loop.
+            async def _start():
+                return publisher.trigger_cycle()
+
+            future = asyncio.run_coroutine_threadsafe(_start(), self.event_loop)
+            if future.result(timeout=10):
+                return self._success("Neighbours discovery cycle started")
+            return self._error("A neighbours cycle is already running")
+        except FutureTimeoutError:
+            logger.error("Timed out starting the neighbours cycle", exc_info=True)
+            if future is not None:
+                future.cancel()
+            return self._error("Timed out starting the neighbours cycle")
+        except cherrypy.HTTPError:
+            raise
+        except Exception as e:
+            logger.error(f"Error starting neighbours cycle: {e}", exc_info=True)
+            return self._error(str(e))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def neighbor_scopes(self):
+        """Last known region scopes per neighbour.
+
+        GET /api/neighbor_scopes
+
+        Served as its own endpoint rather than folded into the advert queries: the
+        advert list is paginated per contact type and read on every neighbours-page
+        load, and this table is small enough (one row per queried neighbour) that
+        the client can hold the whole thing and join on pubkey.
+
+        ``scopes`` is the last answer a neighbour gave; an empty string is a real
+        answer meaning it serves unscoped traffic only. ``status``/``queried_at``
+        describe the most recent query, which may have failed after a good answer,
+        so ``responded_at`` is how fresh the scopes themselves are.
+
+        ``served`` carries this node's own scopes in the same comma-separated form,
+        so a client can tell which of a neighbour's scopes it already shares without
+        re-deriving the rule (the wildcard plus every allow-flood region). It is the
+        very string this node sends when a neighbour asks *it* the same question.
+        """
+        self._set_cors_headers()
+
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        try:
+            storage = self._get_storage()
+            scopes = storage.get_neighbor_scopes() or {}
+            # Keyword cannot be named `self` here -- it would collide with the
+            # method's own first argument.
+            return self._success(
+                scopes, count=len(scopes), served={"scopes": self._served_scopes()}
+            )
+        except Exception as e:
+            logger.error(f"Error reading neighbour scopes: {e}")
+            return self._error(str(e))
+
+    def _served_scopes(self) -> str:
+        """This node's advertised region scopes, or "" when they cannot be read.
+
+        Deliberately the same formatter the anon-regions responder uses, rather
+        than a second reading of the transport-key table: whatever a neighbour
+        would be told is what a client comparing against it has to see.
+        """
+        login_helper = getattr(self.daemon_instance, "login_helper", None)
+        formatter = getattr(login_helper, "_format_region_names", None) if login_helper else None
+        if not callable(formatter):
+            return ""
+        try:
+            return formatter() or ""
+        except Exception as e:
+            logger.debug(f"Could not read served region scopes: {e}")
+            return ""
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
+    def query_neighbor_scopes(self):
+        """Ask one neighbour for its region scopes now.
+
+        POST /api/query_neighbor_scopes  {"pubkey": "<64 hex chars>"}
+
+        Unlike ``publish_neighbors`` this holds the request open for the answer:
+        one query is a single route-direct request whose response window is
+        normally the 5 s floor (only a slow radio config approaches the 120 s
+        ceiling), so a spinner is a better fit than a poll. Nothing is published
+        as a result -- the answer is stored and returned, and the periodic cycle
+        remains the only thing that writes to the MQTT topic.
+
+        The request is route-direct with an empty path, so it only reaches a
+        zero-hop neighbour, and the responder rate-limits anonymous replies (4 per
+        3 minutes, shared across its identities) -- both show up here as a
+        ``timeout``.
+        """
+        self._set_cors_headers()
+
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        try:
+            self._require_post()
+            data = cherrypy.request.json or {}
+            pubkey = str(data.get("pubkey") or "").strip()
+            if not pubkey:
+                return self._error("Missing pubkey parameter")
+
+            publisher = getattr(self.daemon_instance, "neighbors_publisher", None)
+            if not publisher:
+                return self._error("Neighbors publisher not available")
+            if self.event_loop is None:
+                return self._error("Event loop not available")
+
+            import asyncio
+
+            future = asyncio.run_coroutine_threadsafe(publisher.query_one(pubkey), self.event_loop)
+            result = future.result(timeout=self.SCOPE_QUERY_HTTP_TIMEOUT)
+            return self._success(result)
+        except FutureTimeoutError:
+            # Deliberately not cancelled: the query has already spent the airtime,
+            # and it persists its own outcome, so letting it finish means the answer
+            # still shows up on a re-read instead of being thrown away here.
+            logger.warning(
+                "Neighbour scope query still in flight after %.0fs",
+                self.SCOPE_QUERY_HTTP_TIMEOUT,
+            )
+            return self._error("Still waiting for the neighbour to reply - check back in a moment")
+        except cherrypy.HTTPError:
+            raise
+        except ValueError as e:
+            return self._error(str(e))
+        except RuntimeError as e:
+            # query_one raises this when a cycle or another query already holds the
+            # scope helper -- one request in flight at a time, by design. Still
+            # logged, because an unrelated RuntimeError from the event loop lands
+            # here too and would otherwise leave no trace.
+            logger.warning(f"Neighbour scope query refused: {e}")
+            return self._error(str(e))
+        except Exception as e:
+            logger.error(f"Error querying neighbour scopes: {e}", exc_info=True)
+            return self._error(str(e))
+
+    @staticmethod
+    def _validate_neighbors_settings(raw):
+        """Validate the ``mqtt_brokers.neighbors`` block.
+
+        Returns ``(settings, error)``; ``error`` is None on success. The interval
+        is rejected rather than clamped when out of range, matching the firmware's
+        ``set mqtt.neighbors.interval`` behavior.
+        """
+        from repeater.neighbors_publisher import (
+            DEFAULT_INTERVAL_HOURS,
+            MAX_INTERVAL_HOURS,
+            MIN_INTERVAL_HOURS,
+        )
+
+        if not isinstance(raw, dict):
+            return None, "neighbors must be an object"
+
+        # Reject unknown keys rather than accepting them silently: a typo would
+        # otherwise return success while changing nothing the runtime reads.
+        known_keys = {
+            "enabled",
+            "interval_hours",
+            "discovery_timeout_seconds",
+            "scope_response_timeout_seconds",
+            "max_sweep_seconds",
+            "duty_cycle_abort_seconds",
+            "max_neighbors",
+            "max_neighbor_age_seconds",
+        }
+        unknown = sorted(set(raw) - known_keys)
+        if unknown:
+            return None, f"Unknown neighbors settings: {', '.join(unknown)}"
+
+        settings = {}
+
+        if "enabled" in raw:
+            if not isinstance(raw["enabled"], bool):
+                return None, "neighbors.enabled must be true or false"
+            settings["enabled"] = raw["enabled"]
+
+        if "interval_hours" in raw:
+            interval = raw["interval_hours"]
+            if isinstance(interval, bool) or not isinstance(interval, (int, float)):
+                return None, "neighbors.interval_hours must be a number"
+            if float(interval) != int(interval):
+                return None, "neighbors.interval_hours must be a whole number of hours"
+            interval = int(interval)
+            if interval < MIN_INTERVAL_HOURS or interval > MAX_INTERVAL_HOURS:
+                return (
+                    None,
+                    f"neighbors.interval_hours must be between {MIN_INTERVAL_HOURS} "
+                    f"and {MAX_INTERVAL_HOURS} (default {DEFAULT_INTERVAL_HOURS})",
+                )
+            settings["interval_hours"] = interval
+
+        if "discovery_timeout_seconds" in raw:
+            try:
+                timeout = float(raw["discovery_timeout_seconds"])
+            except (TypeError, ValueError):
+                return None, "neighbors.discovery_timeout_seconds must be a number"
+            if timeout < 5 or timeout > 300:
+                return None, "neighbors.discovery_timeout_seconds must be between 5 and 300"
+            settings["discovery_timeout_seconds"] = timeout
+
+        if "scope_response_timeout_seconds" in raw:
+            try:
+                scope_timeout = float(raw["scope_response_timeout_seconds"])
+            except (TypeError, ValueError):
+                return None, "neighbors.scope_response_timeout_seconds must be a number"
+            if scope_timeout < 0 or scope_timeout > 300:
+                return None, "neighbors.scope_response_timeout_seconds must be between 0 and 300"
+            settings["scope_response_timeout_seconds"] = scope_timeout
+
+        if "max_neighbors" in raw:
+            try:
+                max_neighbors = int(raw["max_neighbors"])
+            except (TypeError, ValueError):
+                return None, "neighbors.max_neighbors must be a number"
+            if max_neighbors < 1 or max_neighbors > 255:
+                return None, "neighbors.max_neighbors must be between 1 and 255"
+            settings["max_neighbors"] = max_neighbors
+
+        if "max_neighbor_age_seconds" in raw:
+            try:
+                max_age = float(raw["max_neighbor_age_seconds"])
+            except (TypeError, ValueError):
+                return None, "neighbors.max_neighbor_age_seconds must be a number"
+            if max_age < 60:
+                return None, "neighbors.max_neighbor_age_seconds must be at least 60"
+            settings["max_neighbor_age_seconds"] = max_age
+
+        if "max_sweep_seconds" in raw:
+            try:
+                max_sweep = float(raw["max_sweep_seconds"])
+            except (TypeError, ValueError):
+                return None, "neighbors.max_sweep_seconds must be a number"
+            if max_sweep < 30 or max_sweep > 7200:
+                return None, "neighbors.max_sweep_seconds must be between 30 and 7200"
+            settings["max_sweep_seconds"] = max_sweep
+
+        if "duty_cycle_abort_seconds" in raw:
+            try:
+                abort_after = float(raw["duty_cycle_abort_seconds"])
+            except (TypeError, ValueError):
+                return None, "neighbors.duty_cycle_abort_seconds must be a number"
+            if abort_after < 0 or abort_after > 600:
+                return None, "neighbors.duty_cycle_abort_seconds must be between 0 and 600"
+            settings["duty_cycle_abort_seconds"] = abort_after
+
+        return settings, None
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def adverts_count_by_contact_type(self, contact_type=None, hours=None):
+        """Get the total count of adverts for a specific contact type."""
+        try:
+            if not contact_type:
+                return self._error("contact_type parameter is required")
+
+            hours_int = int(hours) if hours is not None else None
+
+            storage = self._get_storage()
+            count = storage.sqlite_handler.get_adverts_count_by_contact_type(
+                contact_type=contact_type, hours=hours_int
+            )
+
+            return self._success(
+                {"count": count},
+                contact_type=contact_type,
+                hours=hours_int,
+            )
+
+        except ValueError as e:
+            return self._error(f"Invalid parameter format: {e}")
+        except Exception as e:
+            logger.error(f"Error getting adverts count by contact type: {e}")
+            return self._error(e)

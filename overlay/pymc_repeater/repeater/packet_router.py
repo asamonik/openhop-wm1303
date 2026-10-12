@@ -575,6 +575,11 @@ class PacketRouter:
                 self._record_for_ui(packet, metadata)
 
         elif payload_type == LoginResponseHandler.payload_type():
+            scope_helper = getattr(self.daemon, 'neighbor_scope_helper', None)
+            if scope_helper is not None and await scope_helper.process_response_packet(packet):
+                packet.mark_do_not_retransmit()
+                self._record_for_ui(packet, metadata)
+                return True
             # PAYLOAD_TYPE_RESPONSE (0x01): payload is dest_hash(1)+src_hash(1)+encrypted.
             # Deliver to the bridge that is the destination, or to all bridges when the
             # response is addressed to this repeater (path-based reply: firmware sends

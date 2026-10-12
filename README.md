@@ -2,7 +2,7 @@
 
 A multi-channel LoRa bridge and repeater that turns an SX1302/SX1303-based concentrator into a **MeshCore multi-channel radio gateway**. It receives, deduplicates, and retransmits packets across up to 6 independent LoRa channels — each with its own frequency, bandwidth, spreading factor, coding rate, and TX power — enabling MeshCore nodes on different channels to communicate through a single device.
 
-Built on top of the MeshCore core ([pyMC_core](https://github.com/HansvanMeer/pyMC_core) fork, dev — upstream now at [openhop-dev/openhop_core](https://github.com/openhop-dev/openhop_core)) and the repeater application ([pyMC_Repeater](https://github.com/HansvanMeer/pyMC_Repeater) fork, dev — upstream now at [openhop-dev/openhop_repeater](https://github.com/openhop-dev/openhop_repeater)), this project adds the WM1303-specific backend, bridge engine, web management UI, and all HAL-level modifications needed to run the concentrator as a multi-channel MeshCore repeater.
+Built on [OpenHop core 1.1.3](https://github.com/openhop-dev/openhop_core) and [OpenHop Repeater 1.1.4](https://github.com/openhop-dev/openhop_repeater) (formerly pyMC), this project adds the WM1303-specific backend, bridge engine, web management UI, and HAL modifications needed to run the concentrator as a multi-channel MeshCore repeater. Dependency revisions are pinned together in [`config/dependencies.conf`](config/dependencies.conf).
 
 For local regression checks, the MeshCore reference version, and hardware
 verification requirements, see [Testing and compatibility](docs/testing.md).
@@ -296,11 +296,11 @@ With slower LoRa settings, the same message takes **much** longer:
 
 | Repository | Purpose |
 |-----------|--------|
-| [HansvanMeer/sx1302_hal](https://github.com/HansvanMeer/sx1302_hal) | SX1302 HAL v2.10 (fork) |
-| [HansvanMeer/pyMC_core](https://github.com/HansvanMeer/pyMC_core) | MeshCore core library (fork, dev branch — upstream now at [openhop-dev/openhop_core](https://github.com/openhop-dev/openhop_core)) |
-| [HansvanMeer/pyMC_Repeater](https://github.com/HansvanMeer/pyMC_Repeater) | MeshCore repeater application (fork, dev branch — upstream now at [openhop-dev/openhop_repeater](https://github.com/openhop-dev/openhop_repeater)) |
+| [Lora-net/sx1302_hal](https://github.com/Lora-net/sx1302_hal) | Semtech HAL 2.1.0 base, with WM1303 overlays |
+| [openhop-dev/openhop_core](https://github.com/openhop-dev/openhop_core) | Core 1.1.3, with WM1303 overlays |
+| [openhop-dev/openhop_repeater](https://github.com/openhop-dev/openhop_repeater) | Repeater 1.1.4 and matching built-in dashboard, with WM1303 overlays |
 
-> These are forks of the original projects. The official upstream of `pyMC_core` and `pyMC_Repeater` moved to the `openhop-dev` GitHub organization (see [`docs/repositories.md`](./docs/repositories.md)); the Hans van Meer forks are kept in sync with that upstream. They are not modified directly — all WM1303-specific changes are applied as overlays from this repository.
+> Installation now consumes pinned canonical sources. Existing Hans van Meer dependency checkouts are recognized for migration; configuration, identities, database files, and checkout paths are preserved. Changes in dependency working trees are retained in Git stash before applying the new source and overlays. See [`docs/repositories.md`](./docs/repositories.md).
 
 ## Disclaimer
 

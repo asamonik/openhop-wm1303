@@ -5,14 +5,46 @@ from typing import Dict, Optional
 from openhop_core.protocol import Identity
 from openhop_core.protocol.constants import PUB_KEY_SIZE
 
+# ACL roles come from openhop_core, which mirrors firmware
+# ``src/helpers/ClientACL.h``: the role is the LOW TWO BITS of the permissions
+# byte and ADMIN is 3 — it is not "the 0x02 bit".
+#
+# This import is deliberately fail-closed. A core without these symbols still
+# builds the login reply's is_admin byte from ``permissions & 0x02``, which
+# also matches READ_WRITE (2); pairing it with this module would silently
+# announce a room server's read-write clients as admins. Refusing to start is
+# the safe failure.
+try:
+    from openhop_core.protocol.constants import (
+        PERM_ACL_ADMIN,
+        PERM_ACL_GUEST,
+        PERM_ACL_READ_ONLY,
+        PERM_ACL_READ_WRITE,
+        PERM_ACL_ROLE_MASK,
+    )
+    from openhop_core.protocol.constants import acl_is_admin as is_admin_permissions
+    from openhop_core.protocol.constants import acl_role as role_of
+except ImportError as exc:  # pragma: no cover - exercised by the install, not tests
+    raise ImportError(
+        "openhop_core is too old: it does not export PERM_ACL_* / acl_is_admin. "
+        "Install openhop_core with the ACL role fix (fix/login-perms or later) — "
+        "an older core encodes admin as the 0x02 bit and would announce "
+        "read-write clients as admins."
+    ) from exc
+
 logger = logging.getLogger("ACL")
 
-# Keep the existing Python writer/admin wire values. A blank-password reader
-# needs a distinct role; do not migrate those roles to firmware's 2/3 here.
-PERM_ACL_GUEST = 0x00
-PERM_ACL_ADMIN = 0x02
-PERM_ACL_READ_WRITE = 0x01
-PERM_ACL_ROLE_MASK = 0x03
+_ROLE_NAMES = {
+    PERM_ACL_GUEST: "guest",
+    PERM_ACL_READ_ONLY: "read_only",
+    PERM_ACL_READ_WRITE: "read_write",
+    PERM_ACL_ADMIN: "admin",
+}
+
+
+def role_name(permissions: int) -> str:
+    """Human-readable role name for logs and the web API."""
+    return _ROLE_NAMES[role_of(permissions)]
 
 
 class ClientInfo:
@@ -30,14 +62,14 @@ class ClientInfo:
         self.sync_since = 0  # For room servers - timestamp of last synced message
 
     def is_admin(self) -> bool:
-        return (self.permissions & PERM_ACL_ROLE_MASK) == PERM_ACL_ADMIN
+        return is_admin_permissions(self.permissions)
 
     def is_guest(self) -> bool:
-        # Existing telemetry callers classify password writers as guests too.
-        # Preserve that restriction; posting uses exact writer/admin roles.
-        return (self.permissions & PERM_ACL_ROLE_MASK) in (
-            PERM_ACL_GUEST, PERM_ACL_READ_WRITE,
-        )
+        return role_of(self.permissions) == PERM_ACL_GUEST
+
+    def role_name(self) -> str:
+        """Role name ("guest"/"read_only"/"read_write"/"admin") for logs and the API."""
+        return role_name(self.permissions)
 
 
 class ACL:
@@ -137,7 +169,9 @@ class ACL:
             client = self.clients.get(pub_key)
             if client is None:
                 if not self.allow_read_only:
-                    logger.info("Blank password, sender not in ACL and read-only disabled")
+                    logger.info(
+                        "Blank password, sender not in ACL and read-only disabled"
+                    )
                     return False, 0
                 if len(self.clients) >= self.max_clients:
                     logger.warning("ACL full, cannot add client")
@@ -146,10 +180,10 @@ class ACL:
                 logger.info("Blank password, allowing read-only guest access")
             else:
                 role = client.permissions & PERM_ACL_ROLE_MASK
-                if role not in (PERM_ACL_GUEST, PERM_ACL_READ_WRITE, PERM_ACL_ADMIN):
+                if role not in (PERM_ACL_GUEST, PERM_ACL_READ_ONLY, PERM_ACL_READ_WRITE, PERM_ACL_ADMIN):
                     logger.info("Blank password, sender has an unsupported ACL role")
                     return False, 0
-                if role == PERM_ACL_GUEST and not self.allow_read_only:
+                if role in (PERM_ACL_GUEST, PERM_ACL_READ_ONLY) and not self.allow_read_only:
                     logger.info("Blank password, read-only access is disabled")
                     return False, 0
                 # Known writers/admins keep ACL-based reconnect access. Blank
@@ -158,8 +192,12 @@ class ACL:
 
             if self._is_replay(client, timestamp):
                 return False, 0
-            self._touch_client_session(client, shared_secret, timestamp, sync_since=sync_since)
+            self._touch_client_session(
+                client, shared_secret, timestamp, sync_since=sync_since
+            )
             self.clients[pub_key] = client
+            # No role normalisation needed: PERM_ACL_GUEST *is* role 0, so a
+            # client stored with no role bits already reads back as a guest.
             return True, client.permissions
 
         permissions = 0
@@ -169,10 +207,18 @@ class ACL:
         )
         if admin_pwd and password == admin_pwd:
             permissions = PERM_ACL_ADMIN
-            logger.info(f"Admin password validated for '{target_identity_name or 'unknown'}'")
+            logger.info(
+                f"Admin password validated for '{target_identity_name or 'unknown'}'"
+            )
         elif guest_pwd and password == guest_pwd:
-            permissions = PERM_ACL_READ_WRITE
-            logger.info(f"Guest password validated for '{target_identity_name or 'unknown'}'")
+            # Firmware splits the guest password by server type. simple_repeater
+            # grants GUEST (may fetch base telemetry, may not change settings);
+            # simple_room_server grants READ_WRITE (may post and read messages).
+            permissions = PERM_ACL_READ_WRITE if is_room_server else PERM_ACL_GUEST
+            logger.info(
+                f"Guest password validated for '{target_identity_name or 'unknown'}' "
+                f"(role={role_name(permissions)})"
+            )
         else:
             logger.info(f"Invalid password for '{target_identity_name or 'unknown'}'")
             return False, 0
@@ -187,12 +233,14 @@ class ACL:
 
         if self._is_replay(client, timestamp):
             return False, 0
-        self._touch_client_session(client, shared_secret, timestamp, sync_since=sync_since)
+        self._touch_client_session(
+            client, shared_secret, timestamp, sync_since=sync_since
+        )
         client.permissions &= ~PERM_ACL_ROLE_MASK
         client.permissions |= permissions
         self.clients[pub_key] = client
 
-        logger.info(f"Login success! Permissions: {'ADMIN' if client.is_admin() else 'GUEST'}")
+        logger.info(f"Login success! Role: {client.role_name()}")
         return True, client.permissions
 
     def get_client(self, pub_key: bytes) -> Optional[ClientInfo]:

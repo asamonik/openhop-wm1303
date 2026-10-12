@@ -7,6 +7,7 @@ Also handles CLI commands for admin users on the repeater identity.
 """
 
 import asyncio
+import inspect
 import logging
 import time
 
@@ -14,15 +15,134 @@ from openhop_core.node.handlers.text import TextMessageHandler
 from openhop_core.protocol import CryptoUtils, Identity, PathUtils
 
 from .acl import PERM_ACL_ADMIN, PERM_ACL_READ_WRITE, PERM_ACL_ROLE_MASK
+from .acl import PERM_ACL_GUEST, is_admin_permissions
 from .mesh_cli import MeshCLI
 from .room_server import RoomServer
 
 logger = logging.getLogger("TextHelper")
 
 
-# Text message type flags
+def _core_accepts_ack_policy() -> bool:
+    """Does the installed openhop_core's text handler take ``should_ack_fn``?
+
+    Passing an argument an older core does not know raises TypeError from
+    ``register_identity`` -- which would leave the node with no text handler at
+    all, i.e. off the air. Repeater pinning can change over time, so an older
+    core remains an ordinary state to be in, not an error.
+    """
+    try:
+        return (
+            "should_ack_fn" in inspect.signature(TextMessageHandler.__init__).parameters
+        )
+    except (TypeError, ValueError):  # pragma: no cover - exotic/absent signature
+        return False
+
+
+CORE_ACCEPTS_ACK_POLICY = _core_accepts_ack_policy()
+
+
+# Text message type flags (firmware TxtDataHelpers.h)
 TXT_TYPE_PLAIN = 0x00
 TXT_TYPE_CLI_DATA = 0x01
+TXT_TYPE_SIGNED_PLAIN = 0x02
+TXT_TYPE_CLI_COMMAND = 0x03
+
+# The text types a server acts on. Both simple_repeater::onPeerDataRecv and
+# simple_room_server::onPeerDataRecv open their TXT_MSG branch with
+#
+#     if (!(flags == TXT_TYPE_PLAIN || flags == TXT_TYPE_CLI_DATA
+#           || flags == TXT_TYPE_CLI_COMMAND)) {
+#       MESH_DEBUG_PRINTLN("unsupported text type received: flags=%02x", flags);
+#     } else if (...)
+#
+# so anything else -- SIGNED_PLAIN included -- is logged and dropped: no
+# command run, no post stored, no reply. CLI_COMMAND joined the set when
+# firmware split "a CLI command" out of CLI_DATA (MeshCore 2c0ace25); CLI_DATA
+# stays in it because that is what every released client still sends.
+SERVER_TXT_TYPES = frozenset((TXT_TYPE_PLAIN, TXT_TYPE_CLI_DATA, TXT_TYPE_CLI_COMMAND))
+
+
+def _accept_once(client, sender_timestamp) -> tuple[bool, bool]:
+    """Firmware's TXT_MSG replay guard. Returns ``(accepted, is_retry)``.
+
+    ``simple_repeater`` and ``simple_room_server`` both open the branch with
+    ``sender_timestamp >= client->last_timestamp``: an older timestamp is a
+    replay and is dropped whole, an equal one is a *retry* — accepted, activity
+    refreshed, but the command not re-run and the post not re-added — and a
+    newer one is fresh work. The watermark advances either way.
+
+    Note the deliberate difference from ``ACL._is_replay``, which rejects the
+    equal case: that matches the REQ branch (``timestamp > last_timestamp``),
+    not this one.
+
+    An unresolved client or a core too old to publish the timestamp yields
+    ``(True, False)`` — no watermark to check against, so behave as before.
+    """
+    if client is None or sender_timestamp is None:
+        return True, False
+    last = int(getattr(client, "last_timestamp", 0) or 0)
+    if sender_timestamp < last:
+        logger.warning(
+            f"Possible replay: text timestamp={sender_timestamp} < last={last}; dropping"
+        )
+        return False, False
+    is_retry = sender_timestamp == last
+    client.last_timestamp = sender_timestamp
+    client.last_activity = int(time.time())
+    return True, is_retry
+
+
+def _may_ack(identity_type, client, txt_type, sender_timestamp) -> bool:
+    """Firmware's delivery-ACK rule for a server identity. Read-only.
+
+    A server answers far less than a chat node does, and decides *before* it
+    answers, so nothing it refuses is ever acknowledged:
+
+    - ``simple_repeater``: only ``TXT_TYPE_PLAIN``, and only from an admin --
+      the whole TXT_MSG branch is gated on ``client->isAdmin()``, and inside it
+      the ACK is built only under ``if (flags == TXT_TYPE_PLAIN)``.
+    - ``simple_room_server``: only PLAIN, and only when the role is not
+      ``PERM_ACL_GUEST`` (``send_ack`` stays false on the guest branch).
+    - Neither ACKs a CLI type, an unsupported type, or a replayed timestamp:
+      those never reach the ACK at all.
+
+    A retry (equal timestamp) *is* acknowledged by both -- firmware suppresses
+    the work, not the answer -- so only a strictly older stamp fails here.
+
+    This predicts *eligibility*, not the outcome. A post that clears the role
+    and replay checks and is then refused by ``add_post`` -- openHop's own
+    per-client rate limit, or a database error, neither of which firmware has --
+    is still acknowledged. Closing that would mean feeding the store result back
+    to an ACK the core handler has already scheduled.
+
+    ``txt_type is None`` means a core too old to publish it; there is nothing to
+    judge, so keep the previous behaviour rather than silently going quiet.
+    """
+    if txt_type is None:
+        return True
+    if txt_type != TXT_TYPE_PLAIN:
+        return False
+    if client is None:
+        return False
+    if sender_timestamp is not None:
+        last = int(getattr(client, "last_timestamp", 0) or 0)
+        if sender_timestamp < last:
+            return False
+    if identity_type == "room_server":
+        return not _is_guest_client(client)
+    return is_admin_permissions(getattr(client, "permissions", 0))
+
+
+def _is_guest_client(client) -> bool:
+    """True when ``client`` holds the GUEST role (firmware ``PERM_ACL_GUEST``).
+
+    Falls back to the role bits for a client object with no ``is_guest``
+    helper, so an older ACL shape still fails closed.
+    """
+    is_guest = getattr(client, "is_guest", None)
+    if callable(is_guest):
+        return bool(is_guest())
+    return (getattr(client, "permissions", 0) & PERM_ACL_ROLE_MASK) == PERM_ACL_GUEST
 
 
 class TextHelper:
@@ -97,21 +217,36 @@ class TextHelper:
         # Get ACL for this identity
         identity_acl = self.acl_dict.get(hash_byte)
         if not identity_acl:
-            logger.warning(f"Cannot register identity '{name}': no ACL for hash 0x{hash_byte:02X}")
+            logger.warning(
+                f"Cannot register identity '{name}': no ACL for hash 0x{hash_byte:02X}"
+            )
             return
 
         # Create a contacts wrapper from this identity's ACL
         acl_contacts = self._create_acl_contacts_wrapper(identity_acl)
 
         # Create TextMessageHandler for this identity
-        handler = TextMessageHandler(
-            local_identity=identity,
-            contacts=acl_contacts,
-            log_fn=self.log_fn,
-            send_packet_fn=self._send_packet,
-            radio_config=radio_config,
-            track_task_fn=self._track_task,
-        )
+        handler_kwargs = {
+            "track_task_fn": self._track_task,
+            "local_identity": identity,
+            "contacts": acl_contacts,
+            "log_fn": self.log_fn,
+            "send_packet_fn": self._send_packet,
+            "radio_config": radio_config,
+        }
+        if CORE_ACCEPTS_ACK_POLICY:
+            # The handler's own rule is BaseChatMesh's, which over-answers for a
+            # server: without this, a signed post, a non-admin command or a
+            # guest's post is ACKed there and only then refused here.
+            handler_kwargs["should_ack_fn"] = self._make_ack_policy(
+                hash_byte, identity_type
+            )
+        else:
+            logger.warning(
+                "openhop_core's text handler takes no should_ack_fn: it will "
+                "acknowledge messages this server then refuses. Upgrade openhop_core."
+            )
+        handler = TextMessageHandler(**handler_kwargs)
 
         # Register by dest hash
         hash_byte = identity.get_public_key()[0]
@@ -155,7 +290,11 @@ class TextHelper:
                 if not isinstance(room_config, dict):
                     raise ValueError("Room settings must be a mapping")
                 max_posts = room_config.get("max_posts", MAX_UNSYNCED_POSTS)
-                if isinstance(max_posts, bool) or not isinstance(max_posts, int) or max_posts < 1:
+                if (
+                    isinstance(max_posts, bool)
+                    or not isinstance(max_posts, int)
+                    or max_posts < 1
+                ):
                     raise ValueError("Room max_posts must be a positive integer")
 
                 # Enforce hard limit
@@ -189,7 +328,9 @@ class TextHelper:
                 except RuntimeError:
                     # No running event loop in this thread
                     if self._loop and self._loop.is_running():
-                        future = asyncio.run_coroutine_threadsafe(room_server.start(), self._loop)
+                        future = asyncio.run_coroutine_threadsafe(
+                            room_server.start(), self._loop
+                        )
                         future.add_done_callback(
                             lambda f: (
                                 logger.error(
@@ -201,16 +342,57 @@ class TextHelper:
                             )
                         )
                     else:
-                        logger.error(f"Cannot start room server '{name}': no event loop available")
+                        logger.error(
+                            f"Cannot start room server '{name}': no event loop available"
+                        )
 
                 logger.info(
                     f"Registered room server '{name}': hash=0x{hash_byte:02X}, "
                     f"max_posts={max_posts}"
                 )
             except Exception as e:
-                logger.error(f"Failed to create room server '{name}': {e}", exc_info=True)
+                logger.error(
+                    f"Failed to create room server '{name}': {e}", exc_info=True
+                )
 
-        logger.info(f"Registered {identity_type} '{name}' text handler: hash=0x{hash_byte:02X}")
+        logger.info(
+            f"Registered {identity_type} '{name}' text handler: hash=0x{hash_byte:02X}"
+        )
+
+    def _client_by_pubkey(self, identity_hash: int, pubkey: bytes):
+        """The ACL client for an already-authenticated public key.
+
+        Core hands the ACK policy the key it actually decrypted with, so this
+        is an exact lookup rather than the hash-collision search
+        ``_resolve_sender_client`` has to do from the wire.
+        """
+        identity_acl = self.acl_dict.get(identity_hash)
+        if not identity_acl:
+            return None
+        get_client = getattr(identity_acl, "get_client", None)
+        if callable(get_client):
+            client = get_client(pubkey)
+            if client is not None:
+                return client
+        for client_info in identity_acl.get_all_clients():
+            if client_info.id.get_public_key() == pubkey:
+                return client_info
+        return None
+
+    def _make_ack_policy(self, identity_hash: int, identity_type: str):
+        """Bind :func:`_may_ack` to one registered identity for the core handler."""
+
+        def _policy(sender_pubkey: bytes, txt_type: int, sender_timestamp: int) -> bool:
+            client = self._client_by_pubkey(identity_hash, sender_pubkey)
+            allowed = _may_ack(identity_type, client, txt_type, sender_timestamp)
+            if not allowed:
+                logger.debug(
+                    f"[{identity_type}] withholding ACK for txt_type={txt_type} "
+                    f"from {sender_pubkey[:4].hex()}"
+                )
+            return allowed
+
+        return _policy
 
     def _create_acl_contacts_wrapper(self, acl):
 
@@ -360,20 +542,54 @@ class TextHelper:
         # Extract decrypted message if available
         if hasattr(packet, "decrypted") and packet.decrypted:
             message_text = packet.decrypted.get("text", "<unknown>")
+
+            # Firmware gates the whole TXT_MSG branch on the text type before it
+            # looks at the text at all. Without this, a SIGNED_PLAIN — a room
+            # post, whose 4-byte author prefix the core handler has already
+            # split off, leaving bare text — reaches the repeater's CLI and runs
+            # as a command whenever it happens to start with a command prefix.
+            # A core older than the one that publishes ``txt_type`` reports
+            # None; behave as before rather than dropping every message.
+            txt_type = packet.decrypted.get("txt_type")
+            sender_timestamp = packet.decrypted.get("sender_timestamp")
+            if txt_type is None or sender_timestamp is None:
+                logger.warning(
+                    "TXT_MSG carried no txt_type/sender_timestamp: openhop_core is "
+                    "older than the build that publishes them, so the text-type "
+                    "gate and the replay guard are open. Upgrade openhop_core."
+                )
+            if txt_type is not None and txt_type not in SERVER_TXT_TYPES:
+                logger.debug(
+                    f"[{identity_type}:{identity_name}] unsupported text type "
+                    f"{txt_type} from 0x{src_hash:02X}; dropping"
+                )
+                return
+
             sender_client = self._resolve_sender_client(dest_hash, src_hash, packet)
+
+            # Firmware checks the type, then the replay watermark, and only then
+            # looks at the message. A retry is accepted but re-runs nothing.
+            accepted, is_retry = _accept_once(sender_client, sender_timestamp)
+            if not accepted:
+                logger.warning(
+                    f"[{identity_type}:{identity_name}] replay from 0x{src_hash:02X}; dropping"
+                )
+                return
 
             # Clean message text - remove null bytes and trailing whitespace
             message_text = message_text.rstrip("\x00").rstrip()
 
             is_cli_payload = (
                 room_context is not None and room_context[1] == TXT_TYPE_CLI_DATA
-            ) or (
-                identity_type == "repeater" and self._is_cli_command(message_text)
-            )
+            ) or (identity_type == "repeater" and self._is_cli_command(message_text))
             if is_cli_payload:
-                logger.info("[%s:%s] CLI payload received", identity_type, identity_name)
+                logger.info(
+                    "[%s:%s] CLI payload received", identity_type, identity_name
+                )
             else:
-                logger.info(f"[{identity_type}:{identity_name}] Message: {message_text}")
+                logger.info(
+                    f"[{identity_type}:{identity_name}] Message: {message_text}"
+                )
 
             # Handle room server messages
             if identity_type == "room_server" and dest_hash in self.room_servers:
@@ -384,12 +600,27 @@ class TextHelper:
                 if sender_client is not expected_sender or is_retry:
                     return
                 role = sender_client.permissions & PERM_ACL_ROLE_MASK
-                if (role not in (PERM_ACL_READ_WRITE, PERM_ACL_ADMIN)
-                        or (txt_type == TXT_TYPE_CLI_DATA and role != PERM_ACL_ADMIN)):
+                if role not in (PERM_ACL_READ_WRITE, PERM_ACL_ADMIN) or (
+                    txt_type == TXT_TYPE_CLI_DATA and role != PERM_ACL_ADMIN
+                ):
                     return
 
-                # The wire type, not a word prefix in ordinary chat, selects CLI.
-                if txt_type == TXT_TYPE_CLI_DATA:
+                # simple_room_server::onPeerDataRecv splits by *type*, not by
+                # text: CLI_DATA/CLI_COMMAND go to the admin CLI, PLAIN becomes
+                # a post. Deciding from the text instead got both wrong -- a
+                # PLAIN "set ..." ran as a command instead of being posted, and
+                # a command whose text was not in the prefix list was published
+                # to the room.
+                if txt_type is None:
+                    # Older core: no type to dispatch on, keep the text test.
+                    room_is_command = self._is_cli_command(message_text)
+                else:
+                    room_is_command = txt_type in (
+                        TXT_TYPE_CLI_DATA,
+                        TXT_TYPE_CLI_COMMAND,
+                    )
+
+                if room_is_command:
                     # Handle CLI command - do NOT store as post
                     if room_server and room_server.cli:
                         try:
@@ -409,15 +640,28 @@ class TextHelper:
                             if sender_client is not None:
                                 sender_pubkey = sender_client.id.get_public_key()
 
+                            # A retry re-sends the same command; firmware
+                            # answers it with an empty reply rather than running
+                            # it a second time.
+                            if is_retry:
+                                logger.info(
+                                    f"Room '{identity_name}': retry of command from "
+                                    f"0x{src_hash:02X}; not re-running"
+                                )
+                                return
+
                             # Handle CLI command
                             # Reserve before execution: a failed reply must not
                             # cause an already-executed command to run again.
                             sender_client.last_timestamp = max(
-                                sender_client.last_timestamp, sender_timestamp,
+                                sender_client.last_timestamp,
+                                sender_timestamp,
                             )
                             sender_client.last_activity = int(time.time())
                             reply = room_server.cli.handle_command(
-                                sender_pubkey=sender_pubkey, command=message_text, is_admin=is_admin
+                                sender_pubkey=sender_pubkey,
+                                command=message_text,
+                                is_admin=is_admin,
                             )
 
                             logger.info(
@@ -436,13 +680,36 @@ class TextHelper:
 
                         except Exception as e:
                             logger.error(
-                                f"Error processing room server CLI command: {e}", exc_info=True
+                                f"Error processing room server CLI command: {e}",
+                                exc_info=True,
                             )
 
                     # CLI command handled, don't store as post
                     return
 
                 # NOT a CLI command - store as regular room post
+                #
+                # A guest may read the room but not write to it:
+                # simple_room_server::onPeerDataRecv takes the
+                # `(client->permissions & PERM_ACL_ROLE_MASK) == PERM_ACL_GUEST`
+                # branch for a PLAIN message and stores nothing (and sends no
+                # ACK). Without this, anyone who can log in with the guest
+                # password can post to the room.
+                if sender_client is not None and _is_guest_client(sender_client):
+                    logger.warning(
+                        f"Room '{identity_name}': post denied from 0x{src_hash:02X} (guest)"
+                    )
+                    return
+
+                # Firmware calls addPost only when `!is_retry`, so a resent post
+                # does not appear in the room twice.
+                if is_retry:
+                    logger.info(
+                        f"Room '{identity_name}': retry of post from 0x{src_hash:02X}; "
+                        "not storing again"
+                    )
+                    return
+
                 try:
                     # Get sender's full pubkey
                     sender_pubkey = sender_client.id.get_public_key()
@@ -462,8 +729,16 @@ class TextHelper:
 
                 return False
 
-            # Check if this is a CLI command to the repeater (AFTER decryption)
-            if dest_hash == self.repeater_hash and self.cli and self._is_cli_command(message_text):
+            # A repeater has no chat function, so simple_repeater::onPeerDataRecv
+            # runs *every* accepted type from an admin through handleCommand with
+            # no text test at all. Matching that means a plain DM to the repeater
+            # is a command too -- which it always was; openHop simply dropped the
+            # ones whose text did not match a prefix.
+            if txt_type is None and not self._is_cli_command(message_text):
+                # Older core: no type to dispatch on, keep the text test.
+                return
+
+            if dest_hash == self.repeater_hash and self.cli:
                 try:
                     repeater_hash = self.repeater_hash
                     if repeater_hash is None:
@@ -486,14 +761,22 @@ class TextHelper:
                     if sender_client is not None:
                         sender_pubkey = sender_client.id.get_public_key()
 
+                    # A retry re-sends the same command; firmware answers it
+                    # with an empty reply rather than running it again.
+                    if is_retry:
+                        logger.info(
+                            f"Retry of command from 0x{src_hash:02X}; not re-running"
+                        )
+                        return
+
                     # Handle CLI command
                     reply = self.cli.handle_command(
-                        sender_pubkey=sender_pubkey, command=message_text, is_admin=is_admin
+                        sender_pubkey=sender_pubkey,
+                        command=message_text,
+                        is_admin=is_admin,
                     )
 
-                    logger.info(
-                        f"CLI command handled from 0x{src_hash:02X}"
-                    )
+                    logger.info(f"CLI command handled from 0x{src_hash:02X}")
 
                     # Send reply back to sender
                     handler_info = self.handlers.get(dest_hash)
@@ -595,7 +878,9 @@ class TextHelper:
                 return self._check_admin_permission_for_identity(client_info, repeater_hash)
         return False
 
-    def _check_admin_permission_for_identity(self, sender_client, identity_hash: int) -> bool:
+    def _check_admin_permission_for_identity(
+        self, sender_client, identity_hash: int
+    ) -> bool:
         """Check admin permissions for a specific identity.
 
         Accepts either a resolved ACL client object (preferred) or a legacy
@@ -613,17 +898,16 @@ class TextHelper:
                 pubkey = client_info.id.get_public_key()
                 if pubkey[0] == src_hash:
                     permissions = getattr(client_info, "permissions", 0)
-                    PERM_ACL_ADMIN = 0x02
-                    return (permissions & 0x02) == PERM_ACL_ADMIN
+                    return is_admin_permissions(permissions)
             return False
 
         sender_pubkey = sender_client.id.get_public_key()
         for client_info in identity_acl.get_all_clients():
             if client_info.id.get_public_key() == sender_pubkey:
-                # Check admin bit (0x02 = PERM_ACL_ADMIN)
+                # Role is the low two bits with ADMIN == 3; a 0x02 bit test
+                # would also let READ_WRITE clients run admin CLI commands.
                 permissions = getattr(client_info, "permissions", 0)
-                PERM_ACL_ADMIN = 0x02
-                return (permissions & 0x02) == PERM_ACL_ADMIN
+                return is_admin_permissions(permissions)
 
         return False
 

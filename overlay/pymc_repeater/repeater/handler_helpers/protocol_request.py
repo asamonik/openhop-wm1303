@@ -23,6 +23,9 @@ from openhop_core.node.handlers.result import HandlerResult
 from openhop_core.protocol import CryptoUtils, PacketBuilder, PathUtils
 from openhop_core.protocol.cayenne_lpp import (
     TELEM_CHANNEL_SELF,
+    encode_barometric_pressure,
+    encode_current,
+    encode_power,
     encode_relative_humidity,
     encode_temperature,
     encode_voltage,
@@ -250,6 +253,10 @@ class ProtocolRequestHelper:
         # uint16 err_events, int16 last_snr (×4), uint16 n_direct_dups, n_flood_dups,
         # uint32 total_rx_air_time_secs, n_recv_errors  → 56 bytes
 
+        # Battery Readings: uses first configured sensor that reports bus/pack voltage.
+        readings = self._get_sensor_readings()
+        batt = int(min(max(self._battery_voltage(readings) * 1000, 0), 0xFFFF))
+
         # Uptime: use engine start_time when available (fixes wrong "20521 days" from time.time())
         if self.engine and hasattr(self.engine, "start_time"):
             total_up_time_secs = int(time.time() - self.engine.start_time)
@@ -291,22 +298,34 @@ class ProtocolRequestHelper:
                 self.engine, "airtime_manager", None
             )
             if am is not None:
-                total_air_time_secs = int(getattr(am, "total_airtime_ms", 0) or 0) // 1000
-                total_rx_air_time_secs = int(getattr(am, "total_rx_airtime_ms", 0) or 0) // 1000
+                total_air_time_secs = (
+                    int(getattr(am, "total_airtime_ms", 0) or 0) // 1000
+                )
+                total_rx_air_time_secs = (
+                    int(getattr(am, "total_rx_airtime_ms", 0) or 0) // 1000
+                )
 
         # Routing stats (flood/direct and dups - from engine when available)
         n_sent_flood = getattr(self.engine, "sent_flood_count", 0) if self.engine else 0
-        n_sent_direct = getattr(self.engine, "sent_direct_count", 0) if self.engine else 0
+        n_sent_direct = (
+            getattr(self.engine, "sent_direct_count", 0) if self.engine else 0
+        )
         n_recv_flood = getattr(self.engine, "recv_flood_count", 0) if self.engine else 0
-        n_recv_direct = getattr(self.engine, "recv_direct_count", 0) if self.engine else 0
-        n_direct_dups = getattr(self.engine, "direct_dup_count", 0) if self.engine else 0
+        n_recv_direct = (
+            getattr(self.engine, "recv_direct_count", 0) if self.engine else 0
+        )
+        n_direct_dups = (
+            getattr(self.engine, "direct_dup_count", 0) if self.engine else 0
+        )
         n_flood_dups = getattr(self.engine, "flood_dup_count", 0) if self.engine else 0
-        n_recv_errors = int(getattr(self.radio, "crc_error_count", 0) or 0) if self.radio else 0
+        n_recv_errors = (
+            int(getattr(self.radio, "crc_error_count", 0) or 0) if self.radio else 0
+        )
 
         # Pack 56-byte RepeaterStats (layout matches firmware)
         stats = struct.pack(
             "<HHhhIIIIIIIIHhHHII",
-            0,  # batt_milli_volts (not available on Pi)
+            batt,  # battery in mV
             0,  # curr_tx_queue_len (TODO)
             noise_floor,
             last_rssi,
@@ -362,14 +381,17 @@ class ProtocolRequestHelper:
 
         # Base voltage entry: configured UPS/battery voltage when available,
         # else 0.0 V (voltage-only floor, mirroring the companion self-telemetry).
-        lpp = bytearray(encode_voltage(TELEM_CHANNEL_SELF, self._battery_voltage(readings)))
+        lpp = bytearray(
+            encode_voltage(TELEM_CHANNEL_SELF, self._battery_voltage(readings))
+        )
 
-        # Environment sensors: each gets the next channel starting at 2, in the
-        # order they are configured (firmware querySensors channel assignment).
+        # One channel per sensor reading (matches firmware channel assignment).
         if perm_mask & TELEM_PERM_ENVIRONMENT:
             channel = TELEM_CHANNEL_SELF + 1
             for reading in readings:
-                entry = self._encode_environment_reading(channel, reading)
+                entry = self._encode_power_reading(
+                    channel, reading
+                ) + self._encode_environment_reading(channel, reading)
                 if entry:
                     lpp.extend(entry)
                     channel += 1
@@ -408,11 +430,45 @@ class ProtocolRequestHelper:
         return 0.0
 
     @staticmethod
-    def _encode_environment_reading(channel: int, reading) -> bytes:
-        """Encode a temperature/humidity reading as CayenneLPP, or b"" if none.
+    def _encode_power_reading(channel: int, reading) -> bytes:
+        """Encode a voltage/current/power reading as CayenneLPP, or b"" if none.
 
-        Follows the firmware SHT/BME query order: temperature then relative
-        humidity on the same channel.
+        TODO: a multi-rail sensor (e.g. INA3221) would need one channel per
+        rail here, not one channel for the whole reading.
+        """
+        if not reading.get("ok"):
+            return b""
+        data = reading.get("data") or {}
+        out = bytearray()
+        voltage = data.get("bus_voltage_v")
+        if voltage is not None:
+            try:
+                out.extend(encode_voltage(channel, float(voltage)))
+            except (TypeError, ValueError):
+                pass
+        current = data.get("current_ma")
+        if current is not None:
+            try:
+                out.extend(encode_current(channel, float(current) / 1000.0))
+            except (TypeError, ValueError):
+                pass
+        power = data.get("power_mw")
+        if power is not None:
+            try:
+                power_mw = float(power)
+                watts = int(power_mw / 1000.0)
+                if power_mw >= 0.0 and watts <= 0xFFFF:
+                    out.extend(encode_power(channel, watts))
+            except (TypeError, ValueError, OverflowError):
+                pass
+        return bytes(out)
+
+    @staticmethod
+    def _encode_environment_reading(channel: int, reading) -> bytes:
+        """Encode a temperature/humidity/pressure reading as CayenneLPP, or b"" if none.
+
+        Follows the firmware SHT/BME query order: temperature, relative
+        humidity, then barometric pressure, all on the same channel.
         """
         if not reading.get("ok"):
             return b""
@@ -428,6 +484,12 @@ class ProtocolRequestHelper:
         if humidity is not None:
             try:
                 out.extend(encode_relative_humidity(channel, float(humidity)))
+            except (TypeError, ValueError):
+                pass
+        pressure = data.get("pressure_hpa")
+        if pressure is not None:
+            try:
+                out.extend(encode_barometric_pressure(channel, float(pressure)))
             except (TypeError, ValueError):
                 pass
         return bytes(out)

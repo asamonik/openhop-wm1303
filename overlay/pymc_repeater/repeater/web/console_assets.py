@@ -80,6 +80,49 @@ PACKET_SCOPE_REPLACEMENTS = (
      "_(`span`,{class:`text-xs text-content-secondary dark:text-content-muted`,style:{overflowWrap:`anywhere`}},`Scope: `+a(c.packet.scope||`unknown scope`),1)"),
 )
 
+# The built-in UI shipped with the pinned OpenHop Repeater 1.1.4 release.
+# Hash-specific mappings deliberately fail closed if a different build appears.
+OPENHOP_114_REPLACEMENTS = {
+    'Configuration-Cnh2mH3e.js': (),  # Its native policy editor is already enabled.
+    'NeighbourLinks-BB3d0leo.js': NEIGHBOR_REPLACEMENTS,
+    'RfHealthCorrelation-C-IlaF7f.js': (
+        ('c(X.value?.max_attempts??0)', 'c(X.value?.has_lbt_data?X.value.max_attempts:`N/A`)'),
+        LBT_REPLACEMENTS[1],
+    ),
+    'Dashboard-CQfCREEg.js': (
+        ('f(V,{title:`Up Time`,value:c.value.uptimeFormatted,color:n.uptime,data:[],showChart:!1,class:`stat-card`},null,8,[`value`,`color`])',
+         'f(V,{title:`Up Time`,value:c.value.uptimeFormatted,color:n.uptime,data:[],showChart:!1,class:`stat-card`},null,8,[`value`,`color`]),'
+         'f(V,{title:`RX Duty (60s)`,value:i.systemStats?.rx_duty_pct==null?`N/A`:i.systemStats.rx_duty_pct.toFixed(3)+`%`,color:n.rx,data:[],showChart:!1,class:`stat-card`},null,8,[`value`,`color`])'),
+        ('class:`grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 2xl:grid-cols-7 gap-2 sm:gap-3 xl:gap-4 mb-5 stats-cards-container`',
+         'class:`grid gap-3 lg:gap-4 mb-5 stats-cards-container`,style:{gridTemplateColumns:`repeat(auto-fit,minmax(min(190px,calc((100% - 12px)/2)),1fr))`}'),
+    ),
+    'Dashboard-Bkt1lYRl.css': (
+        ('justify-content:space-between;align-items:flex-end;gap:8px;margin-bottom:8px;display:flex',
+         'flex-direction:column;align-items:flex-start;gap:6px;margin-bottom:8px;display:flex'),
+        ('font-variant-numeric:tabular-nums;font-weight:700;line-height:1}',
+         'font-variant-numeric:tabular-nums;font-weight:700;line-height:1.15;overflow-wrap:anywhere;max-width:100%}'),
+        ('flex-shrink:0;align-items:baseline;gap:6px;margin-left:auto;display:flex',
+         'flex-shrink:0;align-items:baseline;gap:6px;margin-left:0;display:flex;flex-wrap:wrap;max-width:100%'),
+    ),
+    'system-DJ1E8eZb.js': (
+        ('let n=e.utilization_percent;typeof n==`number`&&(g.value=n*_.value/100)',
+         'let n=e.tx_duty_pct??(e.current_airtime_ms==null?null:e.current_airtime_ms/600);typeof n==`number`&&(g.value=n)'),
+    ),
+    'index-BaPuRw8s.js': (
+        ('r[6]||=D(`span`,null,`Duty Cycle`,-1)',
+         'r[6]||=D(`span`,{title:`TX airtime as a percentage of the last 60 seconds`},`TX Duty (60s)`,-1)'),
+        ('p(d(h).dutyCycleUtilization.toFixed(1))+`% / `+p(d(h).dutyCycleMax.toFixed(1))+`% `',
+         'p(d(h).dutyCycleUtilization.toFixed(3))+`% / `+p(d(h).dutyCycleMax.toFixed(1))+`% limit `'),
+        ('D(`span`,ar,p(d(h).dutyCycleUtilization.toFixed(3))+`% / `+p(d(h).dutyCycleMax.toFixed(1))+`% limit `,1)]),D(`div`,or',
+         'D(`span`,ar,p(d(h).dutyCycleUtilization.toFixed(3))+`% / `+p(d(h).dutyCycleMax.toFixed(1))+`% limit `,1)]),'
+         'D(`div`,{class:`text-xs text-content-muted`},`TX budget used: `+p((d(h).stats?.utilization_percent??0).toFixed(1))+`%`,1),D(`div`,or'),
+    ),
+    'PacketDetailsModal-QQ4aXcuM.js': (
+        ('_(`span`,le,a(U(c.packet.route)),1)',
+         '_(`span`,le,a(U(c.packet.route)),1),_(`span`,{class:`text-xs text-content-secondary dark:text-content-muted`,style:{overflowWrap:`anywhere`}},`Scope: `+a(c.packet.scope||`unknown scope`),1)'),
+    ),
+}
+
 
 def adapt_module(source, replacements):
     for before, after in replacements:
@@ -113,7 +156,7 @@ def patch_console_assets(html_dir):
             # The API client and Pinia store both ship as system-*.js.
             if pattern == 'system-*.js' and 'dutyCycleUtilization' not in source:
                 continue
-            updated = adapt_module(source, replacements)
+            updated = adapt_module(source, OPENHOP_114_REPLACEMENTS.get(module.name, replacements))
             if updated != source:
                 pending.append((module, updated))
     # Validate every module first. Keep the existing ownership/mode when the

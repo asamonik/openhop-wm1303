@@ -24,13 +24,13 @@
 Use the bootstrap one-liner — it automatically detects fresh install vs upgrade:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/asamonik/pyMC_WM1303/main/bootstrap.sh | sudo bash
 ```
 
 For unattended installation, select a region with an environment variable:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo env WM1303_REGION=AU915 bash
+curl -fsSL https://raw.githubusercontent.com/asamonik/pyMC_WM1303/main/bootstrap.sh | sudo env WM1303_REGION=AU915 bash
 ```
 
 The wizard selects the region and device-wide sync word. All channels initially
@@ -40,7 +40,7 @@ On upgrades the wizard is skipped and existing settings are preserved.
 ### Manual Installation
 
 ```bash
-git clone https://github.com/HansvanMeer/pyMC_WM1303.git
+git clone https://github.com/asamonik/pyMC_WM1303.git
 cd pyMC_WM1303
 sudo bash install.sh
 ```
@@ -91,12 +91,12 @@ untrusted networks.
 
 #### Step 6: Clone Repositories
 
-Clones the required upstream forks:
+Clones canonical dependencies at the jointly verified revisions in `config/dependencies.conf`:
 
 ```
-/opt/pymc_repeater/repos/pyMC_core/       ← dev branch
-/opt/pymc_repeater/repos/pyMC_Repeater/   ← dev branch
-~/sx1302_hal/                          ← master branch, HAL v2.10
+/opt/pymc_repeater/repos/pyMC_core/       ← OpenHop core 1.1.3, pinned
+/opt/pymc_repeater/repos/pyMC_Repeater/   ← OpenHop Repeater 1.1.4, pinned
+~/sx1302_hal/                          ← Semtech HAL 2.1.0, pinned
 ```
 
 #### Step 7: Apply Overlay Files
@@ -124,8 +124,8 @@ the installed checkouts contain the overlaid file replacements.
 #### Step 9: Install pyMC Core and Repeater
 
 - Creates Python virtual environment
-- Installs pyMC_core (dev) in development mode
-- Installs pyMC_Repeater (dev) in development mode
+- Installs the pinned OpenHop core 1.1.3 checkout in editable mode
+- Installs the pinned OpenHop Repeater 1.1.4 checkout in editable mode
 - Installs Python dependencies
 - Restores the local editable WM1303 core after the repeater's dependency installation
 - Verifies both installed distribution records and imports independently of the working directory or `PYTHONPATH`; upgrades repair missing repeater installations even if source revisions have not changed
@@ -234,7 +234,7 @@ identity's data or an apparently empty contact list.
 The bootstrap script handles both fresh install and upgrade automatically:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/asamonik/pyMC_WM1303/main/bootstrap.sh | sudo bash
 ```
 
 `bootstrap.sh` preserves local integration-checkout changes in a Git stash before
@@ -282,7 +282,7 @@ last 500 lines of `/var/log/wm1303-update.log`. The log is retained until the ne
 update. A second start is refused while a job is running. Older installations
 without this launcher must first use the bootstrap/manual upgrade once.
 
-The standalone bootstrap still defaults to `HansvanMeer/pyMC_WM1303`. For an
+The standalone bootstrap defaults to this fork, `asamonik/pyMC_WM1303`. For an
 intentional fork, set `WM1303_REPO_URL` to its GitHub HTTPS or SSH URL; its basename
 must be `pyMC_WM1303` and the existing checkout origin must match. The GUI launcher
 supplies the saved fork automatically.
@@ -319,8 +319,9 @@ A reboot is recommended after upgrades that change SPI configuration.
 6. Adds missing configuration keys, normalizes legacy channel names, and preserves user values
 7. Updates `/etc/openhop_repeater/version`, restarts the service, and checks startup
 
-`--skip-pull` deliberately uses the existing local dependency checkouts without
-fetching or checking their origins. `--force-config` overwrites configuration with
+`--skip-pull` uses existing dependency checkouts without fetching, but requires
+their commits to match the dependency lock before services are stopped.
+`--force-config` overwrites configuration with
 templates; do not use it when you intend to preserve settings. Backups are placed
 in a unique directory under the selected user's `~/backups/`.
 
@@ -373,8 +374,8 @@ Should show `32768`. If not, reboot the Pi.
 ```
 /opt/pymc_repeater/                    # Main installation
 ├── repos/
-│   ├── pyMC_core/                     # Core library (dev)
-│   └── pyMC_Repeater/                 # Repeater app (dev)
+│   ├── pyMC_core/                     # Pinned OpenHop core (historical path retained)
+│   └── pyMC_Repeater/                 # Pinned OpenHop Repeater (historical path retained)
 │
 /etc/openhop_repeater/                 # Configuration (legacy files are migrated)
 ├── config.yaml

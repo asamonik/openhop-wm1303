@@ -29,6 +29,56 @@ require_expected_origin() {
     fi
 }
 
+require_dependency_origin() {
+    local target_dir="$1" expected_url="$2" legacy_url=""
+    # Only the three previously deployed forks are eligible for migration.
+    # Keep unrelated/custom origins protected by the normal strict check.
+    case "$expected_url" in
+        https://github.com/openhop-dev/openhop_core.git) legacy_url="https://github.com/HansvanMeer/pyMC_core.git" ;;
+        https://github.com/openhop-dev/openhop_repeater.git) legacy_url="https://github.com/HansvanMeer/pyMC_Repeater.git" ;;
+        https://github.com/Lora-net/sx1302_hal.git) legacy_url="https://github.com/HansvanMeer/sx1302_hal.git" ;;
+        *) return 1 ;;
+    esac
+    require_expected_origin "$target_dir" "$expected_url" 2>/dev/null && return 0
+    require_expected_origin "$target_dir" "$legacy_url" 2>/dev/null && return 0
+    printf 'Unrecognized dependency origin for %s; checkout and remote were not changed.\n' "$target_dir" >&2
+    return 1
+}
+
+checkout_dependency_revision() {
+    local target_dir="$1" repo_url="$2" revision="$3" version_tag="${4:-}"
+    local resolved dirty
+    [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || return 1
+    require_dependency_origin "$target_dir" "$repo_url" || return 1
+    # Fetch the canonical release before touching an existing deployment.
+    # Do not rewrite SSH origins or use a mutable branch tip as the target.
+    sudo -u "$PI_USER" git -C "$target_dir" fetch --no-tags "$repo_url" \
+        "$revision:refs/wm1303/dependency" || return 1
+    resolved=$(git -c "safe.directory=$target_dir" -C "$target_dir" rev-parse 'refs/wm1303/dependency^{commit}') || return 1
+    [ "$resolved" = "$revision" ] || return 1
+    if [ -n "$version_tag" ]; then
+        sudo -u "$PI_USER" git -C "$target_dir" fetch --no-tags "$repo_url" \
+            "refs/tags/$version_tag:refs/tags/$version_tag" || return 1
+        resolved=$(git -c "safe.directory=$target_dir" -C "$target_dir" rev-parse "refs/tags/$version_tag^{commit}") || return 1
+        [ "$resolved" = "$revision" ] || return 1
+    fi
+    dirty=$(git -c "safe.directory=$target_dir" -C "$target_dir" status --porcelain) || return 1
+    if [ -n "$dirty" ]; then
+        # Preserve both generated overlays and any local edits for recovery.
+        # Never clean the checkout indiscriminately; overlays are reapplied next.
+        sudo -u "$PI_USER" git -C "$target_dir" stash push --include-untracked \
+            -m "WM1303 dependency upgrade before $revision" || return 1
+    fi
+    sudo -u "$PI_USER" git -C "$target_dir" checkout --detach "$revision" || return 1
+}
+
+install_plugin_manager_service() {
+    local source_dir="$1" service_user="$2" service_group="$3"
+    local unit=/etc/systemd/system/openhop-plugin-manager.service
+    install -o root -g root -m 644 "$source_dir/config/openhop-plugin-manager.service" "$unit" || return 1
+    sed -i "s|__PI_USER__|$service_user|g;s|__PI_GROUP__|$service_group|g" "$unit" || return 1
+}
+
 deploy_overlay() {
     local source_dir="$1"
     local target_dir="$2"

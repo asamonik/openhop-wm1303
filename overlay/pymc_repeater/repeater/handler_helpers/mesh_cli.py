@@ -1,3 +1,4 @@
+import concurrent.futures
 import logging
 import math
 import os
@@ -6,7 +7,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 import yaml
-from openhop_core.paths import resolve_config_path  # WM1303 v2.7: central config-path helper
+from openhop_core.paths import (
+    resolve_config_path,
+)  # WM1303 v2.7: central config-path helper
 
 logger = logging.getLogger(__name__)
 
@@ -74,11 +77,12 @@ def _build_dynamic_owner_info(max_len: int = 115) -> str:
             break
         result = candidate
     return result
+
+
 # ==================== end WM1303 overlay additions ====================
 
 
 class MeshCLI:
-
     def __init__(
         self,
         config_path: str,
@@ -104,6 +108,7 @@ class MeshCLI:
 
         # Store event loop reference for thread-safe scheduling
         import asyncio
+
         try:
             self._event_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -111,6 +116,106 @@ class MeshCLI:
 
         # Get repeater config shortcut
         self.repeater_config = config.get("repeater", {})
+        self.mesh_config = config.setdefault("mesh", {})
+
+    def _save_config_and_apply(self, sections=None) -> bool:
+        """Persist the config, then live-apply the changed sections.
+
+        ``ConfigManager.save_to_file`` returns a bare bool; the tuple form is
+        tolerated for older manager doubles. Live update only runs after a
+        successful save so a failed write never half-applies a change. Pass
+        no sections to stage a change: saved to disk, applied on restart
+        (radio parameters, matching firmware's reboot-to-apply).
+        """
+        result = self.config_manager.save_to_file()
+        saved = result[0] if isinstance(result, tuple) else bool(result)
+        if not saved:
+            return False
+        if sections:
+            self.config_manager.live_update_daemon(sections)
+        return True
+
+    def _get_security_config(self) -> Dict[str, Any]:
+        """Return the repeater login security section (the one LoginHelper reads)."""
+        security = self.repeater_config.get("security")
+        return security if isinstance(security, dict) else {}
+
+    def _get_node_name(self) -> str:
+        """Return the configured node name, preferring the newer key when present."""
+        return self.repeater_config.get("node_name") or self.repeater_config.get(
+            "name", "Unknown"
+        )
+
+    def _set_node_name(self, value: str) -> None:
+        """Persist node name to both legacy and current config keys for compatibility."""
+        self.repeater_config["node_name"] = value
+        self.repeater_config["name"] = value
+
+    def _get_local_pubkey_hex(self) -> Optional[str]:
+        """Return local node public key (hex) when available."""
+        try:
+            if self.identity and hasattr(self.identity, "get_public_key"):
+                pubkey = self.identity.get_public_key()
+                if isinstance(pubkey, (bytes, bytearray)):
+                    return bytes(pubkey).hex().lower()
+                if isinstance(pubkey, str):
+                    normalized = pubkey.strip().lower()
+                    if normalized.startswith("0x"):
+                        normalized = normalized[2:]
+                    if normalized:
+                        return normalized
+        except Exception as exc:
+            logger.debug("Unable to read local identity pubkey: %s", exc)
+
+        key = self.repeater_config.get("identity_key")
+        if isinstance(key, (bytes, bytearray)):
+            return bytes(key).hex().lower()
+        if isinstance(key, str):
+            normalized = key.strip().lower()
+            if normalized.startswith("0x"):
+                normalized = normalized[2:]
+            if normalized and all(ch in "0123456789abcdef" for ch in normalized):
+                return normalized
+
+        return None
+
+    def _is_local_pubkey(self, pubkey_hex: str) -> bool:
+        """Return True when a discovery result pubkey matches the local node."""
+        candidate = (pubkey_hex or "").strip().lower()
+        if not candidate:
+            return False
+        if candidate.startswith("0x"):
+            candidate = candidate[2:]
+
+        local_pubkey = self._get_local_pubkey_hex()
+        if not local_pubkey:
+            return False
+
+        # Prefix-only discovery may return fewer bytes than full identity pubkey.
+        return local_pubkey.startswith(candidate) or candidate.startswith(local_pubkey)
+
+    def _auto_add_discovery_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Persist discovered neighbors automatically, excluding this node itself."""
+        enriched = dict(result)
+        pub_key = str(enriched.get("pub_key") or "").strip().lower()
+        if not pub_key:
+            return enriched
+
+        if self._is_local_pubkey(pub_key):
+            enriched["is_self"] = True
+            enriched["known_neighbor"] = True
+            return enriched
+
+        if not self.storage_handler:
+            return enriched
+
+        from repeater.handler_helpers.discovery import persist_discovery_result
+
+        if persist_discovery_result(self.storage_handler, enriched):
+            enriched["known_neighbor"] = True
+            enriched["auto_added"] = True
+
+        return enriched
 
     def handle_command(self, sender_pubkey: bytes, command: str, is_admin: bool) -> str:
 
@@ -192,6 +297,10 @@ class MeshCLI:
             return self._cmd_neighbors()
         elif command.startswith("neighbor.remove "):
             return self._cmd_neighbor_remove(command)
+        elif command.startswith("discover.scopes"):
+            return self._cmd_discover_scopes(command)
+        elif command.startswith("discover.neighbors"):
+            return self._cmd_discover_neighbors(command)
 
         # Temporary radio params
         elif command.startswith("tempradio "):
@@ -390,6 +499,8 @@ class MeshCLI:
             "Other:",
             "  neighbors           List neighbors",
             "  neighbor.remove <key>  Remove neighbor by pubkey",
+            "  discover.neighbors  Send zero-hop neighbor discovery",
+            "  discover.scopes     Discover neighbor scopes, publish to MQTT",
             "  tempradio <freq> <bw> <sf> <cr> <timeout_mins>",
             "  setperm <pubkey> <perm>  Set ACL permissions",
             "  log start|stop|erase    Logging control",
@@ -437,10 +548,19 @@ class MeshCLI:
                 "  freq: 300-2500 MHz, bw: 7-500 kHz, sf: 5-12, cr: 5-8"
             ),
             "neighbors": "List known neighbor nodes from the routing table.",
+            "discover.neighbors": "Send a neighbor discovery request.",
+            "discover.scopes": (
+                "discover.scopes\n"
+                "  Refresh the zero-hop neighbor table, query each neighbor for its\n"
+                "  region scopes, then publish the table to the MQTT neighbors topic.\n"
+                "  Requires a broker configured with neighbors: true."
+            ),
             "setperm": "setperm <pubkey_hex> <permission_int> \u2014 Set ACL permissions for a node.",
             "log": "log start|stop|erase \u2014 Control logging.",
         }
-        return details.get(topic, f"No detailed help for '{topic}'. Type 'help' for command list.")
+        return details.get(
+            topic, f"No detailed help for '{topic}'. Type 'help' for command list."
+        )
 
     # ==================== System Commands ====================
 
@@ -883,6 +1003,58 @@ class MeshCLI:
         # TODO: Remove neighbor from routing table
         logger.info(f"neighbor.remove: {pubkey_hex}")
         return "Error: Not yet implemented"
+
+    def _cmd_discover_scopes(self, command: str) -> str:
+        """Refresh the neighbour table, query each neighbour's scopes, publish once.
+
+        Manual trigger for the periodic MQTT neighbors cycle (firmware
+        ``discover.scopes``). The cycle takes minutes -- a node-discovery window
+        plus one serialized scope query per neighbour -- so this schedules it and
+        returns immediately rather than holding the CLI reply open.
+        """
+        sub = command[15:]
+        if sub.strip():
+            return "Err - discover.scopes has no options"
+
+        daemon_instance = getattr(self.config_manager, "daemon", None)
+        publisher = getattr(daemon_instance, "neighbors_publisher", None)
+        if not publisher:
+            return "Error: Neighbors publisher not available"
+
+        if not publisher.enabled():
+            return "Err - neighbors publishing is disabled (no broker opted in)"
+
+        import asyncio
+
+        loop = self._event_loop
+        if loop is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+        if loop is None or not loop.is_running():
+            return "Error: Event loop not available"
+
+        try:
+            # trigger_cycle owns the "already running" check and tracks the task
+            # so shutdown can cancel it. Doing it here instead would race: this
+            # runs on the CLI thread, the cycle starts on the event loop.
+            started = concurrent.futures.Future()
+
+            def _start():
+                try:
+                    started.set_result(publisher.trigger_cycle())
+                except Exception as exc:  # pragma: no cover - defensive
+                    started.set_exception(exc)
+
+            loop.call_soon_threadsafe(_start)
+            if started.result(timeout=5):
+                return "OK - neighbor scope discovery started"
+            return "Err - neighbors cycle already active"
+        except Exception as e:
+            logger.error(f"discover.scopes failed: {e}", exc_info=True)
+            return f"Error: {e}"
 
     # ==================== Temporary Radio Commands ====================
 

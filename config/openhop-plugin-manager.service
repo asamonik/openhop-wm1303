@@ -1,0 +1,24 @@
+# Optional manager for OpenHop 1.1.4 plugins; no plugin is installed by this unit.
+[Unit]
+Description=OpenHop Plugin Manager (WM1303)
+After=network-online.target openhop-repeater.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__PI_USER__
+Group=__PI_GROUP__
+WorkingDirectory=/var/lib/openhop_repeater
+Environment="PYTHONPATH=/opt/pymc_repeater/repos/pyMC_Repeater:/opt/pymc_repeater/repos/pyMC_core/src"
+ExecCondition=/opt/pymc_repeater/venv/bin/python3 -I -c "import sys,yaml; c=yaml.safe_load(open(sys.argv[1])) or {}; p=c.get('plugins'); sys.exit(1 if isinstance(p, dict) and p.get('enabled') is False else 0)" /etc/openhop_repeater/config.yaml
+ExecStart=/opt/pymc_repeater/venv/bin/python3 -m repeater.plugins --config /etc/openhop_repeater/config.yaml
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+MemoryHigh=256M
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=openhop-plugin-manager
+
+[Install]
+WantedBy=multi-user.target

@@ -1,3 +1,4 @@
+import copy
 import logging
 import os
 from copy import deepcopy
@@ -7,17 +8,22 @@ from typing import Optional, Dict, Any, List
 from repeater.atomic_file import atomic_write_text
 from repeater.config import CONFIG_WRITE_LOCK
 from repeater.room_settings import validate_room_configuration
+from repeater.logging_utils import normalize_log_level
+from repeater.modem_config import normalize_modem_config_in_place
 
 logger = logging.getLogger("ConfigManager")
+
+# Serialize staging, persistence and publication across managers in this process.
+_CONFIG_WRITE_LOCK = CONFIG_WRITE_LOCK
 
 
 class ConfigManager:
     """Manages configuration persistence and live updates to the daemon."""
-    
+
     def __init__(self, config_path: str, config: dict, daemon_instance=None):
         """
         Initialize ConfigManager.
-        
+
         Args:
             config_path: Path to the YAML config file
             config: Reference to the config dictionary
@@ -184,14 +190,105 @@ class ConfigManager:
         except Exception as e:
             logger.error(f"Failed to apply live radio config: {e}", exc_info=True)
             return False
-    
+
+    def _refresh_airtime_radio_params(self) -> None:
+        repeater_handler = getattr(self.daemon, "repeater_handler", None)
+        airtime_mgr = (
+            getattr(repeater_handler, "airtime_mgr", None) if repeater_handler else None
+        )
+        if airtime_mgr is None or not hasattr(airtime_mgr, "refresh_radio_params"):
+            return
+        # Use the full radio section so preamble_length is included; the live
+        # hardware snapshot intentionally omits fields the radio API does not set.
+        airtime_mgr.refresh_radio_params(self.config.get("radio", {}) or {})
+
+    @staticmethod
+    def _parse_bool(value: Any, default: bool = True) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _apply_live_http_config(self) -> bool:
+        if not self.daemon:
+            logger.warning("Daemon not available for HTTP live update")
+            return False
+
+        http_server = getattr(self.daemon, "http_server", None)
+        if http_server is None:
+            # Early in daemon lifecycle, there is nothing to control yet.
+            logger.info("HTTP server not initialized yet; skipping live HTTP update")
+            return True
+
+        http_cfg = self.config.get("http", {}) if isinstance(self.config, dict) else {}
+        enabled = self._parse_bool(http_cfg.get("enabled", True), default=True)
+        host = str(http_cfg.get("host", "0.0.0.0") or "0.0.0.0")  # nosec B104 - intentional LAN bind default
+
+        try:
+            port = int(http_cfg.get("port", 8000))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid http.port=%r, falling back to 8000", http_cfg.get("port")
+            )
+            port = 8000
+
+        # Keep runtime server settings aligned with config before start/restart.
+        http_server.host = host
+        http_server.port = port
+
+        from repeater.service_utils import start_http_server, stop_http_server
+
+        if enabled:
+            success, message = start_http_server(self.daemon)
+        else:
+            success, message = stop_http_server(self.daemon)
+
+        if success:
+            logger.info("Applied live HTTP config: %s", message)
+        else:
+            logger.warning("Failed live HTTP config apply: %s", message)
+        return success
+
+    def _apply_live_logging_config(self) -> bool:
+        if not self.daemon:
+            logger.warning("Daemon not available for logging live update")
+            return False
+
+        logging_cfg = (
+            self.config.get("logging", {}) if isinstance(self.config, dict) else {}
+        )
+        level = normalize_log_level(logging_cfg.get("level", "INFO"))
+
+        root_logger = logging.getLogger()
+        root_logger.setLevel(level)
+
+        repeater_logger = logging.getLogger("RepeaterDaemon")
+        repeater_logger.setLevel(level)
+
+        sx1262_logger = logging.getLogger("SX1262_wrapper")
+        sx1262_logger.setLevel(level)
+
+        mqtt_logger = logging.getLogger("MQTTHandler")
+        mqtt_logger.setLevel(level)
+
+        buffer = getattr(self.daemon, "_log_buffer", None)
+        if buffer is not None:
+            buffer.setLevel(level)
+
+        logger.info(
+            "Applied live logging config: level=%s",
+            logging.getLevelName(level) if isinstance(level, int) else level,
+        )
+        return True
+
     def save_to_file(self, config: Optional[dict] = None) -> bool:
         """
         Save current config to YAML file.
 
         This is a full replacement, not a scoped update. Runtime callers should
         prefer update_and_save() so pending settings from other writers survive.
-        
+
         Returns:
             True if successful, False otherwise
         """
@@ -203,51 +300,59 @@ class ConfigManager:
                 # Setting width to a very large number prevents truncation of long strings like identity keys
                 content = yaml.safe_dump(
                     candidate,
-                    default_flow_style=False, 
-                    indent=2, 
-                    width=1000000,  # Very large width to prevent any line wrapping
+                    default_flow_style=False,
+                    indent=2,
+                    width=1000000,
                     sort_keys=False,
-                    allow_unicode=True
+                    allow_unicode=True,
                 )
                 atomic_write_text(self.config_path, content)
             logger.info(f"Configuration saved to {self.config_path}")
             return True
-        except Exception as e:
-            logger.error(f"Failed to save config to {self.config_path}: {e}", exc_info=True)
+        except Exception:
+            logger.exception("Failed to save config to %s", self.config_path)
             return False
-    
-    def live_update_daemon(self, sections: Optional[List[str]] = None, *,
-                           replace_sections: bool = False) -> bool:
+    @staticmethod
+    def _apply_updates(config: dict, updates: dict) -> None:
+        for section, values in updates.items():
+            if isinstance(values, dict):
+                config.setdefault(section, {}).update(values)
+            else:
+                config[section] = values
+
+    def live_update_daemon(
+        self, sections: Optional[List[str]] = None, *, replace_sections: bool = False
+    ) -> bool:
         """
         Apply configuration changes to the running daemon's in-memory config.
-        
+
         Args:
             sections: List of config sections to update (e.g., ['repeater', 'delays']).
                      If None, updates all common sections.
             replace_sections: Replace supplied daemon sections, including removal
                 of omitted nested keys, instead of merging them.
-        
+
         Returns:
             True if live update was successful, False otherwise
         """
-        if not self.daemon or not hasattr(self.daemon, 'config'):
+        if not self.daemon or not hasattr(self.daemon, "config"):
             logger.warning("Daemon not available for live update")
             return False
-        
+
         try:
             daemon_config = self.daemon.config
             live_update_ok = True
-            
+
             # Default sections to update if not specified
             if sections is None:
-                sections = ['repeater', 'delays', 'radio', 'acl', 'identities', 'glass']
-            
+                sections = ["repeater", "delays", "radio", "acl", "identities", "glass"]
+
             # Update each section
             for section in sections:
                 if section in self.config:
                     if section not in daemon_config:
                         daemon_config[section] = {}
-                    
+
                     # Deep copy the section to avoid reference issues
                     if replace_sections:
                         daemon_config[section] = deepcopy(self.config[section])
@@ -257,16 +362,18 @@ class ConfigManager:
                         self._merge_config(daemon_config[section], self.config[section])
                     else:
                         daemon_config[section] = deepcopy(self.config[section])
-                    
+
                     logger.debug(f"Live updated daemon config section: {section}")
-            
+
             logger.info(f"Live updated daemon config sections: {', '.join(sections)}")
 
             # Login ACLs cache credentials at registration. Refresh only the
             # repeater ACL; room servers retain their per-identity passwords.
-            if 'repeater' in sections:
-                login_helper = getattr(self.daemon, 'login_helper', None)
-                refresh_security = getattr(login_helper, 'refresh_repeater_security', None)
+            if "repeater" in sections:
+                login_helper = getattr(self.daemon, "login_helper", None)
+                refresh_security = getattr(
+                    login_helper, "refresh_repeater_security", None
+                )
                 if callable(refresh_security):
                     if refresh_security(daemon_config) is False:
                         logger.warning("Repeater ACL security refresh failed")
@@ -275,38 +382,51 @@ class ConfigManager:
                 # Discovery handlers are constructed at startup and captured
                 # by companion servers. A config edit cannot replace those
                 # callbacks without restarting the service.
-                if hasattr(self.daemon, 'discovery_helper'):
-                    discovery_enabled = bool(daemon_config.get('repeater', {}).get('allow_discovery', True))
+                if hasattr(self.daemon, "discovery_helper"):
+                    discovery_enabled = bool(
+                        daemon_config.get("repeater", {}).get("allow_discovery", True)
+                    )
                     if discovery_enabled != (self.daemon.discovery_helper is not None):
-                        logger.info("Discovery policy change requires a service restart")
+                        logger.info(
+                            "Discovery policy change requires a service restart"
+                        )
                         live_update_ok = False
 
-            if 'duty_cycle' in sections:
+            if "duty_cycle" in sections:
                 # AirtimeManager reads enforcement dynamically but caches this
                 # limit. Refresh it without resetting its rolling TX history.
-                handler = getattr(self.daemon, 'repeater_handler', None)
-                airtime_manager = getattr(handler, 'airtime_mgr', None)
+                handler = getattr(self.daemon, "repeater_handler", None)
+                airtime_manager = getattr(handler, "airtime_mgr", None)
                 if airtime_manager is None:
                     live_update_ok = False
                 else:
-                    airtime_manager.max_airtime_per_minute = daemon_config.get('duty_cycle', {}).get(
-                        'max_airtime_per_minute', 3600
-                    )
-            
+                    airtime_manager.max_airtime_per_minute = daemon_config.get(
+                        "duty_cycle", {}
+                    ).get("max_airtime_per_minute", 3600)
+
             # Mesh settings include the engine's loop-detection policy.
-            if self.daemon and hasattr(self.daemon, 'repeater_handler'):
-                if any(s in ['delays', 'repeater', 'mesh'] for s in sections):
-                    if hasattr(self.daemon.repeater_handler, 'reload_runtime_config'):
-                        if self.daemon.repeater_handler.reload_runtime_config() is False:
-                            logger.warning("RepeaterHandler runtime config reload failed")
+            if self.daemon and hasattr(self.daemon, "repeater_handler"):
+                if any(s in ["delays", "repeater", "mesh"] for s in sections):
+                    if hasattr(self.daemon.repeater_handler, "reload_runtime_config"):
+                        if (
+                            self.daemon.repeater_handler.reload_runtime_config()
+                            is False
+                        ):
+                            logger.warning(
+                                "RepeaterHandler runtime config reload failed"
+                            )
                             live_update_ok = False
                         else:
                             logger.info("Reloaded RepeaterHandler runtime config")
-            
+
             # Also reload advert_helper config if repeater section changed
-            if self.daemon and hasattr(self.daemon, 'advert_helper') and self.daemon.advert_helper:
-                if 'repeater' in sections:
-                    if hasattr(self.daemon.advert_helper, 'reload_config'):
+            if (
+                self.daemon
+                and hasattr(self.daemon, "advert_helper")
+                and self.daemon.advert_helper
+            ):
+                if "repeater" in sections:
+                    if hasattr(self.daemon.advert_helper, "reload_config"):
                         if self.daemon.advert_helper.reload_config() is False:
                             logger.warning("AdvertHelper config reload failed")
                             live_update_ok = False
@@ -314,7 +434,11 @@ class ConfigManager:
                             logger.info("Reloaded AdvertHelper config")
 
             # Re-apply dispatcher path hash mode when mesh section changed
-            if 'mesh' in sections and self.daemon and hasattr(self.daemon, 'dispatcher'):
+            if (
+                "mesh" in sections
+                and self.daemon
+                and hasattr(self.daemon, "dispatcher")
+            ):
                 mesh_cfg = self.daemon.config.get("mesh", {})
                 path_hash_mode = mesh_cfg.get("path_hash_mode", 0)
                 if path_hash_mode not in (0, 1, 2):
@@ -323,34 +447,58 @@ class ConfigManager:
                     )
                     path_hash_mode = 0
                 self.daemon.dispatcher.set_default_path_hash_mode(path_hash_mode)
-                logger.info(f"Reloaded path hash mode: mesh.path_hash_mode={path_hash_mode}")
+                logger.info(
+                    f"Reloaded path hash mode: mesh.path_hash_mode={path_hash_mode}"
+                )
 
-            if 'radio_type' in sections:
+                # mesh.default_region is firmware's default_scope, which decides
+                # the REPLY_SCOPE_DEFAULT row. Re-resolve it here rather than
+                # leaving it to the transport_keys hook: setting the default region
+                # over the web API writes the config *after* it creates the region,
+                # so that hook has already run against the previous value.
+                refresh_default_scope = getattr(
+                    self.daemon, "refresh_default_flood_scope", None
+                )
+                if callable(refresh_default_scope):
+                    refresh_default_scope()
+
+            if "radio_type" in sections:
                 logger.info("radio_type change detected; service restart required")
                 live_update_ok = False
 
-            if 'kiss' in sections and self._kiss_transport_restart_required():
+            if "kiss" in sections and self._kiss_transport_restart_required():
                 live_update_ok = False
 
-            if 'radio' in sections:
+            if "radio" in sections:
                 live_update_ok = self._apply_live_radio_config() and live_update_ok
-            
+            if "web" in sections:
+                app = getattr(getattr(self.daemon, 'http_server', None), 'app', None)
+                if app is not None and hasattr(app, 'apply_web_config'):
+                    app.apply_web_config()
+            if "http" in sections:
+                live_update_ok = self._apply_live_http_config() and live_update_ok
+            if "logging" in sections:
+                live_update_ok = self._apply_live_logging_config() and live_update_ok
+
             return live_update_ok
-            
+
         except Exception as e:
             logger.error(f"Failed to live update daemon config: {e}", exc_info=True)
             return False
-    
-    def update_and_save(self, 
-                       updates: Dict[str, Any], 
-                       live_update: bool = True,
-                       live_update_sections: Optional[List[str]] = None, *,
-                       replace_sections: bool = False) -> Dict[str, Any]:
+
+    def update_and_save(
+        self,
+        updates: Dict[str, Any],
+        live_update: bool = True,
+        live_update_sections: Optional[List[str]] = None,
+        *,
+        replace_sections: bool = False,
+    ) -> Dict[str, Any]:
         """
         Apply updates to config, save to file, and optionally live update daemon.
-        
+
         This is the main method that should be used by both mesh_cli and api_endpoints.
-        
+
         Args:
             updates: Dictionary of config updates in nested format.
                     Example: {"repeater": {"node_name": "NewName"}, "delays": {"tx_delay_factor": 1.5}}
@@ -358,7 +506,7 @@ class ConfigManager:
             live_update_sections: Specific sections to live update. If None, auto-detects from updates.
             replace_sections: Replace only the supplied top-level sections instead
                 of recursively merging them. Unmentioned saved sections survive.
-        
+
         Returns:
             Dict with keys:
                 - success: bool - Whether operation succeeded
@@ -369,9 +517,9 @@ class ConfigManager:
         result: Dict[str, Any] = {
             "success": False,
             "saved": False,
-            "live_updated": False
+            "live_updated": False,
         }
-        
+
         try:
             if not isinstance(updates, dict):
                 raise ValueError("Configuration updates must be a mapping")
@@ -404,32 +552,36 @@ class ConfigManager:
                             live_update_sections, replace_sections=True
                         )
                     else:
-                        result["live_updated"] = self.live_update_daemon(live_update_sections)
-            
+                        result["live_updated"] = self.live_update_daemon(
+                            live_update_sections
+                        )
+
             result["success"] = result["saved"]
             return result
-            
+
         except Exception as e:
             logger.error(f"Error in update_and_save: {e}", exc_info=True)
             result["error"] = str(e)
             return result
-    
-    def update_nested(self, path: str, value: Any, live_update: bool = True) -> Dict[str, Any]:
+
+    def update_nested(
+        self, path: str, value: Any, live_update: bool = True
+    ) -> Dict[str, Any]:
         """
         Update a nested config value using dot notation.
-        
+
         Convenience method for simple updates like "repeater.node_name" = "NewName"
-        
+
         Args:
             path: Dot-separated path to config value (e.g., "repeater.node_name")
             value: Value to set
             live_update: Whether to apply changes to running daemon
-        
+
         Returns:
             Result dict from update_and_save
         """
-        parts = path.split('.')
-        
+        parts = path.split(".")
+
         if len(parts) == 1:
             # Top-level key
             updates = {parts[0]: value}
@@ -448,26 +600,27 @@ class ConfigManager:
                     current[part] = {}
                     current = current[part]
             current[parts[-1]] = value
-        
+
         # Determine which section to live update
         section = parts[0]
-        
+
         return self.update_and_save(
             updates=updates,
             live_update=live_update,
-            live_update_sections=[section] if live_update else None
+            live_update_sections=[section] if live_update else None,
         )
-    
+
     def get_status(self) -> Dict[str, Any]:
         """
         Get status information about the ConfigManager.
-        
+
         Returns:
             Dict with config file path, existence, daemon availability
         """
         return {
             "config_path": self.config_path,
             "config_exists": os.path.exists(self.config_path),
-            "daemon_available": self.daemon is not None and hasattr(self.daemon, 'config'),
-            "config_sections": list(self.config.keys()) if self.config else []
+            "daemon_available": self.daemon is not None
+            and hasattr(self.daemon, "config"),
+            "config_sections": list(self.config.keys()) if self.config else [],
         }

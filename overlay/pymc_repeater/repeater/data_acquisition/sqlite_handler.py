@@ -11,7 +11,10 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from repeater.companion_storage import storage_key_for_public_key, validated_channel_rows
+from repeater.companion_storage import (
+    storage_key_for_public_key,
+    validated_channel_rows,
+)
 from . import tx_diagnostics
 
 logger = logging.getLogger("SQLiteHandler")
@@ -49,6 +52,18 @@ class SQLiteHandler:
         self._packet_stats_cache = {}
         self._packet_type_stats_cache = {}
         self._neighbors_cache = {"timestamp": 0.0, "value": None}
+        # Short time-based cache for the per-packet cumulative-counts aggregate
+        # (two full-table scans). The storage writer thread calls this once per
+        # recorded packet/duplicate; a few seconds of staleness is fine for the
+        # RRD/UI counters and stops a full scan running on every packet.
+        # Intentionally NOT cleared by _invalidate_hot_caches() — that runs on
+        # every write, which would defeat the cache under load.
+        self._cumulative_counts_cache = {"timestamp": 0.0, "value": None}
+        self._cumulative_counts_ttl_sec = 3.0
+        # Optional callback fired after any transport_keys (region) write, so the
+        # daemon can rebuild the flood-reply RegionMap. Fired after commit, in the
+        # writer's thread; see set_transport_keys_changed_callback.
+        self._transport_keys_changed_cb = None
         # Thread-local storage for persistent SQLite connections.
         # Opening a new connection on every DB call is expensive on SD-card
         # storage: each sqlite3.connect() call triggers file-system operations
@@ -64,7 +79,9 @@ class SQLiteHandler:
             try:
                 self.close_thread_connection()
             except Exception as exc:
-                logger.error("SQLite initialization cleanup also failed: %s", type(exc).__name__)
+                logger.error(
+                    "SQLite initialization cleanup also failed: %s", type(exc).__name__
+                )
             raise
         else:
             self.close_thread_connection()
@@ -126,6 +143,26 @@ class SQLiteHandler:
         self._packet_stats_cache.clear()
         self._neighbors_cache = {"timestamp": 0.0, "value": None}
 
+    def set_transport_keys_changed_callback(self, callback) -> None:
+        """Register a callback fired after any transport_keys (region) write.
+
+        The daemon uses this to rebuild the flood-reply RegionMap when a named
+        region is added, removed, or has its flood policy changed (CLI, web API,
+        or Glass sync all funnel through the create/update/delete/sync methods
+        below). The callback runs after the write commits, in the writer's
+        thread; pass ``None`` to clear it.
+        """
+        self._transport_keys_changed_cb = callback
+
+    def _notify_transport_keys_changed(self) -> None:
+        callback = self._transport_keys_changed_cb
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception as e:
+            logger.error(f"transport_keys change callback failed: {e}", exc_info=True)
+
     def _init_database(self):
         try:
             with self._connect() as conn:
@@ -153,6 +190,8 @@ class SQLiteHandler:
                         payload TEXT,
                         payload_length INTEGER,
                         tx_delay_ms REAL,
+                        rx_radio_id TEXT,
+                        tx_radio_id TEXT,
                         packet_hash TEXT,
                         original_path TEXT,
                         forwarded_path TEXT,
@@ -235,12 +274,17 @@ class SQLiteHandler:
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_packets_timestamp ON packets(timestamp)"
                 )
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_packets_type ON packets(type)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_packets_hash ON packets(packet_hash)")
                 conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_packets_upstream_time "
-                    "ON packets(upstream_hash, upstream_hash_size, timestamp)"
+                    "CREATE INDEX IF NOT EXISTS idx_packets_type ON packets(type)"
                 )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_packets_hash ON packets(packet_hash)"
+                )
+                # idx_packets_upstream_time is intentionally NOT created here.
+                # It spans upstream_hash / upstream_hash_size, which only exist
+                # on a pre-existing database once the add_upstream_hash_to_packets
+                # migration has added them -- and migrations run after this. The
+                # migration creates the index itself; see _run_migrations.
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_packets_transmitted ON packets(transmitted)"
                 )
@@ -255,7 +299,9 @@ class SQLiteHandler:
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_adverts_timestamp ON adverts(timestamp)"
                 )
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_adverts_pubkey ON adverts(pubkey)")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_adverts_pubkey ON adverts(pubkey)"
+                )
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_noise_timestamp ON noise_floor(timestamp)"
                 )
@@ -323,7 +369,6 @@ class SQLiteHandler:
                     "CREATE INDEX IF NOT EXISTS idx_room_client_sync_pending ON room_client_sync(pending_ack_crc)"
                 )
 
-
                 # ------------------------------------------------------------------
                 # WM1303 overlay tables (idempotent; deterministic at schema-init)
                 # ------------------------------------------------------------------
@@ -344,15 +389,25 @@ class SQLiteHandler:
                         pkt_hash TEXT
                     )
                 """)
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_pktmet_ts ON packet_metrics(timestamp)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_pktmet_ch_ts ON packet_metrics(channel_id, timestamp)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_pktmet_dir_ts ON packet_metrics(direction, timestamp)")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_pktmet_ts ON packet_metrics(timestamp)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_pktmet_ch_ts ON packet_metrics(channel_id, timestamp)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_pktmet_dir_ts ON packet_metrics(direction, timestamp)"
+                )
 
                 # Additive migration: old packet rows have no measured retry
                 # metadata and must never be backfilled as clear TX attempts.
                 conn.execute(tx_diagnostics.SCHEMA)
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_txdiag_ts ON tx_diagnostics(timestamp)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_txdiag_ch_ts ON tx_diagnostics(channel_id, timestamp)")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_txdiag_ts ON tx_diagnostics(timestamp)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_txdiag_ch_ts ON tx_diagnostics(channel_id, timestamp)"
+                )
 
                 # Per-channel per-minute CRC error rate tracking.
                 conn.execute("""
@@ -364,8 +419,12 @@ class SQLiteHandler:
                         crc_disabled_count INTEGER NOT NULL DEFAULT 0
                     )
                 """)
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_crcrate_ts ON crc_error_rate(timestamp)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_crcrate_ch_ts ON crc_error_rate(channel_id, timestamp)")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_crcrate_ts ON crc_error_rate(timestamp)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_crcrate_ch_ts ON crc_error_rate(channel_id, timestamp)"
+                )
 
                 # Dedup events for bridge visualization (7-day retention).
                 conn.execute("""
@@ -379,8 +438,12 @@ class SQLiteHandler:
                         pkt_type TEXT DEFAULT ''
                     )
                 """)
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_dedup_ts ON dedup_events(ts)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_dedup_type ON dedup_events(event_type)")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_dedup_ts ON dedup_events(ts)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_dedup_type ON dedup_events(event_type)"
+                )
 
                 # SX1261 health events (structured pkt_fwd SX1261 event log).
                 conn.execute("""
@@ -396,8 +459,12 @@ class SQLiteHandler:
                         details TEXT
                     )
                 """)
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_sx1261_health_ts ON sx1261_health_events(timestamp)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_sx1261_health_type ON sx1261_health_events(event_type)")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_sx1261_health_ts ON sx1261_health_events(timestamp)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_sx1261_health_type ON sx1261_health_events(event_type)"
+                )
 
                 # Neighbour samples (per-node RSSI/SNR history; 8-day retention).
                 conn.execute("""
@@ -410,7 +477,9 @@ class SQLiteHandler:
                         channel TEXT
                     )
                 """)
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_nbsamp_pk_ts ON neighbour_samples(pubkey, timestamp)")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_nbsamp_pk_ts ON neighbour_samples(pubkey, timestamp)"
+                )
 
                 # Invalid packets (Layer-2 protocol forensics; see protocol_validator.py).
                 # CRC-GOOD but protocol-MALFORMED packets dropped by the validator.
@@ -437,9 +506,15 @@ class SQLiteHandler:
                         snr REAL
                     )
                 """)
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_invalid_packets_ts ON invalid_packets(timestamp)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_invalid_packets_reason ON invalid_packets(drop_reason)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_invalid_packets_offender ON invalid_packets(source_pubkey_hint)")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_invalid_packets_ts ON invalid_packets(timestamp)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_invalid_packets_reason ON invalid_packets(drop_reason)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_invalid_packets_offender ON invalid_packets(source_pubkey_hint)"
+                )
                 conn.execute("""
                     CREATE VIEW IF NOT EXISTS invalid_packet_offenders AS
                     SELECT
@@ -463,10 +538,13 @@ class SQLiteHandler:
                 # invalid packets into invalid_packets.
                 try:
                     from repeater.protocol_validator import set_invalid_packet_store
+
                     set_invalid_packet_store(self.store_invalid_packet)
                     logger.info("Protocol validator storage hook registered")
                 except Exception as _hook_err:  # noqa: BLE001
-                    logger.debug("Protocol validator storage hook not registered: %s", _hook_err)
+                    logger.debug(
+                        "Protocol validator storage hook not registered: %s", _hook_err
+                    )
                 logger.info(f"SQLite database initialized: {self.sqlite_path}")
 
         except Exception as e:
@@ -964,6 +1042,22 @@ class SQLiteHandler:
                         "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
                         (migration_name, time.time()),
                     )
+                for name, schema in (
+                    ('add_daemon_state', '''CREATE TABLE IF NOT EXISTS daemon_state (
+                        key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at REAL NOT NULL)'''),
+                    ('add_neighbor_scopes', '''CREATE TABLE IF NOT EXISTS neighbor_scopes (
+                        pubkey TEXT PRIMARY KEY, scopes TEXT NOT NULL DEFAULT '',
+                        responded_at REAL, status TEXT NOT NULL, queried_at REAL NOT NULL)'''),
+                ):
+                    conn.execute(schema)
+                    conn.execute('INSERT OR IGNORE INTO migrations (migration_name, applied_at) VALUES (?, ?)',
+                                 (name, time.time()))
+                columns = {row[1] for row in conn.execute('PRAGMA table_info(packets)')}
+                for name in ('rx_radio_id', 'tx_radio_id'):
+                    if name not in columns:
+                        conn.execute(f'ALTER TABLE packets ADD COLUMN {name} TEXT')
+                conn.execute('INSERT OR IGNORE INTO migrations (migration_name, applied_at) VALUES (?, ?)',
+                             ('add_packet_radio_ids', time.time()))
                 self._migrate_room_timestamps(conn)
                 conn.execute("""
                     INSERT INTO room_post_cursors (room_hash, last_timestamp)
@@ -977,6 +1071,130 @@ class SQLiteHandler:
         except Exception as e:
             logger.error(f"Failed to run migrations: {e}")
             raise
+
+    # Neighbour scope methods
+    def get_neighbor_scopes(self) -> dict:
+        """Return every stored scope record, keyed by lowercase pubkey hex.
+
+        Never raises: the caller renders a column from this, and a missing or
+        corrupt table must degrade to "nothing known" rather than fail the
+        request that also carries the neighbour table.
+        """
+        try:
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT pubkey, scopes, responded_at, status, queried_at FROM neighbor_scopes"
+                ).fetchall()
+            return {
+                row["pubkey"]: {
+                    "scopes": row["scopes"] or "",
+                    "responded_at": row["responded_at"],
+                    "status": row["status"],
+                    "queried_at": row["queried_at"],
+                }
+                for row in rows
+            }
+        except Exception as e:
+            logger.debug(f"Could not read neighbour scopes: {e}")
+            return {}
+
+    def record_neighbor_scope(
+        self,
+        pubkey: str,
+        status: str,
+        scopes: Optional[str] = None,
+        queried_at: Optional[float] = None,
+    ) -> bool:
+        """Record the outcome of one scope query.
+
+        ``scopes`` is the answer the neighbour gave, and is only supplied when it
+        actually answered. A failed query updates ``status``/``queried_at`` but
+        leaves the last known ``scopes`` and ``responded_at`` in place: the
+        responder rate-limits anon replies (4 per 3 minutes, shared across
+        identities), so a single timeout is weak evidence that a neighbour's
+        scopes changed and is not worth discarding a good answer over.
+
+        An empty ``scopes`` string is a real answer -- it means the neighbour
+        serves unscoped traffic only -- so it is stored, not treated as absent.
+        """
+        pubkey = str(pubkey or "").strip().lower()
+        if not pubkey:
+            return False
+        when = time.time() if queried_at is None else float(queried_at)
+        try:
+            with self._connect() as conn:
+                if scopes is None:
+                    conn.execute(
+                        """
+                        INSERT INTO neighbor_scopes (pubkey, scopes, responded_at,
+                                                     status, queried_at)
+                        VALUES (?, '', NULL, ?, ?)
+                        ON CONFLICT(pubkey) DO UPDATE SET
+                            status = excluded.status,
+                            queried_at = excluded.queried_at
+                        """,
+                        (pubkey, str(status), when),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO neighbor_scopes (pubkey, scopes, responded_at,
+                                                     status, queried_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(pubkey) DO UPDATE SET
+                            scopes = excluded.scopes,
+                            responded_at = excluded.responded_at,
+                            status = excluded.status,
+                            queried_at = excluded.queried_at
+                        """,
+                        (pubkey, str(scopes), when, str(status), when),
+                    )
+                conn.commit()
+            return True
+        except Exception as e:
+            logger.warning(f"Could not persist neighbour scopes for {pubkey[:8]}: {e}")
+            return False
+
+    # Daemon state methods
+    def get_daemon_state(self, key: str) -> Optional[dict]:
+        """Read a persisted daemon-state blob, or None when absent/unreadable.
+
+        Never raises: every caller treats missing state as "no history", so a
+        corrupt row must degrade to that rather than break startup.
+        """
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT value_json FROM daemon_state WHERE key = ?", (key,)
+                ).fetchone()
+            if not row:
+                return None
+            value = json.loads(row[0])
+            return value if isinstance(value, dict) else None
+        except Exception as e:
+            logger.debug(f"Could not read daemon state '{key}': {e}")
+            return None
+
+    def set_daemon_state(self, key: str, value: dict) -> bool:
+        """Upsert a daemon-state blob. Returns whether it was written."""
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO daemon_state (key, value_json, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_json = excluded.value_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (key, json.dumps(value), time.time()),
+                )
+                conn.commit()
+            return True
+        except Exception as e:
+            logger.warning(f"Could not persist daemon state '{key}': {e}")
+            return False
 
     # API Token methods
     def create_api_token(self, name: str, token_hash: str) -> int:
@@ -1055,11 +1273,15 @@ class SQLiteHandler:
                 orig_path = record.get("original_path")
                 fwd_path = record.get("forwarded_path")
                 try:
-                    orig_path_val = json.dumps(orig_path) if orig_path is not None else None
+                    orig_path_val = (
+                        json.dumps(orig_path) if orig_path is not None else None
+                    )
                 except Exception:
                     orig_path_val = str(orig_path)
                 try:
-                    fwd_path_val = json.dumps(fwd_path) if fwd_path is not None else None
+                    fwd_path_val = (
+                        json.dumps(fwd_path) if fwd_path is not None else None
+                    )
                 except Exception:
                     fwd_path_val = str(fwd_path)
 
@@ -1070,9 +1292,10 @@ class SQLiteHandler:
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
                         upstream_hash, upstream_hash_size,
                         header, transport_codes, payload, payload_length,
-                        tx_delay_ms, packet_hash, original_path, forwarded_path, raw_packet,
+                        tx_delay_ms, rx_radio_id, tx_radio_id,
+                        packet_hash, original_path, forwarded_path, raw_packet,
                         lbt_attempts, lbt_backoff_delays_ms, lbt_channel_busy
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                     (
                         record.get("timestamp", time.time()),
@@ -1095,6 +1318,8 @@ class SQLiteHandler:
                         record.get("payload"),
                         record.get("payload_length"),
                         record.get("tx_delay_ms"),
+                        record.get("rx_radio_id"),
+                        record.get("tx_radio_id"),
                         record.get("packet_hash"),
                         orig_path_val,
                         fwd_path_val,
@@ -2144,7 +2369,8 @@ class SQLiteHandler:
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
                         upstream_hash, upstream_hash_size,
                         transport_codes, payload, payload_length,
-                        tx_delay_ms, packet_hash, original_path, forwarded_path,
+                        tx_delay_ms, rx_radio_id, tx_radio_id,
+                        packet_hash, original_path, forwarded_path,
                         lbt_attempts, lbt_channel_busy
                     FROM packets
                     ORDER BY timestamp DESC
@@ -2198,7 +2424,8 @@ class SQLiteHandler:
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
                         upstream_hash, upstream_hash_size,
                         transport_codes, payload, payload_length,
-                        tx_delay_ms, packet_hash, original_path, forwarded_path,
+                        tx_delay_ms, rx_radio_id, tx_radio_id,
+                        packet_hash, original_path, forwarded_path,
                         lbt_attempts, lbt_channel_busy
                     FROM packets
                 """
@@ -2332,7 +2559,8 @@ class SQLiteHandler:
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
                         upstream_hash, upstream_hash_size,
                         header, transport_codes, payload, payload_length,
-                        tx_delay_ms, packet_hash, original_path, forwarded_path, raw_packet,
+                        tx_delay_ms, rx_radio_id, tx_radio_id,
+                        packet_hash, original_path, forwarded_path, raw_packet,
                         lbt_attempts, lbt_backoff_delays_ms, lbt_channel_busy
                     FROM packets
                     WHERE packet_hash = ?
@@ -2359,7 +2587,8 @@ class SQLiteHandler:
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
                         upstream_hash, upstream_hash_size,
                         header, transport_codes, payload, payload_length,
-                        tx_delay_ms, packet_hash, original_path, forwarded_path, raw_packet,
+                        tx_delay_ms, rx_radio_id, tx_radio_id,
+                        packet_hash, original_path, forwarded_path, raw_packet,
                         lbt_attempts, lbt_backoff_delays_ms, lbt_channel_busy
                     FROM packets
                     WHERE id = ?
@@ -2380,7 +2609,9 @@ class SQLiteHandler:
         path_hash_size: int,
         hours: int = 24,
         limit: int = 1000,
+        bucket_seconds: Optional[int] = None,
     ) -> list:
+        """Observations of one peer, oldest first; ``bucket_seconds`` summarises them instead."""
         try:
             normalized_hash = str(peer_hash or "").strip().upper()
             if not normalized_hash:
@@ -2393,6 +2624,16 @@ class SQLiteHandler:
 
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
+                if bucket_seconds is not None:
+                    return self._bucket_neighbor_link_history(
+                        conn,
+                        normalized_hash,
+                        path_hash_size,
+                        cutoff,
+                        int(bucket_seconds),
+                        limit,
+                    )
+
                 rows = conn.execute(
                     """
                     SELECT
@@ -2446,6 +2687,53 @@ class SQLiteHandler:
         except Exception as e:
             logger.error(f"Failed to get neighbor link history: {e}")
             return []
+
+    @staticmethod
+    def _bucket_neighbor_link_history(
+        conn,
+        peer_hash: str,
+        path_hash_size: int,
+        cutoff: float,
+        bucket_seconds: int,
+        limit: int,
+    ) -> list:
+        bucket_seconds = max(1, bucket_seconds)
+        rows = conn.execute(
+            """
+            SELECT
+                CAST(timestamp / ? AS INTEGER) * ? AS bucket_ts,
+                COUNT(*) AS n,
+                SUM(is_duplicate) AS dup,
+                MAX(timestamp) AS last_ts,
+                AVG(score) AS score,
+                AVG(rssi) AS rssi,
+                AVG(snr) AS snr
+            FROM packets INDEXED BY idx_packets_upstream_time
+            WHERE upstream_hash = ?
+              AND upstream_hash_size = ?
+              AND timestamp >= ?
+            GROUP BY bucket_ts
+            ORDER BY bucket_ts DESC
+            LIMIT ?
+            """,
+            (bucket_seconds, bucket_seconds, peer_hash, path_hash_size, cutoff, limit),
+        ).fetchall()
+
+        def mean(value):
+            return None if value is None else round(value, 3)
+
+        return [
+            {
+                "timestamp": int(row["bucket_ts"]),
+                "last_ts": row["last_ts"],
+                "n": int(row["n"]),
+                "dup": int(row["dup"]),
+                "score": mean(row["score"]),
+                "rssi": mean(row["rssi"]),
+                "snr": mean(row["snr"]),
+            }
+            for row in reversed(rows)
+        ]
 
     def get_packet_type_stats(self, hours: int = 24) -> dict:
         try:
@@ -2642,12 +2930,17 @@ class SQLiteHandler:
             logger.error(f"Failed to get neighbors: {e}")
             return {}
 
-    def get_noise_floor_history(self, hours: int = 24, limit: int = None) -> list:
+    def get_noise_floor_history(
+        self, hours: int = 24, limit: int = None, offset: int = 0
+    ) -> list:
         try:
             cutoff = time.time() - (hours * 3600)
 
             if limit is None:
-                limit = 1000
+                limit = max(2000, min(1_000_000, int(hours) * 300))
+            else:
+                limit = max(1, min(1_000_000, int(limit)))
+            offset = max(0, int(offset))
 
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
@@ -2658,13 +2951,19 @@ class SQLiteHandler:
                     WHERE timestamp > ?
                     ORDER BY timestamp DESC
                     LIMIT ?
+                    OFFSET ?
                 """
 
-                measurements = conn.execute(query, (cutoff, int(limit))).fetchall()
+                measurements = conn.execute(
+                    query, (cutoff, int(limit), offset)
+                ).fetchall()
 
                 # Reverse to get chronological order (oldest to newest)
                 result = [
-                    {"timestamp": row["timestamp"], "noise_floor_dbm": row["noise_floor_dbm"]}
+                    {
+                        "timestamp": row["timestamp"],
+                        "noise_floor_dbm": row["noise_floor_dbm"],
+                    }
                     for row in reversed(measurements)
                 ]
 
@@ -2827,6 +3126,11 @@ class SQLiteHandler:
         try:
             with self._connect() as conn:
                 result = conn.execute(purge_queries[table_name])
+                if table_name == "adverts":
+                    # Purging the neighbour table has to take the scopes with it,
+                    # or the UI shows scope counts for repeaters it no longer lists
+                    # and presents them as current.
+                    conn.execute("DELETE FROM neighbor_scopes")
                 conn.commit()
                 logger.info(f"Purged {result.rowcount} rows from {table_name}")
                 return result.rowcount
@@ -2844,7 +3148,9 @@ class SQLiteHandler:
             logger.error(f"Failed to vacuum database: {e}")
             raise
 
-    def cleanup_old_data(self, days: int = 7, companion_events_days: Optional[int] = None):
+    def cleanup_old_data(
+        self, days: int = 7, companion_events_days: Optional[int] = None
+    ):
         """Prune retention-bounded tables.
 
         ``companion_events_days`` is forwarded from engine.py
@@ -2857,19 +3163,37 @@ class SQLiteHandler:
             cutoff = time.time() - (days * 24 * 3600)
 
             with self._connect() as conn:
-                result = conn.execute("DELETE FROM packets WHERE timestamp < ?", (cutoff,))
+                result = conn.execute(
+                    "DELETE FROM packets WHERE timestamp < ?", (cutoff,)
+                )
                 packets_deleted = result.rowcount
 
-                result = conn.execute("DELETE FROM adverts WHERE timestamp < ?", (cutoff,))
+                result = conn.execute(
+                    "DELETE FROM adverts WHERE timestamp < ?", (cutoff,)
+                )
                 adverts_deleted = result.rowcount
 
-                result = conn.execute("DELETE FROM noise_floor WHERE timestamp < ?", (cutoff,))
+                # A scope row describes a neighbour, so it has nothing left to be
+                # displayed against once that neighbour's advert is pruned. Without
+                # this it would survive every retention pass and grow without bound.
+                conn.execute(
+                    "DELETE FROM neighbor_scopes WHERE pubkey NOT IN "
+                    "(SELECT lower(pubkey) FROM adverts)"
+                )
+
+                result = conn.execute(
+                    "DELETE FROM noise_floor WHERE timestamp < ?", (cutoff,)
+                )
                 noise_deleted = result.rowcount
 
-                result = conn.execute("DELETE FROM crc_errors WHERE timestamp < ?", (cutoff,))
+                result = conn.execute(
+                    "DELETE FROM crc_errors WHERE timestamp < ?", (cutoff,)
+                )
                 crc_deleted = result.rowcount
 
-                result = conn.execute("DELETE FROM tx_diagnostics WHERE timestamp < ?", (cutoff,))
+                result = conn.execute(
+                    "DELETE FROM tx_diagnostics WHERE timestamp < ?", (cutoff,)
+                )
                 tx_diagnostics_deleted = result.rowcount
 
                 conn.commit()
@@ -3052,7 +3376,9 @@ class SQLiteHandler:
                         current_time,
                     ),
                 )
-                return cursor.lastrowid
+                new_id = cursor.lastrowid
+            self._notify_transport_keys_changed()
+            return new_id
         except Exception as e:
             logger.error(f"Failed to create transport key: {e}")
             return None
@@ -3122,7 +3448,8 @@ class SQLiteHandler:
         transport_key: Optional[str] = None,
         parent_id: Optional[int] = None,
         last_used: Optional[float] = None,
-        *, clear_parent: bool = False,
+        *,
+        clear_parent: bool = False,
     ) -> bool:
         try:
             has_name = name is not None
@@ -3145,13 +3472,18 @@ class SQLiteHandler:
             with self._connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 current = conn.execute(
-                    "SELECT name, flood_policy, transport_key FROM transport_keys WHERE id = ?", (key_id,),
+                    "SELECT name, flood_policy, transport_key FROM transport_keys WHERE id = ?",
+                    (key_id,),
                 ).fetchone()
                 if current is None:
                     return False
                 # Auto-derived public keys follow a renamed region. An explicit
                 # custom key remains unchanged unless the caller replaces it.
-                if has_name and name != current[0] and transport_key in (None, current[2]):
+                if (
+                    has_name
+                    and name != current[0]
+                    and transport_key in (None, current[2])
+                ):
                     try:
                         old_auto_key = self.generate_transport_key(current[0])
                     except ValueError:
@@ -3167,9 +3499,18 @@ class SQLiteHandler:
                 if has_parent_id and parent_id is not None:
                     self._validate_transport_parent(conn, parent_id, key_id)
                 params = (
-                    int(has_name), name, int(has_flood_policy), flood_policy,
-                    int(has_transport_key), transport_key, int(has_parent_id), parent_id,
-                    int(has_last_used), last_used, time.time(), key_id,
+                    int(has_name),
+                    name,
+                    int(has_flood_policy),
+                    flood_policy,
+                    int(has_transport_key),
+                    transport_key,
+                    int(has_parent_id),
+                    parent_id,
+                    int(has_last_used),
+                    last_used,
+                    time.time(),
+                    key_id,
                 )
                 cursor = conn.execute(
                     """
@@ -3185,7 +3526,10 @@ class SQLiteHandler:
                     """,
                     params,
                 )
-                return cursor.rowcount > 0
+                changed = cursor.rowcount > 0
+            if changed:
+                self._notify_transport_keys_changed()
+            return changed
         except Exception as e:
             logger.error(f"Failed to update transport key: {e}")
             return False
@@ -3194,9 +3538,17 @@ class SQLiteHandler:
         try:
             with self._connect() as conn:
                 # Keep children as flat regions when their group is removed.
-                conn.execute("UPDATE transport_keys SET parent_id = NULL WHERE parent_id = ?", (key_id,))
-                cursor = conn.execute("DELETE FROM transport_keys WHERE id = ?", (key_id,))
-                return cursor.rowcount > 0
+                conn.execute(
+                    "UPDATE transport_keys SET parent_id = NULL WHERE parent_id = ?",
+                    (key_id,),
+                )
+                cursor = conn.execute(
+                    "DELETE FROM transport_keys WHERE id = ?", (key_id,)
+                )
+                changed = cursor.rowcount > 0
+            if changed:
+                self._notify_transport_keys_changed()
+            return changed
         except Exception as e:
             logger.error(f"Failed to delete transport key: {e}")
             return False
@@ -3257,8 +3609,12 @@ class SQLiteHandler:
                 "node_id": node_id,
                 "name": name,
                 "flood_policy": flood_policy,
-                "parent_node_id": str(parent_node_id).strip() if parent_node_id else None,
-                "transport_key": transport_key.strip() if isinstance(transport_key, str) else None,
+                "parent_node_id": str(parent_node_id).strip()
+                if parent_node_id
+                else None,
+                "transport_key": transport_key.strip()
+                if isinstance(transport_key, str)
+                else None,
             }
             used_names.add(name)
 
@@ -3296,9 +3652,13 @@ class SQLiteHandler:
                 if not transport_key:
                     transport_key = self.generate_transport_key(node["name"])
                     generated_keys += 1
-                self._validate_transport_key_fields(node["name"], node["flood_policy"], transport_key)
+                self._validate_transport_key_fields(
+                    node["name"], node["flood_policy"], transport_key
+                )
                 parent_id = (
-                    db_ids.get(node["parent_node_id"]) if node.get("parent_node_id") else None
+                    db_ids.get(node["parent_node_id"])
+                    if node.get("parent_node_id")
+                    else None
                 )
                 cursor = conn.execute(
                     """
@@ -3326,12 +3686,24 @@ class SQLiteHandler:
                 db_ids[node["node_id"]] = int(cursor.lastrowid)
             conn.commit()
 
+        self._notify_transport_keys_changed()
         return {"applied_nodes": len(ordered), "generated_keys": generated_keys}
 
     def delete_advert(self, advert_id: int) -> bool:
         try:
             with self._connect() as conn:
+                # Adverts are one row per pubkey (migration `adverts_unique_pubkey`),
+                # so deleting one drops the neighbour entirely; its scope row would
+                # otherwise outlive it with nothing left to display it against.
+                row = conn.execute(
+                    "SELECT pubkey FROM adverts WHERE id = ?", (advert_id,)
+                ).fetchone()
                 cursor = conn.execute("DELETE FROM adverts WHERE id = ?", (advert_id,))
+                if row and row[0]:
+                    conn.execute(
+                        "DELETE FROM neighbor_scopes WHERE pubkey = ?",
+                        (str(row[0]).lower(),),
+                    )
                 self._neighbors_cache = {"timestamp": 0.0, "value": None}
                 return cursor.rowcount > 0
         except Exception as e:
@@ -3344,9 +3716,14 @@ class SQLiteHandler:
             with self._connect() as conn:
                 if pubkey_prefix is None:
                     cursor = conn.execute("DELETE FROM adverts")
+                    conn.execute("DELETE FROM neighbor_scopes")
                 else:
                     cursor = conn.execute(
                         "DELETE FROM adverts WHERE lower(pubkey) LIKE ?",
+                        (f"{pubkey_prefix.lower()}%",),
+                    )
+                    conn.execute(
+                        "DELETE FROM neighbor_scopes WHERE pubkey LIKE ?",
                         (f"{pubkey_prefix.lower()}%",),
                     )
                 self._neighbors_cache = {"timestamp": 0.0, "value": None}

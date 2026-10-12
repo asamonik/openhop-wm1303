@@ -76,25 +76,8 @@ LOG_DIR="/var/log/openhop_repeater"
 DATA_DIR="/var/lib/openhop_repeater"
 # PKTFWD_DIR and HAL_DIR are set after user detection (see below)
 
-# GitHub repositories (unmodified forks)
-#
-# Note: the official upstream of pyMC_core and pyMC_Repeater has moved to the
-# openhop-dev GitHub organization:
-#   - https://github.com/openhop-dev/openhop_core   (was pyMC-dev/pymc-core)
-#   - https://github.com/openhop-dev/openhop_repeater (was pyMC-dev/pymc-repeater)
-#
-# The Hans van Meer forks below remain the WM1303 source of truth: they are
-# kept in sync with the new upstream and apply any WM1303-specific patches
-# before this installer consumes them. See docs/repositories.md for the full
-# upstream/fork relationship.
-HAL_REPO="https://github.com/HansvanMeer/sx1302_hal.git"
-CORE_REPO="https://github.com/HansvanMeer/pyMC_core.git"
-REPEATER_REPO="https://github.com/HansvanMeer/pyMC_Repeater.git"
-
-# Branch configuration
-HAL_BRANCH="master"
-CORE_BRANCH="dev"
-REPEATER_BRANCH="dev"
+# Canonical sources and immutable, jointly verified dependency revisions.
+source "${SCRIPT_DIR}/config/dependencies.conf"
 
 # Parse arguments
 SKIP_UPDATE=false
@@ -223,9 +206,9 @@ PKTFWD_DIR="${PI_HOME}/wm1303_pf"
 HAL_DIR="${PI_HOME}/sx1302_hal"
 
 # Refuse unexpected sources before package changes or service interruption.
-[ ! -d "${HAL_DIR}/.git" ] || require_expected_origin "${HAL_DIR}" "${HAL_REPO}" || fail "HAL origin check failed"
-[ ! -d "${REPO_DIR}/pyMC_core/.git" ] || require_expected_origin "${REPO_DIR}/pyMC_core" "${CORE_REPO}" || fail "Core origin check failed"
-[ ! -d "${REPO_DIR}/pyMC_Repeater/.git" ] || require_expected_origin "${REPO_DIR}/pyMC_Repeater" "${REPEATER_REPO}" || fail "Repeater origin check failed"
+[ ! -d "${HAL_DIR}/.git" ] || require_dependency_origin "${HAL_DIR}" "${HAL_REPO}" || fail "HAL origin check failed"
+[ ! -d "${REPO_DIR}/pyMC_core/.git" ] || require_dependency_origin "${REPO_DIR}/pyMC_core" "${CORE_REPO}" || fail "Core origin check failed"
+[ ! -d "${REPO_DIR}/pyMC_Repeater/.git" ] || require_dependency_origin "${REPO_DIR}/pyMC_Repeater" "${REPEATER_REPO}" || fail "Repeater origin check failed"
 
 INSTALL_VERSION="unknown"
 if [ -f "${SCRIPT_DIR}/VERSION" ]; then
@@ -725,65 +708,28 @@ ok "Ownership set"
 phase "Clone Repositories"
 
 clone_or_update_repo() {
-    local repo_url="$1"
-    local target_dir="$2"
-    local branch="$3"
+    local repo_url="$1" target_dir="$2" branch="$3" revision="$4" version_tag="$5"
     local name
-    name=$(basename "$target_dir") || fail "Cannot identify repository ${target_dir}"
-
-    if [ -d "${target_dir}/.git" ]; then
-        require_expected_origin "${target_dir}" "${repo_url}" || fail "Refusing to update ${name} from an unexpected origin"
+    name=$(basename "$target_dir") || fail "Cannot identify repository $target_dir"
+    if [ ! -d "$target_dir/.git" ]; then
+        sudo -u "$PI_USER" git clone --no-checkout --no-tags --single-branch --branch "$branch" \
+            "$repo_url" "$target_dir" >> "$LOG_FILE" 2>&1 || fail "Failed to clone $name"
     fi
-
-    # Fix git 'dubious ownership' error (CVE-2022-24765)
-    git config --global --add safe.directory "${target_dir}" 2>/dev/null
-    sudo -u "${PI_USER}" git config --global --add safe.directory "${target_dir}" 2>/dev/null
-
-    if [ -d "${target_dir}/.git" ]; then
-        # Ensure proper ownership before git operations
-        chown -R "${PI_USER}:${PI_GROUP}" "${target_dir}"
-        cd "${target_dir}"
-        # Use `git reset --hard origin/<branch>` after fetch instead of `git pull`.
-        # Idempotent and avoids "Your local changes would be overwritten by merge"
-        # errors if a previous run left overlay-modified tracked files behind.
-        sudo -u "${PI_USER}" git fetch --all >> "${LOG_FILE}" 2>&1
-        sudo -u "${PI_USER}" git reset --hard >> "${LOG_FILE}" 2>&1
-        sudo -u "${PI_USER}" git checkout -B "${branch}" "origin/${branch}" >> "${LOG_FILE}" 2>&1
-        sudo -u "${PI_USER}" git reset --hard "origin/${branch}" >> "${LOG_FILE}" 2>&1
-        sudo -u "${PI_USER}" git clean -fd >> "${LOG_FILE}" 2>&1 || true
-        ok "${name} updated to latest ${branch}"
-    else
-        if ! sudo -u "${PI_USER}" git clone -b "${branch}" "${repo_url}" "${target_dir}" >> "${LOG_FILE}" 2>&1; then
-            fail "Failed to clone ${name}"
-        fi
-        ok "${name} cloned"
-    fi
+    chown -R "$PI_USER:$PI_GROUP" "$target_dir" || fail "Cannot set repository ownership for $name"
+    checkout_dependency_revision "$target_dir" "$repo_url" "$revision" "$version_tag" \
+        >> "$LOG_FILE" 2>&1 || fail "Failed to fetch or verify pinned revision for $name; inspect $LOG_FILE"
+    ok "$name prepared at ${revision:0:8} (local changes retained in Git stash)"
 }
 
-step "Cloning sx1302_hal (HAL v2.10)"
-clone_or_update_repo "${HAL_REPO}" "${HAL_DIR}" "${HAL_BRANCH}"
+step "Preparing Semtech HAL 2.1.0"
+clone_or_update_repo "${HAL_REPO}" "${HAL_DIR}" "${HAL_BRANCH}" "${HAL_REVISION}" "${HAL_TAG}"
 
-step "Cloning pyMC_core (dev branch)"
-clone_or_update_repo "${CORE_REPO}" "${REPO_DIR}/pyMC_core" "${CORE_BRANCH}"
+step "Preparing OpenHop core ${CORE_TAG}"
+clone_or_update_repo "${CORE_REPO}" "${REPO_DIR}/pyMC_core" "${CORE_BRANCH}" "${CORE_REVISION}" "${CORE_TAG}"
 
-step "Cloning pyMC_Repeater (dev branch)"
-clone_or_update_repo "${REPEATER_REPO}" "${REPO_DIR}/pyMC_Repeater" "${REPEATER_BRANCH}"
+step "Preparing OpenHop Repeater ${REPEATER_TAG}"
+clone_or_update_repo "${REPEATER_REPO}" "${REPO_DIR}/pyMC_Repeater" "${REPEATER_BRANCH}" "${REPEATER_REVISION}" "${REPEATER_TAG}"
 
-# Sync upstream tags so setuptools-scm computes correct version numbers
-step "Syncing upstream tags for version resolution"
-for _sync_pair in "pyMC_core:https://github.com/rightup/pyMC_core.git" "pyMC_Repeater:https://github.com/rightup/pyMC_Repeater.git"; do
-    _sync_name="${_sync_pair%%:*}"
-    _sync_url="${_sync_pair#*:}"
-    _sync_dir="${REPO_DIR}/${_sync_name}"
-    if [ -d "${_sync_dir}/.git" ]; then
-        cd "${_sync_dir}"
-        if ! git remote get-url upstream >> "${LOG_FILE}" 2>&1; then
-            sudo -u ${PI_USER} git remote add upstream "${_sync_url}" >> "${LOG_FILE}" 2>&1
-        fi
-        sudo -u ${PI_USER} git fetch upstream --tags >> "${LOG_FILE}" 2>&1 || true
-    fi
-done
-ok "Upstream tags synced"
 
 # =============================================================================
 # Phase 5: Apply Overlay Modifications
@@ -966,7 +912,7 @@ ok "Installed"
 
 step "Installing pyMC_Repeater (editable/dev mode)"
 cd "${REPO_DIR}/pyMC_Repeater"
-if ! sudo -u ${PI_USER} "${VENV_DIR}/bin/pip" --no-input install -e . >> "${LOG_FILE}" 2>&1; then
+if ! sudo -u "${PI_USER}" env "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENHOP_REPEATER=${REPEATER_TAG}+wm1303" "${VENV_DIR}/bin/pip" --no-input install -e . >> "${LOG_FILE}" 2>&1; then
     fail "pyMC_Repeater install failed"
 fi
 ok "Installed"
@@ -1274,7 +1220,10 @@ sed -i "s|__PI_HOME__|${PI_HOME}|g" /etc/systemd/system/openhop-repeater.service
 ok "Installed (user: ${PI_USER})"
 
 step "Reloading systemd daemon"
+install_plugin_manager_service "$SCRIPT_DIR" "$PI_USER" "$PI_GROUP" >> "$LOG_FILE" 2>&1 || fail "Plugin manager service installation failed"
 systemctl daemon-reload >> "${LOG_FILE}" 2>&1
+systemctl enable openhop-plugin-manager.service >> "$LOG_FILE" 2>&1
+systemctl --no-block restart openhop-plugin-manager.service >> "$LOG_FILE" 2>&1 || warn "Optional plugin manager did not start; repeater operation is unaffected"
 ok "Reloaded"
 
 step "Enabling service for auto-start"

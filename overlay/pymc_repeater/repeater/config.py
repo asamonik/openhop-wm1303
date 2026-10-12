@@ -6,7 +6,9 @@ from threading import RLock
 from typing import Any, Dict, Optional
 
 import yaml
-from openhop_core.paths import resolve_config_path  # WM1303 v2.7: central config-path helper
+from openhop_core.paths import (
+    resolve_config_path,
+)  # WM1303 v2.7: central config-path helper
 from repeater.atomic_file import atomic_write_text
 from repeater.room_settings import validate_room_configuration
 
@@ -16,6 +18,141 @@ logger = logging.getLogger("Config")
 # read/modify/write operations. Atomic replacement alone cannot prevent lost
 # updates when two writers start from the same old configuration.
 CONFIG_WRITE_LOCK = RLock()
+
+from repeater.exceptions import ConfigurationError
+from repeater.modem_config import normalize_modem_config
+
+logger = logging.getLogger("Config")
+
+
+def _resolve_policy_config_path(config: Dict[str, Any], config_path: str) -> Path:
+    policy_section = (
+        config.get("policy", {}) if isinstance(config.get("policy"), dict) else {}
+    )
+    configured = policy_section.get("policy_file") or "policy.yaml"
+
+    base_dir = Path(config_path).expanduser().resolve().parent
+    p = Path(str(configured)).expanduser()
+    if not p.is_absolute():
+        p = (base_dir / p).resolve()
+    return p
+
+
+def _load_policy_engine_config(
+    config: Dict[str, Any], config_path: str
+) -> Dict[str, Any]:
+    from repeater.policy_engine import default_policy_engine_config
+    policy_path = _resolve_policy_config_path(config, config_path)
+    defaults = default_policy_engine_config()
+
+    if not policy_path.exists():
+        logger.info("Policy file not found at %s, policy engine disabled", policy_path)
+        config["policy_engine"] = defaults
+        config["policy_file_path"] = str(policy_path)
+        return config
+
+    try:
+        with open(policy_path) as f:
+            loaded = yaml.safe_load(f) or {}
+
+        if isinstance(loaded, dict) and isinstance(loaded.get("policy_engine"), dict):
+            policy_cfg = loaded.get("policy_engine")
+        elif isinstance(loaded, dict):
+            policy_cfg = loaded
+        else:
+            policy_cfg = {}
+
+        merged = dict(defaults)
+        if isinstance(policy_cfg, dict):
+            merged.update(policy_cfg)
+
+        if not isinstance(merged.get("rules"), list):
+            merged["rules"] = []
+        if not isinstance(merged.get("objects"), dict):
+            merged["objects"] = {}
+
+        config["policy_engine"] = merged
+        config["policy_file_path"] = str(policy_path)
+        logger.info("Loaded policy config from %s", policy_path)
+        return config
+    except Exception as e:
+        logger.warning(
+            "Failed to load policy config from %s: %s. Policy engine disabled.",
+            policy_path,
+            e,
+        )
+        config["policy_engine"] = defaults
+        config["policy_file_path"] = str(policy_path)
+        return config
+
+
+class NullRadio:
+    """No-op radio used when radio_type disables hardware initialization."""
+
+    def __init__(self):
+        self._rx_callback = None
+
+    def begin(self):
+        return True
+
+    async def send(self, data: bytes):
+        raise RuntimeError("Radio is disabled (radio_type is null/none)")
+
+    async def wait_for_rx(self) -> bytes:
+        import asyncio
+
+        while True:
+            await asyncio.sleep(3600)
+
+    def sleep(self):
+        return None
+
+    def get_last_rssi(self) -> int:
+        return 0
+
+    def get_last_snr(self) -> float:
+        return 0.0
+
+    def set_rx_callback(self, callback):
+        self._rx_callback = callback
+
+    def check_radio_health(self):
+        return True
+
+
+class BaselineCrcCounterRadio:
+    """Radio proxy that exposes CRC errors relative to repeater startup.
+
+    openHop Modem transports report the modem firmware's cumulative CRC counter.
+    The SX1262 wrapper's counter starts at process startup, which lets the engine
+    persist deltas without knowing the radio backend. Mirror that wrapper flow
+    here by normalizing the modem's raw counter at the transport boundary.
+    """
+
+    def __init__(self, radio):
+        self._radio = radio
+        self._crc_baseline = self._read_raw_crc_count()
+
+    def __getattr__(self, name: str):
+        return getattr(self._radio, name)
+
+    @property
+    def crc_error_count(self) -> int:
+        current = self._read_raw_crc_count()
+        if self._crc_baseline <= 0 and current > 0:
+            self._crc_baseline = current
+            return 0
+        return max(0, current - self._crc_baseline)
+
+    @crc_error_count.setter
+    def crc_error_count(self, value: Any) -> None:
+        setattr(self._radio, "crc_error_count", value)
+
+    def _read_raw_crc_count(self) -> int:
+        try:
+            return int(getattr(self._radio, "crc_error_count", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
 
 
 def resolve_storage_dir(
@@ -60,10 +197,10 @@ def validate_owner_info(value):
 def get_node_info(config: Dict[str, Any]) -> Dict[str, Any]:
     """
     Extract node name, radio configuration, and MQTT settings from config.
-    
+
     Args:
         config: Configuration dictionary
-        
+
     Returns:
         Dictionary with node_name, radio_config, and MQTT configuration
     """
@@ -77,11 +214,12 @@ def get_node_info(config: Dict[str, Any]) -> Dict[str, Any]:
     radio_freq_mhz = radio_freq / 1_000_000
     radio_bw_khz = radio_bw / 1_000
     radio_config_str = f"{radio_freq_mhz},{radio_bw_khz},{radio_sf},{radio_cr}"
-    
+
     # Handle getting the config from mqtt brokers, falling back to letsmesh if it doesn't exist
-    mqtt_config = (config.get("mqtt_brokers") or config.get("letsmesh")
-                   or config.get("mqtt") or {})
-    
+    mqtt_config = (
+        config.get("mqtt_brokers") or config.get("letsmesh") or config.get("mqtt") or {}
+    )
+
     return {
         "node_name": node_name,
         "radio_config": radio_config_str,
@@ -95,11 +233,15 @@ def get_node_info(config: Dict[str, Any]) -> Dict[str, Any]:
 
 def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     if config_path is None:
-        config_path = os.getenv("OPENHOP_REPEATER_CONFIG") or os.getenv("PYMC_REPEATER_CONFIG") or str(resolve_config_path('config.yaml'))
+        config_path = (
+            os.getenv("OPENHOP_REPEATER_CONFIG")
+            or os.getenv("PYMC_REPEATER_CONFIG")
+            or str(resolve_config_path("config.yaml"))
+        )
 
     # Check if config file exists
     if not Path(config_path).exists():
-        raise FileNotFoundError(
+        raise ConfigurationError(
             f"Configuration file not found: {config_path}\n"
             f"Please create a config file. Example: \n"
             f"  sudo cp {Path(config_path).parent}/config.yaml.example {config_path}\n"
@@ -116,11 +258,21 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
                 raise ValueError("Configuration must be a YAML mapping")
             logger.info(f"Loaded config from {config_path}")
     except Exception as e:
-        raise RuntimeError(f"Failed to load configuration from {config_path}: {e}") from e
+        raise ConfigurationError(
+            f"Failed to load configuration from {config_path}: {e}"
+        ) from e
 
     # Empty YAML sections are null, not mappings. Normalize the sections used
     # below before reading them, and reject malformed shapes before key creation.
-    for section in ("storage", "repeater", "mesh", "glass", "gps", "sensors", "logging"):
+    for section in (
+        "storage",
+        "repeater",
+        "mesh",
+        "glass",
+        "gps",
+        "sensors",
+        "logging",
+    ):
         if config.get(section) is None:
             config.pop(section, None)
         elif not isinstance(config[section], dict):
@@ -151,7 +303,7 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
             "request_timeout_seconds": 10,
             "verify_tls": True,
             "api_token": "",
-            "cert_store_dir": str(resolve_config_path('glass')),
+            "cert_store_dir": str(resolve_config_path("glass")),
         }
 
     if "gps" not in config:
@@ -212,12 +364,18 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
         if identity_file:
             identity_path = Path(identity_file).expanduser()
             if not identity_path.is_absolute():
-                identity_path = Path(config_path).expanduser().resolve().parent / identity_path
-            config["repeater"]["identity_key"] = _load_or_create_identity_key(path=identity_path)
+                identity_path = (
+                    Path(config_path).expanduser().resolve().parent / identity_path
+                )
+            config["repeater"]["identity_key"] = _load_or_create_identity_key(
+                path=identity_path
+            )
         else:
             config["repeater"]["identity_key"] = _load_or_create_identity_key()
 
-    log_level = os.getenv("OPENHOP_REPEATER_LOG_LEVEL") or os.getenv("PYMC_REPEATER_LOG_LEVEL")
+    log_level = os.getenv("OPENHOP_REPEATER_LOG_LEVEL") or os.getenv(
+        "PYMC_REPEATER_LOG_LEVEL"
+    )
     if log_level:
         if "logging" not in config:
             config["logging"] = {}
@@ -229,17 +387,21 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
 def save_config(config_data: Dict[str, Any], config_path: Optional[str] = None) -> bool:
     """
     Save configuration to YAML file.
-    
+
     Args:
         config_data: Configuration dictionary to save
         config_path: Path to config file (uses default if None)
-        
+
     Returns:
         True if successful, False otherwise
     """
     if config_path is None:
-        config_path = os.getenv("OPENHOP_REPEATER_CONFIG") or os.getenv("PYMC_REPEATER_CONFIG") or str(resolve_config_path('config.yaml'))
-    
+        config_path = (
+            os.getenv("OPENHOP_REPEATER_CONFIG")
+            or os.getenv("PYMC_REPEATER_CONFIG")
+            or str(resolve_config_path("config.yaml"))
+        )
+
     try:
         with CONFIG_WRITE_LOCK:
             validate_room_configuration(config_data)
@@ -262,20 +424,22 @@ def save_config(config_data: Dict[str, Any], config_path: Optional[str] = None) 
 
         logger.info(f"Saved configuration to {config_path}")
         return True
-        
+
     except Exception as e:
         logger.error(f"Failed to save configuration: {e}")
         return False
 
 
-def update_unscoped_flood_policy(allow: bool, config_path: Optional[str] = None) -> bool:
+def update_unscoped_flood_policy(
+    allow: bool, config_path: Optional[str] = None
+) -> bool:
     """
     Update the unscoped flood policy in the configuration.
-    
+
     Args:
         allow: True to allow unscoped flooding, False to deny
         config_path: Path to config file (uses default if None)
-        
+
     Returns:
         True if successful, False otherwise
     """
@@ -285,7 +449,7 @@ def update_unscoped_flood_policy(allow: bool, config_path: Optional[str] = None)
             config.setdefault("mesh", {})["global_flood_allow"] = allow
             config["mesh"]["unscoped_flood_allow"] = allow
             return save_config(config, config_path)
-        
+
     except Exception as e:
         logger.error(f"Failed to update unscoped flood policy: {e}")
         return False
@@ -338,6 +502,7 @@ def _load_or_create_identity_key(path: Optional[str | Path] = None) -> bytes:
 
 
 def get_radio_for_board(board_config: dict):
+    board_config = normalize_modem_config(board_config)
 
     def _parse_int(value, *, default=None) -> int:
         if value is None:
@@ -362,7 +527,10 @@ def get_radio_for_board(board_config: dict):
             return [_parse_int(item) for item in stripped.split(",") if item.strip()]
         raise ValueError(f"Invalid int list value type: {type(value)}")
 
-    radio_type = board_config.get("radio_type", "sx1262").lower().strip()
+    radio_type_raw = board_config.get('radio_type')
+    radio_type = str(radio_type_raw).lower().strip() if radio_type_raw is not None else 'none'
+    if radio_type in ('', 'none', 'null', 'disabled', 'off', 'no_radio'):
+        return NullRadio()
     if radio_type == "kiss-modem":
         radio_type = "kiss"
 
@@ -378,21 +546,49 @@ def get_radio_for_board(board_config: dict):
         if not radio_config:
             raise ValueError("Missing 'radio' section in configuration file")
 
-        # CH341 integration: swap SPI transport + GPIO backend to CH341
+        # CH341 integration: per-radio USB adapter selection.
+        # For multi-radio, pass distinct bus/address/serial_number so each
+        # SX1262Radio owns its own CH341 SPI+GPIO pair (no process singleton).
+        ch341_spi = None
+        ch341_gpio = None
         if radio_type == "sx1262_ch341":
             ch341_cfg = board_config.get("ch341")
             if not ch341_cfg:
                 raise ValueError("Missing 'ch341' section in configuration file")
 
             from openhop_core.hardware.lora.LoRaRF.SX126x import set_spi_transport
-            from openhop_core.hardware.transports.ch341_spi_transport import CH341SPITransport
+            from openhop_core.hardware.transports.ch341_spi_transport import (
+                CH341SPITransport,
+            )
 
             vid = _parse_int(ch341_cfg.get("vid"), default=0x1A86)
             pid = _parse_int(ch341_cfg.get("pid"), default=0x5512)
+            bus = _parse_int(ch341_cfg.get("bus"), default=None)
+            address = _parse_int(
+                ch341_cfg.get("address", ch341_cfg.get("device_address")),
+                default=None,
+            )
+            serial_number = ch341_cfg.get("serial_number") or ch341_cfg.get("serial")
+            if serial_number is not None:
+                serial_number = str(serial_number).strip() or None
 
-            # Create CH341 transport (also configures CH341 GPIO manager globally)
-            ch341_spi = CH341SPITransport(vid=vid, pid=pid, auto_setup_gpio=True)
-            set_spi_transport(ch341_spi)
+            # Multi-radio entries should not stomp the process-global defaults.
+            # Legacy single-radio keeps global install for older code paths.
+            multi_context = bool(board_config.get("_radio_id")) or bool(
+                board_config.get("_ch341_per_instance")
+            )
+            ch341_spi = CH341SPITransport(
+                vid=vid,
+                pid=pid,
+                bus=bus,
+                address=address,
+                serial_number=serial_number,
+                auto_setup_gpio=True,
+                set_as_global_gpio=not multi_context,
+            )
+            ch341_gpio = ch341_spi.gpio_manager
+            if not multi_context:
+                set_spi_transport(ch341_spi)
 
         combined_config = {
             "bus_id": _parse_int(spi_config["bus_id"]),
@@ -428,13 +624,23 @@ def get_radio_for_board(board_config: dict):
         # Add optional GPIO parameters if specified in config
         # These wont be supported by older versions of openhop_core
         if "gpio_chip" in spi_config:
-            combined_config["gpio_chip"] = _parse_int(spi_config["gpio_chip"], default=0)
+            combined_config["gpio_chip"] = _parse_int(
+                spi_config["gpio_chip"], default=0
+            )
         if "use_gpiod_backend" in spi_config:
             combined_config["use_gpiod_backend"] = spi_config["use_gpiod_backend"]
         if "radio_timing_delay" in spi_config:
-            combined_config["radio_timing_delay"] = float(spi_config["radio_timing_delay"])
+            combined_config["radio_timing_delay"] = float(
+                spi_config["radio_timing_delay"]
+            )
 
-        radio = SX1262Radio.get_instance(**combined_config)
+        # Always construct a fresh instance so multi-radio configs do not
+        # share/reuse a singleton SX1262 handle.
+        if ch341_spi is not None:
+            combined_config["spi_transport"] = ch341_spi
+        if ch341_gpio is not None:
+            combined_config["gpio_manager"] = ch341_gpio
+        radio = SX1262Radio(**combined_config)
 
         if hasattr(radio, "_initialized") and not radio._initialized:
             try:
@@ -460,7 +666,9 @@ def get_radio_for_board(board_config: dict):
 
         kiss_config = board_config.get("kiss")
         if not kiss_config:
-            raise ValueError("Missing 'kiss' section in configuration file for radio_type: kiss")
+            raise ValueError(
+                "Missing 'kiss' section in configuration file for radio_type: kiss"
+            )
 
         port = kiss_config.get("port")
         if not port:
@@ -475,7 +683,12 @@ def get_radio_for_board(board_config: dict):
             "coding_rate": int(radio_cfg.get("coding_rate", 8)),
             "tx_power": int(radio_cfg.get("tx_power", 14)),
         }
-        for key in ("tx_delay_ms", "kiss_persistence", "kiss_slottime_ms", "kiss_txtail_ms"):
+        for key in (
+            "tx_delay_ms",
+            "kiss_persistence",
+            "kiss_slottime_ms",
+            "kiss_txtail_ms",
+        ):
             if kiss_config.get(key) is not None:
                 radio_config[key] = int(kiss_config[key])
         if kiss_config.get("kiss_full_duplex") is not None:
@@ -495,26 +708,26 @@ def get_radio_for_board(board_config: dict):
 
         return radio
 
-    elif radio_type == "pymc_tcp":
+    elif radio_type == "modem_tcp":
         try:
             from openhop_core.hardware.tcp_radio import TCPLoRaRadio
         except ImportError:
             raise RuntimeError(
-                "pymc_tcp radio requires pyMC_core >= the release that includes "
-                "PR pyMC-dev/pyMC_core#68 (merged 2026-05-13). "
+                "modem_tcp radio requires openhop-core >= the release that includes "
+                "the openhop-core release with TCP modem support. "
                 "Reinstall the [hardware] extra to pick it up."
             ) from None
 
-        tcp_cfg = board_config.get("pymc_tcp")
+        tcp_cfg = board_config.get("modem_tcp")
         if not tcp_cfg:
             raise ValueError(
-                "Missing 'pymc_tcp' section in configuration file for radio_type: pymc_tcp"
+                "Missing 'modem_tcp' section in configuration file for radio_type: modem_tcp"
             )
 
         host = tcp_cfg.get("host")
         if not host:
             raise ValueError(
-                "Missing 'host' in 'pymc_tcp' section (modem hostname or LAN IP)"
+                "Missing 'host' in 'modem_tcp' section (modem hostname or LAN IP)"
             )
 
         radio_cfg = board_config.get("radio") or {}
@@ -537,30 +750,30 @@ def get_radio_for_board(board_config: dict):
         try:
             radio.begin()
         except Exception as e:
-            raise RuntimeError(f"Failed to initialize pymc_tcp radio: {e}") from e
+            raise RuntimeError(f"Failed to initialize modem_tcp radio: {e}") from e
 
-        return radio
+        return BaselineCrcCounterRadio(radio)
 
-    elif radio_type == "pymc_usb":
+    elif radio_type == "modem_usb":
         try:
             from openhop_core.hardware.usb_radio import USBLoRaRadio
         except ImportError:
             raise RuntimeError(
-                "pymc_usb radio requires pyMC_core >= the release that includes "
-                "PR pyMC-dev/pyMC_core#68 (merged 2026-05-13). "
+                "modem_usb radio requires openhop-core >= the release that includes "
+                "the openhop-core release with TCP modem support. "
                 "Reinstall the [hardware] extra to pick it up."
             ) from None
 
-        usb_cfg = board_config.get("pymc_usb")
+        usb_cfg = board_config.get("modem_usb")
         if not usb_cfg:
             raise ValueError(
-                "Missing 'pymc_usb' section in configuration file for radio_type: pymc_usb"
+                "Missing 'modem_usb' section in configuration file for radio_type: modem_usb"
             )
 
         port = usb_cfg.get("port")
         if not port:
             raise ValueError(
-                "Missing 'port' in 'pymc_usb' section (e.g. /dev/ttyACM0)"
+                "Missing 'port' in 'modem_usb' section (e.g. /dev/ttyACM0)"
             )
 
         radio_cfg = board_config.get("radio") or {}
@@ -581,9 +794,9 @@ def get_radio_for_board(board_config: dict):
         try:
             radio.begin()
         except Exception as e:
-            raise RuntimeError(f"Failed to initialize pymc_usb radio: {e}") from e
+            raise RuntimeError(f"Failed to initialize modem_usb radio: {e}") from e
 
-        return radio
+        return BaselineCrcCounterRadio(radio)
 
     elif radio_type == "wm1303":
         # WM1303 SenseCAP M1 backend (pyMC_WM1303 overlay)
@@ -608,5 +821,170 @@ def get_radio_for_board(board_config: dict):
 
     raise RuntimeError(
         f"Unknown radio type: {radio_type}. "
-        "Supported: sx1262, sx1262_ch341, kiss (or kiss-modem), pymc_tcp, pymc_usb, wm1303"
+        "Supported: sx1262, sx1262_ch341, kiss (or kiss-modem), modem_tcp, modem_usb"
     )
+
+
+def _merge_radio_entry(global_config: dict, entry: dict) -> dict:
+    """Build a board_config dict for one radios[] entry.
+
+    Entry may override radio_type and hardware sections; shared top-level
+    ``radio`` air settings are inherited unless the entry supplies its own.
+    """
+    if not isinstance(entry, dict):
+        raise ValueError("each radios[] entry must be a mapping")
+
+    radio_id = entry.get("id") or entry.get("radio_id")
+    if not radio_id:
+        raise ValueError("each radios[] entry requires an 'id'")
+
+    merged = dict(global_config)
+    for key in (
+        "radio_type",
+        "radio",
+        "sx1262",
+        "ch341",
+        "kiss",
+        "modem_tcp",
+        "modem_usb",
+    ):
+        if key in entry:
+            merged[key] = entry[key]
+
+    if "radio_type" not in entry and "radio_type" not in global_config:
+        raise ValueError(f"radios[] entry {radio_id!r} missing radio_type")
+
+    merged["_radio_id"] = str(radio_id)
+    # Hint for CH341 path: do not install process-global SPI/GPIO defaults.
+    merged["_ch341_per_instance"] = True
+    return merged
+
+
+def _apply_fabric_tx_mode(fabric, mode: str) -> None:
+    """Map simple tx_mode strings onto RFFabric.set_tx_selector.
+
+    Modes:
+    - default: always TX ``default_radio`` (or first registered).
+    - sticky:  TX on the radio that last received (reply on same band).
+    - bridge:  TX on a *different* radio than last RX (dual-freq backhaul).
+               Designed for two radios (local <-> link). With 3+ radios, uses
+               the first other id in registration order. With no prior RX,
+               falls back to default_radio.
+    """
+    mode_l = (mode or "default").strip().lower()
+    if mode_l in ("", "default"):
+        fabric.set_tx_selector(None)
+        return
+
+    if mode_l == "sticky":
+
+        def _sticky(_data: bytes):
+            rid = getattr(fabric, "_last_rx_radio_id", None)
+            if rid and rid in fabric.radios:
+                return rid
+            return fabric.default_radio_id
+
+        fabric.set_tx_selector(_sticky)
+        return
+
+    if mode_l == "bridge":
+
+        def _bridge(_data: bytes):
+            ids = list(fabric.radios.keys())
+            if len(ids) < 2:
+                return fabric.default_radio_id
+            last = getattr(fabric, "_last_rx_radio_id", None)
+            if last and last in fabric.radios:
+                for rid in ids:
+                    if rid != last:
+                        return rid
+            return fabric.default_radio_id
+
+        fabric.set_tx_selector(_bridge)
+        return
+
+    raise ValueError(
+        f"Unknown fabric.tx_mode={mode!r}. Supported: default, sticky, bridge"
+    )
+
+
+def build_radio_stack(config: dict):
+    """Build single- or multi-radio stack for the repeater.
+
+    - No ``radios:`` -> legacy ``get_radio_for_board(config)``.
+    - ``radios:`` list -> FabricRadio over N physical radios.
+    - ``fabric:`` knobs: default_radio, tx_mode (default|sticky|bridge), use_fabric.
+
+    Returns (radio, meta).
+    """
+    radios_cfg = config.get("radios")
+    fabric_cfg = config.get("fabric") if isinstance(config.get("fabric"), dict) else {}
+    use_fabric = bool(fabric_cfg.get("use_fabric", False))
+    tx_mode = str(fabric_cfg.get("tx_mode", "default"))
+    default_radio = fabric_cfg.get("default_radio") or fabric_cfg.get(
+        "default_radio_id"
+    )
+
+    meta = {
+        "mode": "single",
+        "radio_ids": [],
+        "default_radio": None,
+        "tx_mode": tx_mode,
+        "fabric": False,
+    }
+
+    if isinstance(radios_cfg, list) and len(radios_cfg) > 0:
+        try:
+            from openhop_core.rf_fabric import FabricRadio
+        except ImportError as exc:
+            raise RuntimeError(
+                "radios: requires openhop-core with RF Fabric support. "
+                "Install/upgrade openhop-core (Phase 2+)."
+            ) from exc
+
+        pairs = []
+        for entry in radios_cfg:
+            merged = _merge_radio_entry(config, entry)
+            rid = merged.pop("_radio_id")
+            physical = get_radio_for_board(merged)
+            pairs.append((physical, rid))
+
+        default_id = str(default_radio) if default_radio else pairs[0][1]
+        radio = FabricRadio(radios=pairs, default_radio_id=default_id)
+        _apply_fabric_tx_mode(radio.fabric, tx_mode)
+
+        meta.update(
+            {
+                "mode": "multi",
+                "radio_ids": [rid for _, rid in pairs],
+                "default_radio": default_id,
+                "fabric": True,
+            }
+        )
+        return radio, meta
+
+    physical = get_radio_for_board(config)
+    meta["radio_ids"] = ["radio0"]
+    meta["default_radio"] = "radio0"
+
+    if use_fabric:
+        try:
+            from openhop_core.rf_fabric import FabricRadio
+        except ImportError as exc:
+            raise RuntimeError(
+                "fabric.use_fabric requires openhop-core with RF Fabric support."
+            ) from exc
+        rid = str(default_radio or "radio0")
+        radio = FabricRadio(radio=physical, radio_id=rid, default_radio_id=rid)
+        _apply_fabric_tx_mode(radio.fabric, tx_mode)
+        meta.update(
+            {
+                "mode": "single_fabric",
+                "radio_ids": [rid],
+                "default_radio": rid,
+                "fabric": True,
+            }
+        )
+        return radio, meta
+
+    return physical, meta

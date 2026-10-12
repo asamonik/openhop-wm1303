@@ -6,6 +6,9 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import json
 import logging
+import re
+import queue
+import threading
 from pathlib import Path
 import sys
 import time
@@ -23,7 +26,8 @@ class LogStreamTests(unittest.TestCase):
         source = ROOT / 'overlay/pymc_repeater/repeater/web/http_server.py'
         cls = next(n for n in ast.parse(source.read_text()).body
                    if isinstance(n, ast.ClassDef) and n.name == 'LogBuffer')
-        namespace = dict(logging=logging, deque=deque, datetime=datetime, time=time)
+        namespace = dict(logging=logging, deque=deque, datetime=datetime, time=time,
+                         re=re, queue=queue, threading=threading)
         exec(compile(ast.Module(body=[cls], type_ignores=[]), str(source), 'exec'), namespace)
         buffer = namespace['LogBuffer'](max_lines=50)
         def emit(number):

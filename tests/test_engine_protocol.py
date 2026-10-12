@@ -71,7 +71,10 @@ def load_overlay(name):
         module("repeater.handler_helpers", **{name: object for name in (
             "AdvertHelper", "DiscoveryHelper", "LoginHelper", "PathHelper",
             "ProtocolRequestHelper", "TextHelper", "TraceHelper")})
-        module("repeater.identity_manager", IdentityManager=object)
+        module("repeater.identity_manager", IdentityManager=object, IdentitySpec=object)
+        module("repeater.logging_utils", normalize_log_level=lambda value: value)
+        module("repeater.region_map_builder", build_region_map=object, resolve_default_scope_key=object)
+        module("repeater.utils_packet", create_scoped_advert_packet=object)
         module("repeater.packet_router", PacketRouter=object)
         modules["repeater.room_lifecycle"] = load_overlay("room_lifecycle")
         module("repeater.web.http_server", HTTPStatsServer=object, _log_buffer=[])

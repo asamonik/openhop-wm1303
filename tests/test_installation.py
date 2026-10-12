@@ -105,6 +105,7 @@ fail() { printf '%s\\n' "$*" >&2; exit 1; }
 sudo() {
     shift 2
     printf '%s\\n' "$*" >> "$CALLS"
+    if [ "$1" = env ]; then shift 2; fi
     case "$1" in
         */bin/python3) return "$METADATA_STATUS" ;;
         */bin/pip) return "$PIP_STATUS" ;;
@@ -118,6 +119,7 @@ sudo() {
                                         env=dict(os.environ, REPEATER_UPDATED="false", FORCE_REBUILD="false",
                                                  REPO_DIR=str(root), VENV_DIR=str(root / "venv"), PI_USER="service-user",
                                                  LOG_FILE=str(root / "log"), CALLS=str(calls),
+                                                 REPEATER_TAG="1.1.4",
                                                  METADATA_STATUS=metadata_status, PIP_STATUS=pip_status))
                 self.assertEqual(result.returncode, int(pip_status), result.stderr)
                 commands = calls.read_text().splitlines()
@@ -450,7 +452,8 @@ PI_USER=test-user
 PI_GROUP=test-group
 LOG_FILE=/dev/null
 git() { case "$*" in 'rev-parse HEAD') printf 'oldcommit\n';; esac; }
-require_expected_origin() { :; }
+require_dependency_origin() { :; }
+checkout_dependency_revision() { printf 'fetch failed\n' >> "$CALL_LOG"; return 8; }
 chown() { :; }
 sudo() {
     printf '%s\n' "$*" >> "$CALL_LOG"
@@ -461,7 +464,7 @@ ok() { :; }
 warn() { :; }
 '''
             result = subprocess.run(
-                ["bash", "-eu", "-c", setup + function + '\nif update_repo "$1" dev https://github.com/HansvanMeer/pyMC_core.git; then :; fi', "test", str(root)],
+                ["bash", "-eu", "-c", setup + function + '\nif update_repo "$1" main https://github.com/openhop-dev/openhop_core.git deadbeef ""; then :; fi', "test", str(root)],
                 env=dict(os.environ, CALL_LOG=str(log)),
                 capture_output=True,
                 text=True,

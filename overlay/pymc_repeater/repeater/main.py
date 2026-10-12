@@ -23,7 +23,10 @@ from repeater.handler_helpers import (
     TextHelper,
     TraceHelper,
 )
-from repeater.identity_manager import IdentityManager
+from repeater.identity_manager import IdentityManager, IdentitySpec
+from repeater.logging_utils import normalize_log_level
+from repeater.region_map_builder import build_region_map, resolve_default_scope_key
+from repeater.utils_packet import create_scoped_advert_packet
 from repeater.packet_router import PacketRouter
 from repeater.room_lifecycle import RoomLifecycleMixin
 from repeater.web.http_server import HTTPStatsServer, _log_buffer
@@ -85,6 +88,7 @@ except Exception as _trace_setup_err:
 
 
 logger = logging.getLogger("RepeaterDaemon")
+_PERIODIC_ADVERT_STAGGER_SECONDS = 10.0
 
 
 class RepeaterDaemon(RoomLifecycleMixin):
@@ -104,6 +108,8 @@ class RepeaterDaemon(RoomLifecycleMixin):
         self.trace_helper = None
         self.advert_helper = None
         self.discovery_helper = None
+        self.neighbor_scope_helper = None
+        self.neighbors_publisher = None
         self.login_helper = None
         self.text_helper = None
         self.path_helper = None
@@ -125,15 +131,20 @@ class RepeaterDaemon(RoomLifecycleMixin):
         self._dispatcher_task = None
         self._service_tasks = []
         self._metrics_retention = None
+        self._region_map = None
+        self._periodic_advert_last_sent = {}
+        self._periodic_advert_retry_at = {}
+        self._room_server_specs = None
+        self._companion_specs = None
 
-        log_level = config.get("logging", {}).get("level", "INFO")
+        log_level = normalize_log_level(config.get("logging", {}).get("level", "INFO"))
         logging.basicConfig(
-            level=getattr(logging, log_level),
+            level=log_level,
             format=config.get("logging", {}).get("format"),
         )
 
         root_logger = logging.getLogger()
-        _log_buffer.setLevel(getattr(logging, log_level))
+        _log_buffer.setLevel(log_level)
         root_logger.addHandler(_log_buffer)
 
     async def initialize(self):
@@ -249,6 +260,7 @@ class RepeaterDaemon(RoomLifecycleMixin):
 
             local_identity = LocalIdentity(seed=identity_key)
             self.local_identity = local_identity
+            self._preflight_configured_local_identities(local_identity)
             self.dispatcher.local_identity = local_identity
 
             pubkey = local_identity.get_public_key()
@@ -281,6 +293,8 @@ class RepeaterDaemon(RoomLifecycleMixin):
                 send_advert_func=self.send_advert,
             )
             self.repeater_handler.policy_service = self.policy_service
+            self._init_region_map()
+            self.repeater_handler.periodic_advert_tick_func = self.run_periodic_advert_scheduler_tick
             bind_diagnostics = getattr(self.radio, "set_tx_diagnostic_callback", None)
             storage = self.repeater_handler.storage
             record_diagnostic = getattr(storage, "record_tx_diagnostic", None)
@@ -493,6 +507,23 @@ class RepeaterDaemon(RoomLifecycleMixin):
 
             # Load companion identities (CompanionBridge + frame server per companion)
             await self._load_companion_identities()
+
+            from repeater.handler_helpers.neighbor_scopes import NeighborScopeHelper
+            from repeater.neighbors_publisher import NeighborsPublisher
+            self.neighbor_scope_helper = NeighborScopeHelper(
+                local_identity=self.local_identity,
+                packet_injector=self.router.inject_packet,
+                airtime_manager=self.repeater_handler.airtime_mgr,
+                config=self.config,
+            )
+            self.neighbors_publisher = NeighborsPublisher(
+                config=self.config, local_identity=self.local_identity,
+                discovery_helper=self.discovery_helper, scope_helper=self.neighbor_scope_helper,
+                mqtt_handler_provider=lambda: getattr(self.repeater_handler.storage, 'mqtt_handler', None),
+                storage_provider=lambda: self.repeater_handler.storage,
+                self_scopes_fn=self.login_helper._format_region_names,
+            )
+            self.neighbors_publisher.start()
 
             # Subscribe to raw RX in pyMC_core so we can push PUSH_CODE_LOG_RX_DATA to companion clients.
             # Note: on WM1303 hardware the Dispatcher path is bypassed (BridgeEngine handles RF),
@@ -717,9 +748,10 @@ class RepeaterDaemon(RoomLifecycleMixin):
         companion_hash_str = f"0x{companion_hash:02x}"
         storage_key = storage_key_for_public_key(pubkey)
 
-        if (companion_hash in self.companion_bridges
-                or self.identity_manager.has_identity(companion_hash)
-                or companion_hash == self.local_hash):
+        registration_error = self.identity_manager.registration_error(name, identity, 'companion')
+        if registration_error:
+            raise ValueError(f'Cannot add companion: {registration_error}')
+        if companion_hash in self.companion_bridges:
             raise ValueError(f"Companion hash 0x{companion_hash:02x} conflicts with a local identity")
 
         sqlite_handler = None
@@ -754,6 +786,8 @@ class RepeaterDaemon(RoomLifecycleMixin):
             ),
             **bridge_limits,
         )
+        bridge.region_map = self._region_map
+        self.dispatcher.add_raw_packet_subscriber(bridge.note_flood_copy)
 
         if sqlite_handler:
             contact_rows = sqlite_handler.companion_load_contacts(storage_key)
@@ -1603,7 +1637,11 @@ class RepeaterDaemon(RoomLifecycleMixin):
             }
         return {}
 
-    async def send_advert(self, zero_hop: bool = False) -> bool:
+    async def send_advert(self, zero_hop: bool = False, *, advert_kind: str = None) -> bool:
+        if advert_kind is not None:
+            if advert_kind not in ('flood', 'direct'):
+                raise ValueError('advert_kind must be flood or direct')
+            zero_hop = advert_kind == 'direct'
 
         if not self.dispatcher or not self.local_identity:
             logger.error("Cannot send advert: dispatcher or identity not initialized")
@@ -1761,6 +1799,15 @@ class RepeaterDaemon(RoomLifecycleMixin):
     async def _finish_shutdown(self):
         """Stop background services and release hardware in dependency order."""
         cleanup_error = None
+        publisher = getattr(self, 'neighbors_publisher', None)
+        scope_helper = getattr(self, 'neighbor_scope_helper', None)
+        for worker, operation in ((publisher, 'stop'), (scope_helper, 'close')):
+            if worker is not None:
+                try:
+                    await getattr(worker, operation)()
+                except Exception as exc:
+                    logger.warning('Error stopping neighbour worker: %s', exc)
+                    cleanup_error = cleanup_error or exc
 
         # Room pushes own ACK waits and cursor updates. Stop them before a
         # potentially long HTTP drain, while SQLite and the radio still exist;
@@ -2309,6 +2356,410 @@ class RepeaterDaemon(RoomLifecycleMixin):
                 if run_error is None or isinstance(run_error, asyncio.CancelledError):
                     raise
                 logger.exception("Repeater cleanup also failed; preserving the original failure")
+
+
+    def _configured_identity_specs(self, identity_type: str) -> list[IdentitySpec]:
+        """Build valid configured local identities without registering them.
+
+        Invalid optional room-server or companion entries retain the existing
+        skip-and-log behavior.  Valid entries are returned for collision
+        validation before they can create helper, database, or TCP state.
+        """
+        from openhop_core import LocalIdentity
+
+        config_key = {
+            "room_server": "room_servers",
+            "companion": "companions",
+        }[identity_type]
+        configs = self.config.get("identities", {}).get(config_key) or []
+        specs = []
+
+        for identity_config in configs:
+            name = identity_config.get("name")
+            identity_key = identity_config.get("identity_key")
+            label = "Companion" if identity_type == "companion" else "Room server"
+
+            if not name or not identity_key:
+                logger.warning("Skipping %s config: missing name or identity_key", label.lower())
+                continue
+
+            try:
+                if isinstance(identity_key, str):
+                    key_hex = (
+                        normalize_companion_identity_key(identity_key)
+                        if identity_type == "companion"
+                        else identity_key
+                    )
+                    identity_key_bytes = bytes.fromhex(key_hex)
+                elif isinstance(identity_key, bytes):
+                    identity_key_bytes = identity_key
+                else:
+                    logger.error("%s '%s' identity_key has unknown type", label, name)
+                    continue
+            except ValueError as error:
+                logger.error("%s '%s' identity_key invalid hex: %s", label, name, error)
+                continue
+
+            if len(identity_key_bytes) not in (32, 64):
+                logger.error(
+                    "%s '%s' identity_key must be 32 bytes (hex) or 64 bytes "
+                    "(MeshCore firmware key)",
+                    label,
+                    name,
+                )
+                continue
+
+            try:
+                identity = LocalIdentity(seed=identity_key_bytes)
+            except Exception as error:
+                logger.error("Failed to create %s identity '%s': %s", label.lower(), name, error)
+                continue
+
+            specs.append(
+                IdentitySpec(
+                    name=name,
+                    identity=identity,
+                    config=identity_config,
+                    identity_type=identity_type,
+                )
+            )
+
+        return specs
+
+    def _preflight_configured_local_identities(self, local_identity) -> None:
+        """Validate every configured local identity before stateful setup begins.
+
+        The parsed room-server and companion specs are cached so the identity
+        loaders reuse them instead of re-parsing the config (and re-logging
+        every invalid entry). Collision rules live in
+        ``IdentityManager.validate_specs``; at this point the manager holds no
+        registered identities, so this is a pure batch check.
+        """
+        self._room_server_specs = self._configured_identity_specs("room_server")
+        self._companion_specs = self._configured_identity_specs("companion")
+        specs = [
+            IdentitySpec("repeater", local_identity, self.config, "repeater"),
+            *self._room_server_specs,
+            *self._companion_specs,
+        ]
+        manager = self.identity_manager or IdentityManager(self.config)
+        manager.validate_specs(specs)
+
+    def _get_sqlite_handler(self):
+        """Return the shared SQLiteHandler, or None if storage is unavailable."""
+        handler = self.repeater_handler
+        storage = getattr(handler, "storage", None) if handler else None
+        return getattr(storage, "sqlite_handler", None) if storage else None
+
+    def _init_region_map(self) -> None:
+        """Build the shared RegionMap, wire it into the dispatcher, and hook rebuilds.
+
+        Called once storage is available (right after ``repeater_handler`` is
+        created) and before any companion bridge is built, so the dispatcher and
+        every bridge share the same instance. Runtime region edits (transport_keys
+        CRUD from the CLI, web API, or Glass sync) fire the storage change hook,
+        which reruns ``refresh_region_map``.
+        """
+        sqlite_handler = self._get_sqlite_handler()
+        self._region_map = build_region_map(self.config, sqlite_handler)
+        if self.dispatcher is not None:
+            self.dispatcher.region_map = self._region_map
+        self.refresh_default_flood_scope()
+        if sqlite_handler is not None and hasattr(
+            sqlite_handler, "set_transport_keys_changed_callback"
+        ):
+            sqlite_handler.set_transport_keys_changed_callback(self.refresh_region_map)
+        logger.info(
+            "Region map initialized with %d served region(s)",
+            len(self._region_map.regions),
+        )
+
+    def refresh_default_flood_scope(self) -> None:
+        """Re-resolve ``mesh.default_region`` onto the dispatcher's default scope.
+
+        Firmware's ``simple_repeater`` holds a ``default_scope`` TransportKey and
+        answers the ``REPLY_SCOPE_DEFAULT`` row with
+        ``sendFloodScoped(default_scope, ...)``. Core expresses that key as
+        ``Dispatcher.default_flood_transport_key``, which its send-time resolver
+        reads for any flood packet no earlier layer decided -- so this is the half
+        that makes a reply whose request scope was unknowable go out scoped rather
+        than plain. See ``region_map_builder.resolve_default_scope_key`` for which
+        replies those are, and why plain ones die at hop 0.
+
+        Re-run from three places, because three separate things change the answer:
+        boot (``_init_region_map``), a transport_keys edit that adds, removes or
+        re-keys the default region (``refresh_region_map``), and a runtime
+        ``mesh.default_region`` change (``ConfigManager.live_update_daemon``).
+
+        Companion bridges are covered by this one assignment rather than needing
+        their own: a deferred reply from a bridge's login server reaches the shared
+        dispatcher unmarked, so it resolves here. That mirrors firmware
+        ``simple_room_server``, which keeps its own ``default_scope`` for exactly
+        these rows. A bridge's *outgoing requests* are a different matter -- those
+        take the bridge's own companion scope, which its app owns over the frame
+        protocol, as ``_prefs.default_scope_key`` does on a firmware companion.
+        """
+        if self.dispatcher is None:
+            return
+        region_map = self._region_map
+        if region_map is None:
+            self.dispatcher.default_flood_transport_key = None
+            return
+        try:
+            key = resolve_default_scope_key(self.config, region_map)
+        except Exception:
+            # Never let a bad default-region value break TX: an unresolved default
+            # is a plain flood, which is firmware's null-default row.
+            logger.debug("Failed to resolve mesh.default_region", exc_info=True)
+            key = None
+        self.dispatcher.default_flood_transport_key = key
+        logger.info(
+            "Default flood scope %s",
+            "resolved from mesh.default_region" if key else "unset (replies flood un-scoped)",
+        )
+
+    def refresh_region_map(self) -> None:
+        """Rebuild the RegionMap and reassign it to the dispatcher and all bridges.
+
+        Fires from the storage transport_keys change hook whenever a named region
+        is added, removed, or has its flood policy changed. A fresh instance is
+        reassigned (rather than mutated in place) because this may run in a
+        cherrypy worker thread while ``find_match`` iterates the map on the RX
+        hot path in the event-loop thread: an attribute rebind is atomic under
+        the GIL, so an in-flight match keeps using the old, fully-built map.
+        New bridges pick up the current instance at creation time.
+        """
+        new_map = build_region_map(self.config, self._get_sqlite_handler())
+        self._region_map = new_map
+        if self.dispatcher is not None:
+            self.dispatcher.region_map = new_map
+        for bridge in list(self.companion_bridges.values()):
+            try:
+                bridge.region_map = new_map
+            except Exception:
+                logger.debug("Failed to update region map on a companion bridge", exc_info=True)
+        # After the rebind, so the default resolves against the map that is now
+        # live: this hook is exactly where the default region gains, loses or
+        # re-keys its entry.
+        self.refresh_default_flood_scope()
+        logger.info("Region map refreshed with %d served region(s)", len(new_map.regions))
+
+    @staticmethod
+    def _coerce_interval_hours(raw_value, *, min_enabled: int = 1, max_enabled: int = 168) -> int:
+        """Parse interval hours from config, returning 0 when disabled/invalid."""
+        try:
+            hours = int(raw_value)
+        except (TypeError, ValueError):
+            return 0
+        if hours == 0:
+            return 0
+        if hours < min_enabled or hours > max_enabled:
+            return 0
+        return hours
+
+    def _periodic_advert_due(self, stream_key: str, interval_hours: int, now: float) -> bool:
+        """Return True when this stream should send now.
+
+        Streams start their cadence at daemon start, matching the historical
+        repeater timer behavior (first periodic advert after one full interval).
+        """
+        if interval_hours <= 0:
+            return False
+        if now < self._periodic_advert_retry_at.get(stream_key, 0):
+            return False
+        interval_seconds = float(interval_hours) * 3600.0
+        last_sent = self._periodic_advert_last_sent.setdefault(stream_key, now)
+        return (now - last_sent) >= interval_seconds
+
+    async def _send_room_server_advert(
+        self,
+        *,
+        room_name: str,
+        identity,
+        identity_config: dict,
+        advert_kind: str,
+    ) -> bool:
+        """Send an advert packet for a room-server identity."""
+        if not self.dispatcher:
+            logger.error("Cannot send room advert: dispatcher not initialized")
+            return False
+
+        try:
+            from openhop_core.protocol.constants import (
+                ADVERT_FLAG_HAS_NAME,
+                ADVERT_FLAG_IS_ROOM_SERVER,
+            )
+
+            settings = (
+                identity_config.get("settings", {}) if isinstance(identity_config, dict) else {}
+            )
+            node_name = settings.get("node_name", settings.get("room_name", room_name))
+            latitude = settings.get("latitude", 0.0)
+            longitude = settings.get("longitude", 0.0)
+            flags = ADVERT_FLAG_IS_ROOM_SERVER | ADVERT_FLAG_HAS_NAME
+
+            mesh_config = self.config.get("mesh", {})
+            default_region = mesh_config.get("default_region")
+            advert_route_type = "direct" if advert_kind == "direct" else "flood"
+            packet, scoped_region_name = create_scoped_advert_packet(
+                local_identity=identity,
+                node_name=node_name,
+                latitude=latitude,
+                longitude=longitude,
+                flags=flags,
+                default_region=default_region,
+                scope_label="room server advert",
+                route_type=advert_route_type,
+            )
+
+            injector = getattr(getattr(self, "router", None), "inject_packet", None)
+            if callable(injector):
+                sent = await injector(packet, wait_for_ack=False)
+            else:
+                sent = await self.dispatcher.send_packet(packet, wait_for_ack=False)
+
+            if not sent:
+                logger.error("Failed to send room server advert: packet transmission was rejected")
+                return False
+
+            if not callable(injector) and self.repeater_handler:
+                self.repeater_handler.mark_seen(packet)
+                logger.debug("Marked room server advert '%s' as seen in duplicate cache", node_name)
+
+            logger.info(
+                "Sent %s room advert (%s packet) '%s' at (%.6f, %.6f)",
+                advert_kind,
+                advert_route_type,
+                node_name,
+                latitude,
+                longitude,
+            )
+            if scoped_region_name:
+                logger.info("Room server advert scoped to default region '%s'", scoped_region_name)
+            return True
+        except Exception as e:
+            logger.error("Failed to send room server advert: %s", e, exc_info=True)
+            return False
+
+    async def run_periodic_advert_scheduler_tick(self) -> None:
+        """Run one scheduler tick for repeater + room-server advert intervals.
+
+        Called from RepeaterHandler's existing background loop every 5 seconds.
+        """
+        mode = self.config.get("repeater", {}).get("mode", "forward")
+        if mode == "no_tx":
+            return
+
+        now = time.time()
+        scheduled = []
+
+        repeater_cfg = self.config.get("repeater", {}) if isinstance(self.config, dict) else {}
+        repeater_flood_hours = self._coerce_interval_hours(
+            repeater_cfg.get("send_advert_interval_hours", 10),
+            min_enabled=3,
+        )
+        if self._periodic_advert_due("repeater:flood", repeater_flood_hours, now):
+            scheduled.append(
+                {
+                    "key": "repeater:flood",
+                    "label": "repeater flood advert",
+                    "sender": lambda: self.send_advert(advert_kind="flood"),
+                }
+            )
+
+        repeater_direct_hours = self._coerce_interval_hours(
+            repeater_cfg.get("direct_advert_interval_hours", 0),
+            min_enabled=1,
+        )
+        if self._periodic_advert_due("repeater:direct", repeater_direct_hours, now):
+            scheduled.append(
+                {
+                    "key": "repeater:direct",
+                    "label": "repeater direct advert",
+                    "sender": lambda: self.send_advert(advert_kind="direct"),
+                }
+            )
+
+        if self.identity_manager is not None:
+            room_identities = sorted(
+                self.identity_manager.get_identities_by_type("room_server"),
+                key=lambda item: str(item[0]).lower(),
+            )
+            for room_name, room_identity, room_cfg in room_identities:
+                settings = room_cfg.get("settings", {}) if isinstance(room_cfg, dict) else {}
+                room_flood_hours = self._coerce_interval_hours(
+                    settings.get("flood_advert_interval_hours", 0),
+                    min_enabled=1,
+                )
+                room_flood_key = f"room:{room_name}:flood"
+                if self._periodic_advert_due(room_flood_key, room_flood_hours, now):
+                    scheduled.append(
+                        {
+                            "key": room_flood_key,
+                            "label": f"room '{room_name}' flood advert",
+                            "sender": (
+                                lambda n=room_name, i=room_identity, c=room_cfg: (
+                                    self._send_room_server_advert(
+                                        room_name=n,
+                                        identity=i,
+                                        identity_config=c,
+                                        advert_kind="flood",
+                                    )
+                                )
+                            ),
+                        }
+                    )
+
+                room_direct_hours = self._coerce_interval_hours(
+                    settings.get("direct_advert_interval_hours", 0),
+                    min_enabled=1,
+                )
+                room_direct_key = f"room:{room_name}:direct"
+                if self._periodic_advert_due(room_direct_key, room_direct_hours, now):
+                    scheduled.append(
+                        {
+                            "key": room_direct_key,
+                            "label": f"room '{room_name}' direct advert",
+                            "sender": (
+                                lambda n=room_name, i=room_identity, c=room_cfg: (
+                                    self._send_room_server_advert(
+                                        room_name=n,
+                                        identity=i,
+                                        identity_config=c,
+                                        advert_kind="direct",
+                                    )
+                                )
+                            ),
+                        }
+                    )
+
+        if not scheduled:
+            return
+
+        logger.info("Periodic advert scheduler: %d advert(s) due", len(scheduled))
+
+        for idx, item in enumerate(scheduled):
+            if idx > 0:
+                await asyncio.sleep(_PERIODIC_ADVERT_STAGGER_SECONDS)
+
+            stream_key = item["key"]
+            try:
+                ok = await item["sender"]()
+                if ok:
+                    self._periodic_advert_last_sent[stream_key] = time.time()
+                    self._periodic_advert_retry_at.pop(stream_key, None)
+                    logger.info("Periodic advert sent: %s", item["label"])
+                else:
+                    self._periodic_advert_retry_at[stream_key] = time.time() + 60
+                    logger.warning("Periodic advert failed: %s", item["label"])
+            except Exception as exc:
+                self._periodic_advert_retry_at[stream_key] = time.time() + 60
+                logger.error(
+                    "Periodic advert raised exception for %s: %s",
+                    item["label"],
+                    exc,
+                    exc_info=True,
+                )
 
 
 def main():

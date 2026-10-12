@@ -22,6 +22,7 @@ import yaml
 from repeater.data_acquisition.sqlite_handler import SQLiteHandler
 from repeater.web.api_endpoints import APIEndpoints
 from repeater.web.auth.cherrypy_tool import register_require_auth_tool
+from repeater.web.http_server import _cors_response_headers
 
 
 class QuietRequestHandler(WSGIRequestHandler):
@@ -54,7 +55,11 @@ class AnalyticsHTTPTests(unittest.TestCase):
             "token_manager": SimpleNamespace(verify_token=lambda token: None),
         })
         register_require_auth_tool()
-        cherrypy.tree.mount(self.api, "/api", {"/": {"tools.require_auth.on": True}})
+        cherrypy.tree.mount(self.api, "/api", {"/": {
+            "tools.require_auth.on": True,
+            "tools.response_headers.on": True,
+            "tools.response_headers.headers": _cors_response_headers(),
+        }})
 
         def application(environ, start_response):
             try:
@@ -94,7 +99,7 @@ class AnalyticsHTTPTests(unittest.TestCase):
             response = error
         with response:
             status, headers, raw = response.status, response.headers, response.read()
-        payload = json.loads(raw) if headers.get_content_type() == "application/json" else raw
+        payload = json.loads(raw) if raw and headers.get_content_type() == "application/json" else raw
         return status, headers, payload
 
     def test_lbt_http_summary_errors_preflight_and_auth(self):
@@ -128,9 +133,9 @@ class AnalyticsHTTPTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertIn("Invalid parameter format", result["error"])
         status, headers, result = self.request("/api/lbt_diagnostics", "OPTIONS", authenticated=False)
-        self.assertEqual(status, 200)
+        self.assertIn(status, (200, 204))
         self.assertEqual(headers["Access-Control-Allow-Origin"], "*")
-        self.assertEqual(result, "")
+        self.assertIn(result, ("", b""))  # Newer auth tools short-circuit preflight.
         self.assertEqual(self.request("/api/lbt_diagnostics", authenticated=False)[0], 401)
 
     def test_policy_http_read_validate_save_and_group_json_bodies(self):

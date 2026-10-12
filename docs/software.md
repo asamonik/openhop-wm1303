@@ -16,18 +16,18 @@ The software is built from upstream repositories with overlay files applied duri
 
 | Repository | Branch | Role |
 |-----------|--------|------|
-| `HansvanMeer/sx1302_hal` | HAL v2.10 | Concentrator HAL + packet forwarder |
-| `openhop-dev/openhop_core` (upstream) / `HansvanMeer/pyMC_core` (fork) | `main` / `dev` | MeshCore core library |
-| `openhop-dev/openhop_repeater` (upstream) / `HansvanMeer/pyMC_Repeater` (fork) | `main` / `dev` | Repeater application |
+| `Lora-net/sx1302_hal` | pinned HAL 2.1.0 revision | Concentrator HAL + packet forwarder |
+| `openhop-dev/openhop_core` | pinned `v1.1.3` | MeshCore core library |
+| `openhop-dev/openhop_repeater` | pinned `1.1.4` | Repeater application and matching dashboard |
 | `HansvanMeer/pyMC_WM1303` | `main` | Overlays, scripts, config, docs |
 
-Overlay files replace or extend specific source files in the upstream repos without modifying the forks directly. See [`repositories.md`](./repositories.md).
+Overlay files replace or extend local dependency sources without changing the published repositories. Pins are shared by install and upgrade through [`config/dependencies.conf`](../config/dependencies.conf). See [`repositories.md`](./repositories.md).
 
 ## C Layer — HAL and Packet Forwarder
 
 ### libloragw (SX1302 HAL)
 
-Modified HAL library (v2.10 base). Key overlay changes:
+Modified HAL library (2.1.0 base). The selected canonical revision is identical to the previous HAL fork, so changing its source URL does not change radio behavior. Key overlay changes:
 
 | File | Changes |
 |------|---------|
