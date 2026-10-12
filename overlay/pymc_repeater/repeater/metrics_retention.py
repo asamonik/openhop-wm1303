@@ -27,6 +27,9 @@ import math
 
 from contextlib import contextmanager as _contextmanager
 
+from repeater.metrics_schema import DOWNSAMPLE_TABLES
+
+
 class _SharedConn:
     """Module-level shared SQLite connection with thread-safe access."""
 
@@ -165,141 +168,6 @@ DELETE_ONLY_TABLES: List[Tuple[str, str, str]] = [
     ("repeater.db",         "sx1261_health_events",    "timestamp"),
     ("spectrum_history.db", "spectrum_scans",          "timestamp"),
 ]
-
-# Tables that get tiered downsampling.
-# (db_name, source_table, ts_col, aggregation_config)
-# The aggregation_config defines how to aggregate each table.
-DOWNSAMPLE_TABLES: List[Dict] = [
-    {
-        "db": "repeater.db",
-        "table": "packet_metrics",
-        "ts_col": "timestamp",
-        "group_cols": ["channel_id", "direction"],
-        "agg_cols": [
-            ("COUNT(*)",        "sample_count"),
-            ("AVG(rssi)",       "avg_rssi"),
-            ("MIN(rssi)",       "min_rssi"),
-            ("MAX(rssi)",       "max_rssi"),
-            ("AVG(snr)",        "avg_snr"),
-            ("MIN(snr)",        "min_snr"),
-            ("MAX(snr)",        "max_snr"),
-            ("AVG(airtime_ms)", "avg_airtime_ms"),
-            ("SUM(airtime_ms)", "total_airtime_ms"),
-            ("SUM(length)",     "total_bytes"),
-            ("AVG(hop_count)",  "avg_hop_count"),
-            ("SUM(CASE WHEN crc_ok=0 THEN 1 ELSE 0 END)", "crc_error_count"),
-        ],
-    },
-    {
-        "db": "repeater.db",
-        "table": "dedup_events",
-        "ts_col": "ts",
-        "group_cols": ["event_type", "source"],
-        "agg_cols": [
-            ("COUNT(*)",                "sample_count"),
-            ("COUNT(DISTINCT pkt_hash)", "unique_packets"),
-            ("SUM(pkt_size)",           "total_bytes"),
-        ],
-    },
-    {
-        "db": "repeater.db",
-        "table": "noise_floor_history",
-        "ts_col": "timestamp",
-        "group_cols": ["channel_id"],
-        "agg_cols": [
-            ("COUNT(*)",                    "sample_count"),
-            ("AVG(noise_floor_dbm)",        "avg_noise_floor_dbm"),
-            ("MIN(noise_floor_dbm)",        "min_noise_floor_dbm"),
-            ("MAX(noise_floor_dbm)",        "max_noise_floor_dbm"),
-            ("SUM(samples_collected)",      "total_samples_collected"),
-            ("SUM(samples_accepted)",       "total_samples_accepted"),
-            ("MIN(min_rssi)",               "min_rssi"),
-            ("MAX(max_rssi)",               "max_rssi"),
-        ],
-    },
-    {
-        "db": "repeater.db",
-        "table": "cad_events",
-        "ts_col": "timestamp",
-        "group_cols": ["channel_id"],
-        "agg_cols": [
-            ("COUNT(*)",            "sample_count"),
-            ("SUM(cad_clear)",      "total_cad_clear"),
-            ("SUM(cad_detected)",   "total_cad_detected"),
-            ("SUM(cad_skipped)",    "total_cad_skipped"),
-            ("SUM(cad_hw_clear)",   "total_cad_hw_clear"),
-            ("SUM(cad_hw_detected)", "total_cad_hw_detected"),
-            ("SUM(cad_sw_clear)",   "total_cad_sw_clear"),
-            ("SUM(cad_sw_detected)", "total_cad_sw_detected"),
-            ("SUM(cad_busy_events)",      "total_cad_busy_events"),
-        ],
-    },
-    {
-        "db": "repeater.db",
-        "table": "channel_stats_history",
-        "ts_col": "timestamp",
-        "group_cols": ["channel_id"],
-        "agg_cols": [
-            ("COUNT(*)",                "sample_count"),
-            # Legacy schema only: new cumulative snapshots are NOT rolled
-            # up. MAX-MIN loses transitions between buckets and resets.
-            # Keep raw snapshots (~69,120 rows at six channels/eight days)
-            # and calculate reset-aware differences when querying.
-            ("MAX(rx_count) - MIN(rx_count)",             "total_rx_count"),
-            ("AVG(avg_rssi)",                             "avg_rssi"),
-            ("AVG(avg_snr)",                              "avg_snr"),
-            ("MAX(tx_count) - MIN(tx_count)",             "total_tx_count"),
-            ("MAX(tx_failed) - MIN(tx_failed)",           "total_tx_failed"),
-            ("MAX(tx_airtime_ms) - MIN(tx_airtime_ms)",   "total_tx_airtime_ms"),
-            ("MAX(tx_bytes) - MIN(tx_bytes)",             "total_tx_bytes"),
-            ("MAX(lbt_blocked) - MIN(lbt_blocked)",       "total_lbt_blocked"),
-            ("MAX(lbt_passed) - MIN(lbt_passed)",         "total_lbt_passed"),
-            ("AVG(noise_floor_dbm)",                      "avg_noise_floor_dbm"),
-            ("AVG(tx_noisefloor_dbm)",                    "avg_tx_noisefloor_dbm"),
-            ("AVG(lbt_last_rssi)",                        "avg_lbt_last_rssi"),
-        ],
-    },
-    {
-        "db": "repeater.db",
-        "table": "packet_activity",
-        "ts_col": "timestamp",
-        "group_cols": ["channel_id"],
-        "agg_cols": [
-            ("COUNT(*)",        "sample_count"),
-            ("SUM(rx_count)",   "total_rx_count"),
-            ("SUM(tx_count)",   "total_tx_count"),
-        ],
-    },
-    {
-        "db": "repeater.db",
-        "table": "crc_error_rate",
-        "ts_col": "timestamp",
-        "group_cols": ["channel_id"],
-        "agg_cols": [
-            ("COUNT(*)",                "sample_count"),
-            ("SUM(crc_error_count)",    "total_crc_errors"),
-            ("SUM(crc_disabled_count)", "total_crc_disabled"),
-        ],
-    },
-    {
-        "db": "repeater.db",
-        "table": "origin_channel_stats",
-        "ts_col": "timestamp",
-        "group_cols": ["channel_id"],
-        "agg_cols": [
-            ("COUNT(*)",    "sample_count"),
-            ("SUM(count)",  "total_count"),
-        ],
-    },
-]
-
-# AVG ignores NULL, so every average needs its own denominator. COUNT(*)
-# alone cannot preserve nullable averages when partial buckets are merged.
-for _cfg in DOWNSAMPLE_TABLES:
-    _cfg["agg_cols"] += [
-        (f"COUNT({expr[4:-1]})", f"{alias}_count")
-        for expr, alias in _cfg["agg_cols"] if expr.startswith("AVG(")
-    ]
 
 DB_DIR = "/var/lib/openhop_repeater"
 

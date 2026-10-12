@@ -125,10 +125,7 @@ class TraceCollector:
                 if pkt_hash in self._active_key or pkt_hash in self._traces:
                     seq += 1
                 self._seq[pkt_hash] = seq
-                if seq == 0:
-                    lookup_key = pkt_hash
-                else:
-                    lookup_key = f"{pkt_hash}~{seq}"
+                lookup_key = pkt_hash if seq == 0 else f"{pkt_hash}~{seq}"
                 self._active_key[pkt_hash] = lookup_key
 
                 # New trace entry
@@ -169,29 +166,21 @@ class TraceCollector:
             # Update last-event timestamp
             trace['_mono_last'] = real_mono
 
-            # Update trace metadata
-            if channel and not trace['channel']:
-                trace['channel'] = channel
-            if pkt_type and not trace['type']:
-                trace['type'] = pkt_type
-
-            # v2.4.7+: backfill MeshCore metadata if earlier event didn't have it
-            if pkt_hash_full and not trace.get('pkt_hash_full'):
-                trace['pkt_hash_full'] = pkt_hash_full
-            if hops is not None and not trace.get('hops'):
-                trace['hops'] = hops
-            if hash_size is not None and not trace.get('hash_size'):
-                trace['hash_size'] = hash_size
-            if src_hash and not trace.get('src_hash'):
-                trace['src_hash'] = src_hash
-            if dst_hash and not trace.get('dst_hash'):
-                trace['dst_hash'] = dst_hash
-            if path_hashes and not trace.get('path_hashes'):
-                trace['path_hashes'] = path_hashes
-            if payload_hex and not trace.get('payload_hex'):
-                trace['payload_hex'] = payload_hex
-            if payload_full_size is not None and not trace.get('payload_full_size'):
-                trace['payload_full_size'] = payload_full_size
+            # Backfill metadata when earlier events didn't provide it.
+            for key, value in (
+                ('channel', channel), ('type', pkt_type),
+                ('pkt_hash_full', pkt_hash_full), ('src_hash', src_hash),
+                ('dst_hash', dst_hash), ('path_hashes', path_hashes),
+                ('payload_hex', payload_hex),
+            ):
+                if value and not trace.get(key):
+                    trace[key] = value
+            for key, value in (
+                ('hops', hops), ('hash_size', hash_size),
+                ('payload_full_size', payload_full_size),
+            ):
+                if value is not None and not trace.get(key):
+                    trace[key] = value
 
             # Compute elapsed from first step
             elapsed_ms = round((display_mono - trace['_mono_first']) * 1000, 1)

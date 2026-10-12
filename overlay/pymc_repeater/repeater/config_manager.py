@@ -57,11 +57,8 @@ class ConfigManager:
     def _get_live_radio_snapshot(self) -> Dict[str, Any]:
         radio_cfg = self.config.get("radio", {}) or {}
         return {
-            "frequency": int(radio_cfg.get("frequency", 0) or 0),
-            "bandwidth": int(radio_cfg.get("bandwidth", 0) or 0),
-            "spreading_factor": int(radio_cfg.get("spreading_factor", 0) or 0),
-            "coding_rate": int(radio_cfg.get("coding_rate", 0) or 0),
-            "tx_power": int(radio_cfg.get("tx_power", 0) or 0),
+            key: int(radio_cfg.get(key, 0) or 0)
+            for key in ("frequency", "bandwidth", "spreading_factor", "coding_rate", "tx_power")
         }
 
     def _sync_repeater_handler_radio_config(self, radio_cfg: Dict[str, Any]) -> None:
@@ -243,17 +240,8 @@ class ConfigManager:
         )
         level = normalize_log_level(logging_cfg.get("level", "INFO"))
 
-        root_logger = logging.getLogger()
-        root_logger.setLevel(level)
-
-        repeater_logger = logging.getLogger("RepeaterDaemon")
-        repeater_logger.setLevel(level)
-
-        sx1262_logger = logging.getLogger("SX1262_wrapper")
-        sx1262_logger.setLevel(level)
-
-        mqtt_logger = logging.getLogger("MQTTHandler")
-        mqtt_logger.setLevel(level)
+        for name in (None, "RepeaterDaemon", "SX1262_wrapper", "MQTTHandler"):
+            logging.getLogger(name).setLevel(level)
 
         buffer = getattr(self.daemon, "_log_buffer", None)
         if buffer is not None:
@@ -332,21 +320,15 @@ class ConfigManager:
 
             # Update each section
             for section in sections:
-                if section in self.config:
-                    if section not in daemon_config:
-                        daemon_config[section] = {}
+                if section not in self.config:
+                    continue
 
-                    # Deep copy the section to avoid reference issues
-                    if replace_sections:
-                        daemon_config[section] = deepcopy(self.config[section])
-                    elif isinstance(self.config[section], dict):
-                        if not isinstance(daemon_config[section], dict):
-                            daemon_config[section] = {}
-                        self._merge_config(daemon_config[section], self.config[section])
-                    else:
-                        daemon_config[section] = deepcopy(self.config[section])
+                if replace_sections:
+                    daemon_config[section] = deepcopy(self.config[section])
+                else:
+                    self._merge_config(daemon_config, {section: self.config[section]})
 
-                    logger.debug(f"Live updated daemon config section: {section}")
+                logger.debug(f"Live updated daemon config section: {section}")
 
             logger.info(f"Live updated daemon config sections: {', '.join(sections)}")
 

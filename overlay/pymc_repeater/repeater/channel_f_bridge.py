@@ -27,7 +27,7 @@ import asyncio
 import json
 import logging
 from repeater.bridge_engine import _stable_hash
-from repeater.web.packet_trace import trace_event as _trace
+from repeater.channel_bridge_tx import send_channel_packet
 from openhop_core.paths import resolve_config_path  # WM1303 v2.7: central config-path helper
 
 logger = logging.getLogger(__name__)
@@ -70,114 +70,11 @@ class ChannelFBridge:
         self._loop = None  # stored in run() for cross-thread async injection
 
     async def _tx_handler(self, data: bytes):
-        """Handle packets forwarded TO Channel F - TX via HAL chan_Lora_std.
-
-        Routes through the SAME TXQueueManager / GlobalTXScheduler /
-        _send_pull_resp path as all other channels, so by passing
-        `trace_hash=pkt_hash8` into `queue.enqueue()` the backend emits the
-        full set of enriched trace events (tx_noisefloor, cad_start,
-        lbt_check, cad_check, rf_tx_start, rf_tx_end, sx1261_rx_restart,
-        tx_ack) automatically. This makes channel_f traces visually identical
-        to other channels in the Tracing UI.
-        """
-        pkt_hash8 = _stable_hash(data)[:8]
-        try:
-            _friendly = self.bridge._dn(CHANNEL_F_TX_CHANNEL) if self.bridge else CHANNEL_F_TX_CHANNEL
-        except Exception:
-            _friendly = CHANNEL_F_TX_CHANNEL
-        if self.backend is None:
-            self.tx_errors += 1
-            logger.warning('Channel F TX: no backend, cannot send %d bytes', len(data))
-            _trace(pkt_hash8, 'tx_send', channel=CHANNEL_F_TX_CHANNEL,
-                   detail='TX FAILED on %s: no backend available' % _friendly,
-                   status='error')
-            return {'ok': False, 'error': 'no_backend'}
-
-        try:
-            if hasattr(self.backend, '_tx_queue_manager') and self.backend._tx_queue_manager:
-                queue = self.backend._tx_queue_manager.queues.get(CHANNEL_F_TX_CHANNEL)
-                if queue:
-                    result = await queue.enqueue(data, trace_hash=pkt_hash8)
-                    if result.get('ok'):
-                        self.tx_packets += 1
-                        logger.info(
-                            'Channel F TX: sent %d bytes via HAL '
-                            '(send=%.1fms, airtime=%.1fms)',
-                            len(data),
-                            result.get('send_ms', 0),
-                            result.get('airtime_ms', 0)
-                        )
-                        try:
-                            _detail = self.bridge._format_tx_result(
-                                result, _friendly, 'Repeater \u2192 %s' % _friendly)
-                        except Exception:
-                            _send_ms = result.get('send_ms', 0)
-                            _airtime_ms = result.get('airtime_ms', 0)
-                            _queue_wait = result.get('queue_wait_ms', 0)
-                            _detail = ('TX on %s\n  Send: %.1fms\n  Airtime: %.1fms'
-                                       '\n  Queue wait: %.1fms' % (
-                                           _friendly, _send_ms, _airtime_ms, _queue_wait))
-                        _trace(pkt_hash8, 'tx_send', channel=CHANNEL_F_TX_CHANNEL,
-                               detail=_detail,
-                               status='ok')
-                        # Per-packet TX metric for spectrum-tab charts.
-                        try:
-                            _handler = getattr(self.bridge, '_sqlite_handler', None) if self.bridge else None
-                            if _handler is not None:
-                                import time as _t
-                                _handler.store_packet_metric({
-                                    'timestamp': _t.time(),
-                                    'channel_id': str(CHANNEL_F_TX_CHANNEL),
-                                    'direction': 'tx',
-                                    'length': int(len(data)),
-                                    'hop_count': None,
-                                    'crc_ok': True,
-                                    'airtime_ms': float(result.get('airtime_ms', 0) or 0),
-                                    'wait_time_ms': float(result.get('queue_wait_ms', 0) or 0),
-                                    'pkt_hash': pkt_hash8 if isinstance(pkt_hash8, str) else None,
-                                })
-                        except Exception as _pm_e:
-                            logger.warning('packet_metric TX(ch_f) store failed: %s', _pm_e)
-                    else:
-                        self.tx_errors += 1
-                        logger.warning(
-                            'Channel F TX FAIL: %s (%d bytes)',
-                            result.get('error', 'unknown'), len(data)
-                        )
-                        _trace(pkt_hash8, 'tx_send', channel=CHANNEL_F_TX_CHANNEL,
-                               detail='TX FAILED on %s: %s' % (_friendly, result.get('error', 'unknown')),
-                               status='error')
-                    return result
-                else:
-                    logger.warning('Channel F TX: no channel_f queue found in TXQueueManager')
-            else:
-                logger.warning('Channel F TX: no TXQueueManager on backend')
-
-            # Fallback: backend.send() with UI-configured tx_power
-            _ui = _load_channel_f_ui()
-            _tx_power = int(_ui.get('tx_power', 14))
-            meta = await self.backend.send(CHANNEL_F_TX_CHANNEL, data, tx_power=_tx_power, trace_hash=pkt_hash8)
-            if not isinstance(meta, dict) or not meta.get('ok'):
-                self.tx_errors += 1
-                result = meta if isinstance(meta, dict) else {'ok': False, 'error': 'invalid_send_result'}
-                _trace(pkt_hash8, 'tx_send', channel=CHANNEL_F_TX_CHANNEL,
-                       detail='TX FAILED on %s: %s' % (_friendly, result.get('error', 'unknown')),
-                       status='error')
-                return result
-            self.tx_packets += 1
-            logger.info('Channel F TX: sent %d bytes via backend.send() (tx_power=%d)',
-                       len(data), _tx_power)
-            _trace(pkt_hash8, 'tx_send', channel=CHANNEL_F_TX_CHANNEL,
-                   detail='TX on %s via backend.send() (tx_power=%d dBm, %d bytes)' % (_friendly, _tx_power, len(data)),
-                   status='ok')
-            return meta
-        except Exception as e:
-            self.tx_errors += 1
-            logger.error('Channel F TX error: %s', e)
-            _trace(pkt_hash8, 'tx_send', channel=CHANNEL_F_TX_CHANNEL,
-                   detail='TX FAILED on %s: %s' % (_friendly, e),
-                   status='error')
-            return {'ok': False, 'error': str(e)}
+        """Transmit on Channel F through the shared scheduler or backend fallback."""
+        return await send_channel_packet(
+            self, data, channel=CHANNEL_F_TX_CHANNEL,
+            load_ui=_load_channel_f_ui, default_tx_power=14, logger=logger,
+        )
 
     def _rx_from_backend(self, payload, rssi=0, snr=0.0):
         """Callback invoked by WM1303Backend when a chan_Lora_std packet is matched.

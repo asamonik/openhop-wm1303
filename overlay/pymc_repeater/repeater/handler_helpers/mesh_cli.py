@@ -11,6 +11,25 @@ from openhop_core.paths import (
 
 logger = logging.getLogger(__name__)
 
+# CLI parameter -> configuration section, key, default for unformatted values.
+_GET_CONFIG_FIELDS = {
+    "af": ("repeater", "airtime_factor", 1.0),
+    "lat": ("repeater", "latitude", 0.0),
+    "lon": ("repeater", "longitude", 0.0),
+    "tx": ("radio", "tx_power", 20),
+    "advert.interval": ("repeater", "advert_interval_minutes", 120),
+    "flood.advert.interval": ("repeater", "send_advert_interval_hours", 10),
+    "flood.max": ("repeater", "max_flood_hops", 64),
+    "rxdelay": ("delays", "rx_delay_base", 0.0),
+    "txdelay": ("delays", "tx_delay_factor", 1.0),
+    "direct.txdelay": ("delays", "direct_tx_delay_factor", 0.5),
+    "multi.acks": ("repeater", "multi_acks", 0),
+    "int.thresh": ("repeater", "interference_threshold", -120),
+    "agc.reset.interval": ("repeater", "agc_reset_interval", 0),
+    "path.hash.mode": ("mesh", "path_hash_mode", 0),
+    "loop.detect": ("mesh", "loop_detect", "minimal"),
+}
+
 
 # ==================== WM1303 overlay additions ====================
 def _build_dynamic_owner_info(max_len: int = 115) -> str:
@@ -555,25 +574,18 @@ class MeshCLI:
         if param in ("radio", "freq", "tx") and self.config.get("radio_type") == "wm1303":
             return "Error: Multichannel radio; view channels A-F in WM1303 Manager"
 
-        if param == "af":
-            af = self.repeater_config.get("airtime_factor", 1.0)
-            return f"> {af}"
+        if param in _GET_CONFIG_FIELDS:
+            section, key, default = _GET_CONFIG_FIELDS[param]
+            config = self.repeater_config if section == "repeater" else self.config.get(section, {})
+            return f"> {config.get(key, default)}"
 
-        elif param == "name":
+        if param == "name":
             name = self.repeater_config.get("node_name", self.repeater_config.get("name", "Unknown"))
             return f"> {name}"
 
         elif param == "repeat":
             mode = self.repeater_config.get("mode", "forward")
             return f"> {'on' if mode == 'forward' else 'off'}"
-
-        elif param == "lat":
-            lat = self.repeater_config.get("latitude", 0.0)
-            return f"> {lat}"
-
-        elif param == "lon":
-            lon = self.repeater_config.get("longitude", 0.0)
-            return f"> {lon}"
 
         elif param == "radio":
             radio = self.config.get("radio", {})
@@ -590,10 +602,6 @@ class MeshCLI:
             freq_hz = self.config.get("radio", {}).get("frequency", 915000000)
             freq_mhz = freq_hz / 1_000_000.0
             return f"> {freq_mhz}"
-
-        elif param == "tx":
-            power = self.config.get("radio", {}).get("tx_power", 20)
-            return f"> {power}"
 
         elif param == "public.key":
             if not self.identity:
@@ -617,48 +625,6 @@ class MeshCLI:
         elif param == "allow.read.only":
             allow = self.repeater_config.get("security", {}).get("allow_read_only", False)
             return f"> {'on' if allow else 'off'}"
-
-        elif param == "advert.interval":
-            interval = self.repeater_config.get("advert_interval_minutes", 120)
-            return f"> {interval}"
-
-        elif param == "flood.advert.interval":
-            interval = self.repeater_config.get("send_advert_interval_hours", 10)
-            return f"> {interval}"
-
-        elif param == "flood.max":
-            max_flood = self.repeater_config.get("max_flood_hops", 64)
-            return f"> {max_flood}"
-
-        elif param == "rxdelay":
-            delay = self.config.get("delays", {}).get("rx_delay_base", 0.0)
-            return f"> {delay}"
-
-        elif param == "txdelay":
-            delay = self.config.get("delays", {}).get("tx_delay_factor", 1.0)
-            return f"> {delay}"
-
-        elif param == "direct.txdelay":
-            delay = self.config.get("delays", {}).get("direct_tx_delay_factor", 0.5)
-            return f"> {delay}"
-
-        elif param == "multi.acks":
-            acks = self.repeater_config.get("multi_acks", 0)
-            return f"> {acks}"
-
-        elif param == "int.thresh":
-            thresh = self.repeater_config.get("interference_threshold", -120)
-            return f"> {thresh}"
-
-        elif param == "agc.reset.interval":
-            interval = self.repeater_config.get("agc_reset_interval", 0)
-            return f"> {interval}"
-
-        elif param == "path.hash.mode":
-            return f"> {self.config.get('mesh', {}).get('path_hash_mode', 0)}"
-
-        elif param == "loop.detect":
-            return f"> {self.config.get('mesh', {}).get('loop_detect', 'minimal')}"
 
         # ==================== WM1303 overlay additions ====================
         # Companion apps query "owner.info" via TXT_MSG CLI 'get' command.
@@ -836,14 +802,9 @@ class MeshCLI:
 
         subcommand = parts[1]
 
-        if subcommand == "load":
+        if subcommand in ("load", "save", "allowf", "denyf", "get", "home", "put", "remove"):
             return "Error: Region commands not implemented"
-        elif subcommand == "save":
-            return "Error: Region commands not implemented"
-        elif subcommand in ("allowf", "denyf", "get", "home", "put", "remove"):
-            return "Error: Region commands not implemented"
-        else:
-            return "Err - ??"
+        return "Err - ??"
 
     # ==================== Neighbor Commands ====================
 
@@ -995,16 +956,9 @@ class MeshCLI:
 
     def _cmd_log(self, command: str) -> str:
         """Handle log commands."""
-        if command == "log start":
-            # TODO: Enable logging
+        if command in ("log start", "log stop", "log erase"):
+            # TODO: Implement logging controls.
             return "Error: Not yet implemented"
-        elif command == "log stop":
-            # TODO: Disable logging
-            return "Error: Not yet implemented"
-        elif command == "log erase":
-            # TODO: Clear log file
-            return "Error: Not yet implemented"
-        elif command == "log":
+        if command == "log":
             return "Error: Use journalctl to view logs"
-        else:
-            return "Unknown log command"
+        return "Unknown log command"

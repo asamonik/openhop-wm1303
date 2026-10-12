@@ -474,22 +474,16 @@ class ProtocolRequestHelper:
             return b""
         data = reading.get("data") or {}
         out = bytearray()
-        temperature = data.get("temperature_c")
-        if temperature is not None:
+        for field, encode in (
+            ("temperature_c", encode_temperature),
+            ("humidity_pct", encode_relative_humidity),
+            ("pressure_hpa", encode_barometric_pressure),
+        ):
+            value = data.get(field)
+            if value is None:
+                continue
             try:
-                out.extend(encode_temperature(channel, float(temperature)))
-            except (TypeError, ValueError):
-                pass
-        humidity = data.get("humidity_pct")
-        if humidity is not None:
-            try:
-                out.extend(encode_relative_humidity(channel, float(humidity)))
-            except (TypeError, ValueError):
-                pass
-        pressure = data.get("pressure_hpa")
-        if pressure is not None:
-            try:
-                out.extend(encode_barometric_pressure(channel, float(pressure)))
+                out.extend(encode(channel, float(value)))
             except (TypeError, ValueError):
                 pass
         return bytes(out)
@@ -575,14 +569,10 @@ class ProtocolRequestHelper:
             entries.append((pubkey_hex, heard_ago, snr_int))
 
         # Sort (matches C++ order_by values)
-        if order_by == 0:
-            entries.sort(key=lambda e: e[1])  # newest first (smallest heard_ago)
-        elif order_by == 1:
-            entries.sort(key=lambda e: e[1], reverse=True)  # oldest first
-        elif order_by == 2:
-            entries.sort(key=lambda e: e[2], reverse=True)  # strongest SNR first
-        elif order_by == 3:
-            entries.sort(key=lambda e: e[2])  # weakest SNR first
+        if order_by in (0, 1):
+            entries.sort(key=lambda e: e[1], reverse=order_by == 1)  # newest / oldest
+        elif order_by in (2, 3):
+            entries.sort(key=lambda e: e[2], reverse=order_by == 2)  # strongest / weakest
 
         total_count = len(entries)
 
@@ -592,14 +582,10 @@ class ProtocolRequestHelper:
         results = bytearray()
         results_count = 0
 
-        for i in range(count):
-            idx = i + offset
-            if idx >= total_count:
-                break
+        for pubkey_hex, heard_ago, snr_int in entries[offset:offset + count]:
             if len(results) + entry_size > max_results_bytes:
                 break
 
-            pubkey_hex, heard_ago, snr_int = entries[idx]
             try:
                 pubkey_bytes = bytes.fromhex(pubkey_hex)
             except (ValueError, TypeError):

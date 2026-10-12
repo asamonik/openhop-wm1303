@@ -39,6 +39,8 @@ import functools
 import math
 from typing import Dict, List, Optional, Tuple
 
+from repeater.metrics_schema import QUERY_TABLES as _TABLE_REGISTRY
+
 logger = logging.getLogger("tiered_query")
 
 # ---------------------------------------------------------------------------
@@ -48,132 +50,6 @@ RES_1M = 60
 RES_10M = 600
 RES_15M = 900
 
-# ---------------------------------------------------------------------------
-# Table registry — maps base table names to aggregation metadata.
-# This mirrors DOWNSAMPLE_TABLES from metrics_retention.py but is kept
-# self-contained so the query module has no import dependency on the
-# retention thread.
-# ---------------------------------------------------------------------------
-# Each entry: {
-#   "ts_col":      timestamp column in the raw table,
-#   "group_cols":  grouping columns (present in both raw and summary),
-#   "agg_cols":    [(raw_expr, summary_alias), ...]
-# }
-# The summary_alias is the column name in _1m/_10m/_15m tables.
-# The raw_expr is the SQL aggregation applied to the raw table.
-_TABLE_REGISTRY: Dict[str, Dict] = {
-    "packet_activity": {
-        "ts_col": "timestamp",
-        "group_cols": ["channel_id"],
-        "agg_cols": [
-            ("COUNT(*)",        "sample_count"),
-            ("SUM(rx_count)",   "total_rx_count"),
-            ("SUM(tx_count)",   "total_tx_count"),
-        ],
-    },
-    "noise_floor_history": {
-        "ts_col": "timestamp",
-        "group_cols": ["channel_id"],
-        "agg_cols": [
-            ("COUNT(*)",                    "sample_count"),
-            ("AVG(noise_floor_dbm)",        "avg_noise_floor_dbm"),
-            ("MIN(noise_floor_dbm)",        "min_noise_floor_dbm"),
-            ("MAX(noise_floor_dbm)",        "max_noise_floor_dbm"),
-            ("SUM(samples_collected)",      "total_samples_collected"),
-            ("SUM(samples_accepted)",       "total_samples_accepted"),
-            ("MIN(min_rssi)",               "min_rssi"),
-            ("MAX(max_rssi)",               "max_rssi"),
-        ],
-    },
-    "channel_stats_history": {
-        "ts_col": "timestamp",
-        "group_cols": ["channel_id"],
-        "agg_cols": [
-            ("COUNT(*)",                                  "sample_count"),
-            # Deltas are computed before time filtering and bucketing, so
-            # a prior sample and transitions across buckets are preserved.
-            ("SUM(delta_rx_count)",                       "total_rx_count"),
-            ("AVG(avg_rssi)",                             "avg_rssi"),
-            ("AVG(avg_snr)",                              "avg_snr"),
-            ("SUM(delta_tx_count)",                       "total_tx_count"),
-            ("SUM(delta_tx_failed)",                      "total_tx_failed"),
-            ("SUM(delta_tx_airtime_ms)",                  "total_tx_airtime_ms"),
-            ("SUM(delta_tx_bytes)",                       "total_tx_bytes"),
-            ("SUM(delta_lbt_blocked)",                    "total_lbt_blocked"),
-            ("SUM(delta_lbt_passed)",                     "total_lbt_passed"),
-            ("AVG(noise_floor_dbm)",                      "avg_noise_floor_dbm"),
-            ("AVG(tx_noisefloor_dbm)",                    "avg_tx_noisefloor_dbm"),
-            ("AVG(lbt_last_rssi)",                        "avg_lbt_last_rssi"),
-        ],
-    },
-    "dedup_events": {
-        "ts_col": "ts",
-        "group_cols": ["event_type", "source"],
-        "agg_cols": [
-            ("COUNT(*)",                 "sample_count"),
-            ("COUNT(DISTINCT pkt_hash)", "unique_packets"),
-            ("SUM(pkt_size)",            "total_bytes"),
-        ],
-    },
-    "cad_events": {
-        "ts_col": "timestamp",
-        "group_cols": ["channel_id"],
-        "agg_cols": [
-            ("COUNT(*)",              "sample_count"),
-            ("SUM(cad_clear)",        "total_cad_clear"),
-            ("SUM(cad_detected)",     "total_cad_detected"),
-            ("SUM(cad_skipped)",      "total_cad_skipped"),
-            ("SUM(cad_hw_clear)",     "total_cad_hw_clear"),
-            ("SUM(cad_hw_detected)",  "total_cad_hw_detected"),
-            ("SUM(cad_sw_clear)",     "total_cad_sw_clear"),
-            ("SUM(cad_sw_detected)",  "total_cad_sw_detected"),
-            ("SUM(cad_busy_events)",      "total_cad_busy_events"),
-        ],
-    },
-    "crc_error_rate": {
-        "ts_col": "timestamp",
-        "group_cols": ["channel_id"],
-        "agg_cols": [
-            ("COUNT(*)",                "sample_count"),
-            ("SUM(crc_error_count)",    "total_crc_errors"),
-            ("SUM(crc_disabled_count)", "total_crc_disabled"),
-        ],
-    },
-    "packet_metrics": {
-        "ts_col": "timestamp",
-        "group_cols": ["channel_id", "direction"],
-        "agg_cols": [
-            ("COUNT(*)",        "sample_count"),
-            ("AVG(rssi)",       "avg_rssi"),
-            ("MIN(rssi)",       "min_rssi"),
-            ("MAX(rssi)",       "max_rssi"),
-            ("AVG(snr)",        "avg_snr"),
-            ("MIN(snr)",        "min_snr"),
-            ("MAX(snr)",        "max_snr"),
-            ("AVG(airtime_ms)", "avg_airtime_ms"),
-            ("SUM(airtime_ms)", "total_airtime_ms"),
-            ("SUM(length)",     "total_bytes"),
-            ("AVG(hop_count)",  "avg_hop_count"),
-            ("SUM(CASE WHEN crc_ok=0 THEN 1 ELSE 0 END)", "crc_error_count"),
-        ],
-    },
-    "origin_channel_stats": {
-        "ts_col": "timestamp",
-        "group_cols": ["channel_id"],
-        "agg_cols": [
-            ("COUNT(*)",    "sample_count"),
-            ("SUM(count)",  "total_count"),
-        ],
-    },
-}
-
-# Must match the storage schema. These denominators are internal unless
-# explicitly requested; sample_count is not a valid weight for nullable data.
-for _cfg in _TABLE_REGISTRY.values():
-    _cfg["agg_cols"] += [
-        (f"COUNT({expr[4:-1]})", f"{alias}_count")
-        for expr, alias in _cfg["agg_cols"] if expr.startswith("AVG(")
-    ]
 _AVERAGE_ALIASES = {
     alias for cfg in _TABLE_REGISTRY.values()
     for expr, alias in cfg["agg_cols"] if expr.startswith("AVG(")
