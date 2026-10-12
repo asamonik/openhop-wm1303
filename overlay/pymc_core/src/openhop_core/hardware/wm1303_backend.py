@@ -21,7 +21,6 @@ import random
 import re
 import signal
 import socket
-import struct
 import subprocess
 import tempfile
 import threading
@@ -36,7 +35,6 @@ from openhop_core.paths import resolve_config_path  # WM1303 v2.7: central confi
 try:
     from .region_config import (
         get_tx_bounds as _region_get_tx_bounds,
-        get_region_summary as _region_get_summary,
         DEFAULT_REGION as _REGION_DEFAULT,
     )
     _REGION_AVAILABLE = True
@@ -165,8 +163,7 @@ from pathlib import Path
 from typing import Any
 
 from openhop_core.hardware.tx_queue import (
-    ChannelTXQueue, TXQueueManager, GlobalTXScheduler, MAX_CHANNELS,
-    _bw_hz_to_str as _queue_bw_hz_to_str, estimate_lora_airtime_ms,
+    TXQueueManager, GlobalTXScheduler, _bw_hz_to_str as _queue_bw_hz_to_str, estimate_lora_airtime_ms,
     get_tx_diagnostic_context,
 )
 
@@ -350,39 +347,6 @@ def _parse_datr(datr):
                       '250': 250000, '500': 500000}
         return int(m.group(1)), bandwidths[m.group(2)]
     return None, None
-
-def _extract_mc_payload(data: bytes) -> bytes:
-    """Extract payload bytes after MeshCore header + path data.
-
-    The payload stays constant across hop iterations, making it
-    suitable for stable hashing in self-echo and dedup detection.
-
-    MeshCore header layout:
-      byte 0: [VER(2) | TYPE(4) | ROUTE(2)]
-      TFLOOD/TDIRECT (route 0x00/0x03): bytes 1-4 timestamp, byte 5 path_len
-      FLOOD/DIRECT   (route 0x01/0x02): byte 1 path_len
-      path_len byte: bits[5:0] = hops, bits[7:6]+1 = hop_size (1-4 bytes)
-      Following: hops * hop_size bytes of path data
-      After that: the stable message payload
-    """
-    if not data or len(data) < 2:
-        return data
-    hdr = data[0]
-    rt = hdr & 0x03
-    has_tc = rt in (0x00, 0x03)  # TFLOOD or TDIRECT have timestamp
-    idx = 5 if has_tc else 1     # path_raw byte offset
-    if idx >= len(data):
-        return data
-    pl_raw = data[idx]
-    hops = pl_raw & 0x3F
-    hsz = ((pl_raw >> 6) & 0x03) + 1  # hop hash size: 1, 2, 3, or 4 bytes
-    pbytes = hops * hsz
-    payload_start = idx + 1 + pbytes
-    if payload_start >= len(data):
-        return data  # malformed, return all for safe hashing
-    return data[payload_start:]
-
-
 
 # Semtech reference TX gain LUT for SX1250 + SKY66420 FEM (EU868)
 # 16 entries from 12 dBm to 27 dBm via RF0
@@ -1922,7 +1886,6 @@ class WM1303Backend:
         Returns {freq_mhz: rssi_dbm} from most recent scan entries.
         """
         try:
-            import sqlite3
             db_path = str(self._storage_dir / 'spectrum_history.db')
             if not os.path.exists(db_path):
                 return {}
@@ -2373,67 +2336,6 @@ class WM1303Backend:
                         len(cad_channels), final_path)
         except Exception as e:
             logger.warning('WM1303Backend: failed to write CAD config: %s', e)
-
-    def _read_hardware_cad_results(self, max_age: float = 30.0) -> dict:
-        """Read hardware CAD results from the spectral scan JSON.
-
-        The C spectral scan thread appends a 'cad' section to the JSON:
-        {
-            "cad": {
-                "<channel_id>": {
-                    "freq_hz": 869461000,
-                    "sf": 8,
-                    "detected": true/false,
-                    "rssi": -85,
-                    "status": 0  (0=ok, 1=timeout, 2=skipped)
-                }
-            }
-        }
-
-        Returns dict keyed by channel_id, or empty dict if no results.
-        """
-        try:
-            scan_path = Path('/tmp/pymc_spectral_results.json')
-            if not scan_path.exists():
-                return {}
-            data = json.loads(scan_path.read_text())
-            ts = data.get('timestamp', 0)
-            age = time.time() - ts
-            if age > max_age:
-                return {}
-            return data.get('cad', {})
-        except Exception:
-            return {}
-
-    def _get_channel_cad_config(self, channel_id: str) -> bool:
-        """Check if CAD is enabled for a channel.
-
-        CAD is MANDATORY before every TX — always returns True.
-        The per-channel UI toggle is kept for future use (e.g. to control
-        the Python-side software pre-filter sensitivity) but does not
-        disable the hardware CAD scan in pkt_fwd.
-        """
-        return True
-
-    # --- Removed: _cad_check, _pre_tx_check, _lbt_check alias ---
-    # The Python pre-TX CAD/LBT filter was eliminated together with the
-    # custom LBT code in pkt_fwd. HAL LBT (per-channel rssi_target_dbm,
-    # handled inside lgw_send) is now the sole RSSI gate; HW-CAD still
-    # runs unconditionally in the HAL C code. _store_cad_event remains
-    # below for post-TX CAD event logging from TX_ACK parsing.
-
-    def _store_cad_event(self, channel_id: str, result: str,
-                         rssi: float = None, context: str = 'lbt_check') -> None:
-        """Store a CAD event in the database (fire-and-forget)."""
-        try:
-            with _db_conn(self._db_path) as conn:
-                conn.execute(
-                    "INSERT INTO cad_events (timestamp, channel_id, result, rssi_at_time, context) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (time.time(), channel_id, result, rssi, context))
-                conn.commit()
-        except Exception:
-            pass  # Non-critical, don't block TX
 
     def set_airtime_manager(self, manager) -> bool:
         """Use the repeater's live duty budget for every WM1303 transmission."""
@@ -3218,7 +3120,7 @@ class WM1303Backend:
     def _handle_udp(self, data: bytes, addr: tuple) -> None:
         if len(data) < 4:
             return
-        ver, tok_h, tok_l, pkt_type = data[0], data[1], data[2], data[3]
+        tok_h, tok_l, pkt_type = data[1], data[2], data[3]
         token = (tok_h << 8) | tok_l
 
         if pkt_type == PKT_PUSH_DATA:    # RX packet(s)
@@ -4608,83 +4510,6 @@ class WM1303Backend:
                 self._agc_reset_timer = None
 
 
-    # === ORIGINAL FULL AGC RESET CODE (commented out for lightweight test) ===
-    # AGC_FULL_RESET:     def _do_agc_reset(self) -> None:
-    # AGC_FULL_RESET:         """Perform AGC recovery by restarting lora_pkt_fwd.
-    # AGC_FULL_RESET:
-    # AGC_FULL_RESET:         After TX on RF0 (same chain as RX), the SX1302 internal AGC
-    # AGC_FULL_RESET:         firmware can get stuck, making the concentrator deaf. This
-    # AGC_FULL_RESET:         method kills and restarts lora_pkt_fwd with a GPIO reset to
-    # AGC_FULL_RESET:         restore RX sensitivity.
-    # AGC_FULL_RESET:         """
-    # AGC_FULL_RESET:         if not self._running:
-    # AGC_FULL_RESET:             return
-    # AGC_FULL_RESET:         if getattr(self, "_agc_resetting", False):
-    # AGC_FULL_RESET:             logger.warning("WM1303Backend: [AGC RECOVERY] already in progress, skipping")
-    # AGC_FULL_RESET:             return
-    # AGC_FULL_RESET:
-    # AGC_FULL_RESET:         self._agc_resetting = True
-    # AGC_FULL_RESET:         _start = time.monotonic()
-    # AGC_FULL_RESET:         logger.info("WM1303Backend: [AGC RECOVERY] starting concentrator reset")
-    # AGC_FULL_RESET:         try:
-    # AGC_FULL_RESET:             # Step 1: Stop current pkt_fwd
-    # AGC_FULL_RESET:             self._stop_pktfwd_process()
-    # AGC_FULL_RESET:             time.sleep(0.5)
-    # AGC_FULL_RESET:
-    # AGC_FULL_RESET:             # Step 2: GPIO reset to restore AGC
-    # AGC_FULL_RESET:             try:
-    # AGC_FULL_RESET:                 logger.info("WM1303Backend: [AGC RECOVERY] running GPIO reset")
-    # AGC_FULL_RESET:                 r = subprocess.run(
-    # AGC_FULL_RESET:                     ["sudo", str(PKTFWD_RESET), "start"],
-    # AGC_FULL_RESET:                     cwd=str(PKTFWD_DIR), capture_output=True, timeout=15
-    # AGC_FULL_RESET:                 )
-    # AGC_FULL_RESET:                 if r.returncode != 0:
-    # AGC_FULL_RESET:                     logger.warning("WM1303Backend: [AGC RECOVERY] GPIO reset rc=%d",
-    # AGC_FULL_RESET:                                   r.returncode)
-    # AGC_FULL_RESET:                 time.sleep(2.0)  # TCXO warmup
-    # AGC_FULL_RESET:             except Exception as e:
-    # AGC_FULL_RESET:                 logger.error("WM1303Backend: [AGC RECOVERY] GPIO reset failed: %s", e)
-    # AGC_FULL_RESET:
-    # AGC_FULL_RESET:             # Step 3: Restart pkt_fwd
-    # AGC_FULL_RESET:             try:
-    # AGC_FULL_RESET:                 cmd = ["sudo", str(PKTFWD_BIN), "-c", str(BRIDGE_CONF)]
-    # AGC_FULL_RESET:                 logger.info("WM1303Backend: [AGC RECOVERY] restarting pkt_fwd: %s",
-    # AGC_FULL_RESET:                            " ".join(cmd))
-    # AGC_FULL_RESET:                 self._proc = subprocess.Popen(
-    # AGC_FULL_RESET:                     cmd,
-    # AGC_FULL_RESET:                     cwd=str(PKTFWD_DIR),
-    # AGC_FULL_RESET:                     stdout=subprocess.PIPE,
-    # AGC_FULL_RESET:                     stderr=subprocess.STDOUT,
-    # AGC_FULL_RESET:                     text=True,
-    # AGC_FULL_RESET:                 )
-    # AGC_FULL_RESET:                 time.sleep(2.0)  # Wait for concentrator init (optimized)
-    # AGC_FULL_RESET:                 if self._proc.poll() is not None:
-    # AGC_FULL_RESET:                     out = self._proc.stdout.read()
-    # AGC_FULL_RESET:                     logger.error("WM1303Backend: [AGC RECOVERY] pkt_fwd exited: %s",
-    # AGC_FULL_RESET:                                 out[:500])
-    # AGC_FULL_RESET:                 else:
-    # AGC_FULL_RESET:                     logger.info("WM1303Backend: [AGC RECOVERY] pkt_fwd restarted (pid %d)",
-    # AGC_FULL_RESET:                                self._proc.pid)
-    # AGC_FULL_RESET:                     # Restart stdout reader thread
-    # AGC_FULL_RESET:                     self._stdout_thread = threading.Thread(
-    # AGC_FULL_RESET:                         target=self._pktfwd_stdout_reader, daemon=True,
-    # AGC_FULL_RESET:                         name="pktfwd-stdout")
-    # AGC_FULL_RESET:                     self._stdout_thread.start()
-    # AGC_FULL_RESET:             except Exception as e:
-    # AGC_FULL_RESET:                 logger.error("WM1303Backend: [AGC RECOVERY] restart failed: %s", e)
-    # AGC_FULL_RESET:
-    # AGC_FULL_RESET:             self._agc_resets += 1
-    # AGC_FULL_RESET:             _elapsed_ms = round((time.monotonic() - _start) * 1000)
-    # AGC_FULL_RESET:             logger.info("WM1303Backend: [AGC RECOVERY] complete (%dms, total=%d)",
-    # AGC_FULL_RESET:                        _elapsed_ms, self._agc_resets)
-    # AGC_FULL_RESET:         except Exception as e:
-    # AGC_FULL_RESET:             logger.error("WM1303Backend: [AGC RECOVERY] failed: %s", e)
-    # AGC_FULL_RESET:         finally:
-    # AGC_FULL_RESET:             self._agc_resetting = False
-    # AGC_FULL_RESET:             with self._agc_reset_lock:
-    # AGC_FULL_RESET:                 self._agc_reset_timer = None
-    # AGC_FULL_RESET:
-    # === END ORIGINAL FULL AGC RESET CODE ===
 
     # ------------------------------------------------------------------
     # Full Concentrator Reset (used by heartbeat)

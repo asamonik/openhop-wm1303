@@ -766,7 +766,7 @@ class MetricsRetention:
                                     total_deleted += cur.rowcount
                                     logger.debug("MetricsRetention: %s expired %d rows",
                                                  summary_table, cur.rowcount)
-                            except Exception as e:
+                            except Exception:
                                 pass  # table might not exist yet
 
                     conn.commit()

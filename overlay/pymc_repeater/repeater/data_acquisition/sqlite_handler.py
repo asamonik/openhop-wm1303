@@ -4,7 +4,6 @@ import ctypes.util
 import json
 import logging
 import math
-import secrets
 import sqlite3
 import threading
 import time

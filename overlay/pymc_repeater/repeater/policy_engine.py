@@ -238,10 +238,6 @@ class PolicyEngine:
 
         return None
 
-    def _extract_channel_message_body(self, packet) -> Optional[str]:
-        channel_info = self._compute_channel_decrypt_info(packet)
-        return channel_info.get("message_body")
-
     def _get_channel_decrypt_info(self, packet) -> dict[str, Any]:
         packet_key = id(packet)
         cached = self._channel_decrypt_cache.get(packet_key)

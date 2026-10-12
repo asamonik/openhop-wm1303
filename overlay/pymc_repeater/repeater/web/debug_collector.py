@@ -9,12 +9,9 @@ Usage (from API):
     result = await collector.generate()   # returns dict with path, size, expires
 """
 
-import asyncio
-import hashlib
 import json
 import logging
 import os
-import re
 import shlex
 import shutil
 import subprocess
@@ -25,7 +22,7 @@ import threading
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 from openhop_core.paths import resolve_config_path  # WM1303 v2.7: central config-path helper
 from repeater.config import resolve_storage_dir
 from .tiered_query import tiered_channel_query

@@ -19,8 +19,6 @@ import asyncio
 import json
 import logging
 import socket
-import hashlib
-from pathlib import Path
 from repeater.bridge_engine import _stable_hash
 from repeater.web.packet_trace import trace_event as _trace
 from openhop_core.paths import resolve_config_path  # WM1303 v2.7: central config-path helper

@@ -19,7 +19,6 @@ Command set: Section 13 - SPI Interface
 from __future__ import annotations
 
 import logging
-import struct
 import os
 import time
 from typing import Optional
@@ -77,12 +76,6 @@ def _read_region_from_ui() -> tuple[int, int]:
         return _region_get_sx1261_calib(_region_code, fallback_center_hz=center_hz)
     except Exception:
         return 0xD7, 0xDB  # Safe fallback
-
-try:
-    import gpiod
-    _HAS_GPIOD = True
-except ImportError:
-    _HAS_GPIOD = False
 
 logger = logging.getLogger("SX1261Driver")
 

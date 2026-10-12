@@ -2,11 +2,9 @@ import concurrent.futures
 import logging
 import math
 import os
-import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
-import yaml
 from openhop_core.paths import (
     resolve_config_path,
 )  # WM1303 v2.7: central config-path helper
@@ -117,105 +115,6 @@ class MeshCLI:
         # Get repeater config shortcut
         self.repeater_config = config.get("repeater", {})
         self.mesh_config = config.setdefault("mesh", {})
-
-    def _save_config_and_apply(self, sections=None) -> bool:
-        """Persist the config, then live-apply the changed sections.
-
-        ``ConfigManager.save_to_file`` returns a bare bool; the tuple form is
-        tolerated for older manager doubles. Live update only runs after a
-        successful save so a failed write never half-applies a change. Pass
-        no sections to stage a change: saved to disk, applied on restart
-        (radio parameters, matching firmware's reboot-to-apply).
-        """
-        result = self.config_manager.save_to_file()
-        saved = result[0] if isinstance(result, tuple) else bool(result)
-        if not saved:
-            return False
-        if sections:
-            self.config_manager.live_update_daemon(sections)
-        return True
-
-    def _get_security_config(self) -> Dict[str, Any]:
-        """Return the repeater login security section (the one LoginHelper reads)."""
-        security = self.repeater_config.get("security")
-        return security if isinstance(security, dict) else {}
-
-    def _get_node_name(self) -> str:
-        """Return the configured node name, preferring the newer key when present."""
-        return self.repeater_config.get("node_name") or self.repeater_config.get(
-            "name", "Unknown"
-        )
-
-    def _set_node_name(self, value: str) -> None:
-        """Persist node name to both legacy and current config keys for compatibility."""
-        self.repeater_config["node_name"] = value
-        self.repeater_config["name"] = value
-
-    def _get_local_pubkey_hex(self) -> Optional[str]:
-        """Return local node public key (hex) when available."""
-        try:
-            if self.identity and hasattr(self.identity, "get_public_key"):
-                pubkey = self.identity.get_public_key()
-                if isinstance(pubkey, (bytes, bytearray)):
-                    return bytes(pubkey).hex().lower()
-                if isinstance(pubkey, str):
-                    normalized = pubkey.strip().lower()
-                    if normalized.startswith("0x"):
-                        normalized = normalized[2:]
-                    if normalized:
-                        return normalized
-        except Exception as exc:
-            logger.debug("Unable to read local identity pubkey: %s", exc)
-
-        key = self.repeater_config.get("identity_key")
-        if isinstance(key, (bytes, bytearray)):
-            return bytes(key).hex().lower()
-        if isinstance(key, str):
-            normalized = key.strip().lower()
-            if normalized.startswith("0x"):
-                normalized = normalized[2:]
-            if normalized and all(ch in "0123456789abcdef" for ch in normalized):
-                return normalized
-
-        return None
-
-    def _is_local_pubkey(self, pubkey_hex: str) -> bool:
-        """Return True when a discovery result pubkey matches the local node."""
-        candidate = (pubkey_hex or "").strip().lower()
-        if not candidate:
-            return False
-        if candidate.startswith("0x"):
-            candidate = candidate[2:]
-
-        local_pubkey = self._get_local_pubkey_hex()
-        if not local_pubkey:
-            return False
-
-        # Prefix-only discovery may return fewer bytes than full identity pubkey.
-        return local_pubkey.startswith(candidate) or candidate.startswith(local_pubkey)
-
-    def _auto_add_discovery_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        """Persist discovered neighbors automatically, excluding this node itself."""
-        enriched = dict(result)
-        pub_key = str(enriched.get("pub_key") or "").strip().lower()
-        if not pub_key:
-            return enriched
-
-        if self._is_local_pubkey(pub_key):
-            enriched["is_self"] = True
-            enriched["known_neighbor"] = True
-            return enriched
-
-        if not self.storage_handler:
-            return enriched
-
-        from repeater.handler_helpers.discovery import persist_discovery_result
-
-        if persist_discovery_result(self.storage_handler, enriched):
-            enriched["known_neighbor"] = True
-            enriched["auto_added"] = True
-
-        return enriched
 
     def handle_command(self, sender_pubkey: bytes, command: str, is_admin: bool) -> str:
 

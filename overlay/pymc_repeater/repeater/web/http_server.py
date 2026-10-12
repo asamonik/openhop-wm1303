@@ -5,9 +5,7 @@ import os
 import queue
 import re
 import secrets
-import sys
 import threading
-import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -15,9 +13,7 @@ from typing import Callable, Optional
 
 import cherrypy
 import cherrypy_cors
-from openhop_core.protocol.utils import PAYLOAD_TYPES, ROUTE_TYPES
 
-from repeater import __version__
 from repeater.config import resolve_storage_dir
 from repeater.data_acquisition import SQLiteHandler
 
@@ -31,7 +27,6 @@ from .auth_endpoints import AuthEndpoints
 try:
     from repeater.data_acquisition.websocket_handler import (
         PacketWebSocket,
-        broadcast_packet,
         init_websocket,
         shutdown_websocket,
     )
@@ -47,8 +42,6 @@ except ImportError:
     logger.warning("ws4py not available - WebSocket support disabled")
 
 logger = logging.getLogger("HTTPServer")
-_ORIGINAL_UNRAISABLEHOOK = sys.unraisablehook
-_CHEROOT_UNRAISABLE_HOOK_INSTALLED = False
 
 
 def _cors_response_headers(
@@ -64,12 +57,6 @@ def _cors_response_headers(
         ("Access-Control-Allow-Methods", methods),
         ("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key"),
     ]
-
-
-def _looks_like_cheroot_makefile_context(unraisable: object) -> bool:
-    context = f"{getattr(unraisable, 'object', '')!r} {getattr(unraisable, 'err_msg', '')!r}".lower()
-    return "cheroot" in context and "makefile" in context
-
 
 
 class _ShutdownResponse:
@@ -288,7 +275,6 @@ class StatsApp:
 
         # Path to the compiled Vue.js application
         # Use web_path from config if provided, otherwise use default
-        default_html_dir = os.path.join(os.path.dirname(__file__), "html")
         web_path = self.config.get("web", {}).get("web_path")
         plugin_dir = self._resolve_plugin_frontend_dir(web_path)
         self.html_dir = plugin_dir or (

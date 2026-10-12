@@ -50,30 +50,6 @@ def _mc_hdr(data: bytes) -> str:
 
 
 
-def _extract_mc_payload(data: bytes) -> bytes:
-    """Extract payload bytes after MeshCore header + path data.
-
-    The payload stays constant across hop iterations, making it
-    suitable for detecting self-echo feedback loops.
-    """
-    if not data or len(data) < 2:
-        return data
-    hdr = data[0]
-    rt = hdr & 0x03
-    has_tc = rt in (0x00, 0x03)  # TFLOOD/TDIRECT carry two transport codes
-    idx = 5 if has_tc else 1  # path_raw byte offset
-    if idx >= len(data):
-        return data
-    pl_raw = data[idx]
-    hops = pl_raw & 0x3F
-    hsz = ((pl_raw >> 6) & 0x03) + 1  # hash size in bytes
-    pbytes = hops * hsz
-    payload_start = idx + 1 + pbytes
-    if payload_start >= len(data):
-        return data  # malformed, return all for safe hashing
-    return data[payload_start:]
-
-
 def _stable_hash(data: bytes, length: int = 12) -> str:
     """Return MeshCore's packet identity, including TRACE's path length."""
     return packet_hash(data, length)
@@ -435,7 +411,6 @@ class BridgeEngine:
         Builds aliases from all sources so any name resolves correctly.
         """
         import json
-        from pathlib import Path
 
         # Phase 1: Build aliases from radio objects (config.yaml data)
         for r in radios:
@@ -495,7 +470,6 @@ class BridgeEngine:
           - mqtt         -> 'MQTT'
         """
         import json
-        from pathlib import Path
 
         # Static mappings for non-radio endpoints
         self._display_names = {

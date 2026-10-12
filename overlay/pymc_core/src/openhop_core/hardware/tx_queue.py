@@ -16,12 +16,11 @@ import base64
 import logging
 import math
 import random
-import re
 import time
 from collections import deque
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 logger = logging.getLogger("TXQueue")
 

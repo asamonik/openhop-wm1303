@@ -1,4 +1,3 @@
-from collections import deque
 from openhop_core.paths import resolve_config_path  # WM1303 v2.7: central config-path helper
 from repeater.atomic_file import atomic_write_text
 from repeater.config import CONFIG_WRITE_LOCK
@@ -254,53 +253,6 @@ def _backup_config(path: Path):
     return dest
 
 
-def _atomic_write(path: Path, content: str) -> None:
-    """Write `content` to `path` atomically: tmp -> flush -> fsync -> replace.
-
-    os.replace() is atomic within one filesystem, so a power loss leaves
-    either the old or the new file intact - never a truncated config (#29).
-    Raises OSError/PermissionError on failure so callers can recover.
-    """
-    tmp = path.parent / '.{}.tmp.{}'.format(path.name, os.getpid())
-    try:
-        with open(tmp, 'w') as fh:
-            fh.write(content)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    finally:
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except OSError:
-            pass
-    # Persist the directory entry so the rename itself survives power loss.
-    try:
-        dir_fd = os.open(str(path.parent), os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-    except OSError:
-        pass
-
-
-def _verify_written_json(path: Path, content: str) -> bool:
-    """Re-read `path` and confirm it still parses as JSON (#29).
-
-    Non-JSON payloads are accepted as-is. This is the load-side integrity
-    check: a config that cannot be parsed back is treated as corrupt.
-    """
-    if not content.lstrip().startswith(('{', '[')):
-        return True
-    try:
-        json.loads(path.read_text())
-        return True
-    except (OSError, ValueError) as e:
-        logger.error('_safe_write: readback validation failed for %s: %s', path, e)
-        return False
-
-
 def _safe_write(path: Path, content: str, backup: bool = True) -> bool:
     """Validate and atomically persist content, retaining upstream backups."""
     if content.lstrip().startswith(('{', '[')):
@@ -533,21 +485,6 @@ def sync_global_conf():
     return {'status': 'ok', 'center_mhz': center_mhz}
 
 
-
-def _load_global_conf_ORIG() -> dict:
-    """Load global_conf.json stripping C/C++ style comments."""
-    import re
-    if not _GLOBAL_CONF.exists():
-        return {}
-    text = _GLOBAL_CONF.read_text()
-    # Strip block comments /* ... */
-    text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
-    # Strip line comments // ...
-    text = re.sub(r'//[^\n]*', '', text)
-    try:
-        return json.loads(text)
-    except Exception:
-        return {}
 
 def _build_if_channels(conf: dict) -> list:
     """Extract IF chain layout from SX130x_conf."""
@@ -4046,7 +3983,6 @@ class WM1303API:
 
     def noise_floor_history(self, hours='24', **_ignored):
         """GET /api/wm1303/noise_floor_history - Noise floor measurements over time (tiered)."""
-        import sqlite3
         h = min(int(hours), 168)
         bucket_s = auto_bucket_seconds(h)
         now = time.time()
@@ -4627,7 +4563,7 @@ class WM1303API:
     @cherrypy.expose
     def invalid_packets_clear(self, confirm='', **_ignored):
         """Authenticated POST with explicit confirmation to clear diagnostics."""
-        import sqlite3, json
+        import json
         if cherrypy.request.method.upper() != 'POST':
             raise cherrypy.HTTPError(405, 'Use POST with confirm=yes')
         if str(confirm).lower() not in ('yes', '1', 'true'):

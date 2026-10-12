@@ -3,11 +3,9 @@ import copy
 import logging
 import math
 import secrets
-import struct
 import time
 from collections import OrderedDict, deque
 from collections.abc import Mapping
-from enum import Enum
 from typing import Optional, Tuple
 
 from openhop_core.node.handlers.base import BaseHandler
@@ -21,7 +19,6 @@ from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_MULTIPART,
     PAYLOAD_TYPE_TRACE,
     PH_ROUTE_MASK,
-    PH_TYPE_MASK,
     PH_TYPE_SHIFT,
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
@@ -30,7 +27,6 @@ from openhop_core.protocol.constants import (
 )
 from openhop_core.protocol.packet_utils import (
     PacketHeaderUtils,
-    PacketTimingUtils,
     PathUtils,
 )
 
@@ -963,13 +959,6 @@ class RepeaterHandler(BaseHandler):
                 return False, "No transport codes present"
 
             transport_code_0 = packet.transport_codes[0]  # First transport code
-
-            payload = packet.get_payload()
-            payload_type = (
-                packet.get_payload_type()
-                if hasattr(packet, "get_payload_type")
-                else ((packet.header & 0x3C) >> 2)
-            )
 
             # Check packet against each transport key
             for key_record in transport_keys:

@@ -1,4 +1,3 @@
-import copy
 import logging
 import os
 from copy import deepcopy
@@ -9,13 +8,8 @@ from repeater.atomic_file import atomic_write_text
 from repeater.config import CONFIG_WRITE_LOCK
 from repeater.room_settings import validate_room_configuration
 from repeater.logging_utils import normalize_log_level
-from repeater.modem_config import normalize_modem_config_in_place
 
 logger = logging.getLogger("ConfigManager")
-
-# Serialize staging, persistence and publication across managers in this process.
-_CONFIG_WRITE_LOCK = CONFIG_WRITE_LOCK
-
 
 class ConfigManager:
     """Manages configuration persistence and live updates to the daemon."""
@@ -190,17 +184,6 @@ class ConfigManager:
         except Exception as e:
             logger.error(f"Failed to apply live radio config: {e}", exc_info=True)
             return False
-
-    def _refresh_airtime_radio_params(self) -> None:
-        repeater_handler = getattr(self.daemon, "repeater_handler", None)
-        airtime_mgr = (
-            getattr(repeater_handler, "airtime_mgr", None) if repeater_handler else None
-        )
-        if airtime_mgr is None or not hasattr(airtime_mgr, "refresh_radio_params"):
-            return
-        # Use the full radio section so preamble_length is included; the live
-        # hardware snapshot intentionally omits fields the radio API does not set.
-        airtime_mgr.refresh_radio_params(self.config.get("radio", {}) or {})
 
     @staticmethod
     def _parse_bool(value: Any, default: bool = True) -> bool:
