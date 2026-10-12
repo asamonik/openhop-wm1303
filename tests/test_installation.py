@@ -76,6 +76,75 @@ class OverlayDeploymentTests(unittest.TestCase):
 
 
 class InstallerControlFlowTests(unittest.TestCase):
+    def test_repository_rename_preserves_forks_and_accepts_github_url_forms(self):
+        slug_helper = shell_function("bootstrap.sh", "wm1303_repository_slug")
+        origin_helper = shell_function("bootstrap.sh", "require_expected_origin")
+        self.assertEqual(slug_helper, shell_function("config/deploy_overlay.sh", "wm1303_repository_slug"))
+        self.assertEqual(origin_helper, shell_function("config/deploy_overlay.sh", "require_expected_origin"))
+        for repository, canonical in (
+            ("Asamonik/OpenHop-WM1303", "asamonik/openhop-wm1303"),
+            ("Asamonik/pyMC_WM1303", "asamonik/openhop-wm1303"),
+            ("Example/openhop-wm1303", "example/openhop-wm1303"),
+            ("Example/pyMC_WM1303", "example/pyMC_WM1303"),
+        ):
+            for prefix in ("https://github.com/", "git@github.com:", "ssh://git@github.com/"):
+                for suffix in ("", ".git", ".git/"):
+                    origin = prefix + repository + suffix
+                    with self.subTest(origin=origin):
+                        result = subprocess.run(
+                            ["bash", "-eu", "-c", slug_helper + '\nwm1303_repository_slug "$1"', "test", origin],
+                            capture_output=True, text=True,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout.strip(), canonical)
+                        result = subprocess.run(
+                            ["bash", "-eu", "-c",
+                             'git() { printf "%s\\n" "$TEST_ORIGIN"; }\n' + origin_helper
+                             + '\nrequire_expected_origin /unused "$1"',
+                             "test", "https://github.com/" + canonical + ".git"],
+                            env=dict(os.environ, TEST_ORIGIN=origin), capture_output=True, text=True,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+        for origin in ("https://github.com/asamonik/openhop_core.git",
+                       "https://example.com/asamonik/openhop-wm1303.git"):
+            result = subprocess.run(
+                ["bash", "-eu", "-c", slug_helper + '\nwm1303_repository_slug "$1"', "test", origin],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+        for origin in ("https://github.com/example/openhop-wm1303.git",
+                       "https://github.com/example/pyMC_WM1303.git"):
+            result = subprocess.run(
+                ["bash", "-eu", "-c", 'git() { printf "%s\\n" "$TEST_ORIGIN"; }\n'
+                 + origin_helper + '\nrequire_expected_origin /unused https://github.com/asamonik/openhop-wm1303.git'],
+                env=dict(os.environ, TEST_ORIGIN=origin), capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_bootstrap_directory_selection_reuses_legacy_checkout(self):
+        source = (ROOT / "bootstrap.sh").read_text()
+        start = source.index('if [ -z "${INSTALL_DIR:-}" ]; then')
+        block = source[start:source.index("# --- Early parse", start)]
+        with tempfile.TemporaryDirectory() as directory:
+            account_home = Path(directory)
+            legacy = account_home / "pyMC_WM1303"
+            current = account_home / "openhop-wm1303"
+
+            def selected(override=""):
+                result = subprocess.run(
+                    ["bash", "-eu", "-c", block + '\nprintf "%s" "$INSTALL_DIR"'],
+                    env=dict(os.environ, PI_HOME=directory, INSTALL_DIR=override),
+                    capture_output=True, text=True, check=True,
+                )
+                return result.stdout
+
+            self.assertEqual(selected(), str(current))
+            (legacy / ".git").mkdir(parents=True)
+            self.assertEqual(selected(), str(legacy))
+            (current / ".git").mkdir(parents=True)
+            self.assertEqual(selected(), str(current))
+            self.assertEqual(selected(str(legacy)), str(legacy))
+
     def test_version_messages_read_checkouts_with_spaces(self):
         with tempfile.TemporaryDirectory(prefix="wm1303 checkout ") as directory:
             (Path(directory) / "VERSION").write_text("2.7.7\n")
@@ -201,6 +270,24 @@ systemd-run() { printf '%s\\n' "$@" > "$ARGS_LOG"; return "$RUN_STATUS"; }
             self.assertIn("--setenv=WM1303_REPO_URL=https://github.com/example/pyMC_WM1303.git", argv)
             self.assertIn("--setenv=WM1303_UPDATE_JOB=1", argv)
             self.assertEqual(argv[-3:], [str(trusted / "bootstrap.sh"), "--non-interactive", "--user=service-user"])
+            config_file = trusted / "updater.conf"
+            original_config = config_file.read_text()
+            for repository, canonical in (
+                ("example/openhop-wm1303", "example/openhop-wm1303"),
+                ("asamonik/pyMC_WM1303", "asamonik/openhop-wm1303"),
+                ("asamonik/openhop-wm1303", "asamonik/openhop-wm1303"),
+            ):
+                config_file.write_text(original_config.replace("example/pyMC_WM1303", repository))
+                result = invoke("status")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Repository=" + canonical, result.stdout)
+                result = invoke("start")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("--setenv=WM1303_REPO_URL=https://github.com/" + canonical + ".git",
+                              args.read_text().splitlines())
+            config_file.write_text(original_config.replace("example/pyMC_WM1303", "example/openhop_core"))
+            self.assertNotEqual(invoke("start").returncode, 0)
+            config_file.write_text(original_config)
             log.write_text("keep previous log\n")
             for overrides in ({"FLOCK_STATUS": "1"}, {"SHOW_STATUS": "0", "MOCK_STATE": "LoadState=loaded\nActiveState=activating\nSubState=start"}):
                 result = invoke("start", **overrides)

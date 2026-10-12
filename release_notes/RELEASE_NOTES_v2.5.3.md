@@ -2,7 +2,7 @@
 
 **Release date:** 2026-06-03  
 **Type:** Hotfix — restores SX1302 RX and on-air MeshCore compatibility on all WM1303 installs  
-**Upgrade path:** `curl -sSL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo bash`
+**Upgrade path:** `curl -sSL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo bash`
 
 ---
 

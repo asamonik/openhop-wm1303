@@ -799,14 +799,14 @@ def get_radio_for_board(board_config: dict):
         return BaselineCrcCounterRadio(radio)
 
     elif radio_type == "wm1303":
-        # WM1303 SenseCAP M1 backend (pyMC_WM1303 overlay)
+        # WM1303 SenseCAP M1 backend (openhop-wm1303 overlay)
         try:
             from openhop_core.hardware.wm1303_backend import WM1303Backend
         except ImportError:
             raise RuntimeError(
                 "WM1303 support requires pyMC_core with WM1303Backend. "
-                "Install the pyMC_WM1303 overlay (or run install.sh from "
-                "https://github.com/HansvanMeer/pyMC_WM1303)."
+                "Install the openhop-wm1303 overlay (or run install.sh from "
+                "https://github.com/asamonik/openhop-wm1303)."
             ) from None
 
         radio = WM1303Backend(config=board_config)

@@ -3548,7 +3548,7 @@ class WM1303Backend:
                     self._hourly_noise_discarded = getattr(self, '_hourly_noise_discarded', 0) + 1
                 return
 
-            # ── Layer 2 — central MeshCore protocol validator (pyMC_WM1303) ──
+            # ── Layer 2 — central MeshCore protocol validator (openhop-wm1303) ──
             # Drops malformed packets (reserved hash_size=4 spammer, invalid
             # route_type, truncated, length-implausible, etc.) BEFORE any
             # consumer (raw_rx_callbacks, rx_callback/Dispatcher, virtual_radios,

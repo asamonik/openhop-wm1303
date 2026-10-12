@@ -221,10 +221,10 @@ The upgrade script will:
 
 ```bash
 # Interactive (region selection wizard)
-curl -fsSL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo bash
 
 # Non-interactive (specify region via environment variable)
-WM1303_REGION=EU868 curl -fsSL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo -E WM1303_REGION=EU868 bash
+WM1303_REGION=EU868 curl -fsSL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo -E WM1303_REGION=EU868 bash
 ```
 
 ### Post-upgrade verification

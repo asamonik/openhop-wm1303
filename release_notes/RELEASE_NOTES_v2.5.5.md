@@ -95,7 +95,7 @@ The RX watchdog now tracks consecutive restart attempts. When the regular servic
 ## Upgrade Instructions
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo bash
 ```
 
 After upgrade, **hard-refresh the browser** (`Ctrl + Shift + R` / `Cmd + Shift + R`) to load the new UI assets.

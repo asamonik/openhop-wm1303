@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# pyMC_WM1303 Upgrade Script
+# openhop-wm1303 Upgrade Script
 # =============================================================================
 # Updates the WM1303 installation with the latest code from the fork
 # repositories and re-applies overlay modifications.
@@ -130,7 +130,7 @@ done
 # ---------------------------------------------------------------------------
 echo -e "${BOLD}${GREEN}"
 echo "  ╔══════════════════════════════════════════════════════════╗"
-echo "  ║     pyMC_WM1303 Upgrade                                  ║"
+echo "  ║     openhop-wm1303 Upgrade                               ║"
 echo "  ║     Updating WM1303 LoRa Concentrator + MeshCore         ║"
 echo "  ╚══════════════════════════════════════════════════════════╝"
 echo -e "${NC}"
@@ -1936,7 +1936,7 @@ if [ -f "${NO_REBOOT_MARKER}" ]; then
     ok "Opt-out marker present (${NO_REBOOT_MARKER}); skipping auto-reboot cron"
 elif [ "${MEM_TOTAL_MB}" -lt 700 ]; then
     cat > "${REBOOT_CRON_FILE}" << 'CRON_EOF'
-# pyMC_WM1303 - Weekly maintenance reboot for low-memory devices
+# openhop-wm1303 - Weekly maintenance reboot for low-memory devices
 # Auto-installed by install.sh / upgrade.sh on devices with < 700 MB RAM.
 # Rationale: clears kernel Slab caches and Python heap fragmentation that
 # accumulate over days of uptime, keeping memory usage stable on 512 MB Pis.
@@ -2104,7 +2104,7 @@ else
     echo -e "  - Go to ${CYAN}Adv. Config → SPI Device Configuration${NC}"
     echo -e "  - Go to ${CYAN}Adv. Config → GPIO Pin Configuration${NC}"
     echo -e "  - Verify and adjust the SPI paths and GPIO pins for your board"
-    echo -e "  - See: ${CYAN}https://github.com/HansvanMeer/pyMC_WM1303/blob/main/docs/spi-troubleshooting.md${NC}"
+    echo -e "  - See: ${CYAN}https://github.com/asamonik/openhop-wm1303/blob/main/docs/spi-troubleshooting.md${NC}"
     echo ""
     echo -e "  The service is running and will start automatically on boot."
     echo -e "  You can restart it after adjusting settings:"

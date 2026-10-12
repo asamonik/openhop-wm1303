@@ -19,7 +19,7 @@ The software is built from upstream repositories with overlay files applied duri
 | `Lora-net/sx1302_hal` | pinned HAL 2.1.0 revision | Concentrator HAL + packet forwarder |
 | `openhop-dev/openhop_core` | pinned `v1.1.3` | MeshCore core library |
 | `openhop-dev/openhop_repeater` | pinned `1.1.4` | Repeater application and matching dashboard |
-| `HansvanMeer/pyMC_WM1303` | `main` | Overlays, scripts, config, docs |
+| `asamonik/openhop-wm1303` | `main` | Overlays, scripts, config, docs |
 
 Overlay files replace or extend local dependency sources without changing the published repositories. Pins are shared by install and upgrade through [`config/dependencies.conf`](../config/dependencies.conf). See [`repositories.md`](./repositories.md).
 

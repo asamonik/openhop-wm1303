@@ -189,8 +189,8 @@ Updated overlay files for the SX1302 HAL (v2.10):
 ### Fresh Installation
 
 ```bash
-git clone https://github.com/HansvanMeer/pyMC_WM1303.git
-cd pyMC_WM1303
+git clone https://github.com/asamonik/openhop-wm1303.git
+cd openhop-wm1303
 sudo bash install.sh
 ```
 

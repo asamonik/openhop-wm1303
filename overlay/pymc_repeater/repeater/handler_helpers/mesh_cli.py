@@ -30,16 +30,16 @@ def _build_dynamic_owner_info(max_len: int = 115) -> str:
     """
     segments = []
 
-    # 1. Software version (pyMC_WM1303)
+    # 1. Software version (openhop-wm1303)
     try:
         with open(resolve_config_path('version')) as f:
             version = f.read().strip()
         if version:
-            segments.append(f'pyMC_WM1303 v{version}')
+            segments.append(f'openhop-wm1303 v{version}')
         else:
-            segments.append('pyMC_WM1303')
+            segments.append('openhop-wm1303')
     except Exception:
-        segments.append('pyMC_WM1303')
+        segments.append('openhop-wm1303')
 
     # 2. Hardware model (e.g. 'Raspberry Pi 4 Model B Rev 1.4')
     try:

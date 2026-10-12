@@ -128,7 +128,7 @@ All 13 refactored files pass `python3 -m py_compile`.
 ### Standard upgrade
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo bash
 ```
 
 ### After upgrade

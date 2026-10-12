@@ -1,5 +1,5 @@
 """
-Region configuration for pyMC_WM1303.
+Region configuration for openhop-wm1303.
 
 Provides regulatory frequency bands, SX1261 image calibration values,
 and typical EIRP limits for the regions supported by the WM1303 backend.

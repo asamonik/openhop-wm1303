@@ -62,7 +62,7 @@ When Channel A was configured with SF10 (longer airtime ~567ms vs ~100ms at SF7)
 
 Use the one-liner bootstrap:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo bash
 ```
 
 The HAL will be rebuilt automatically during upgrade.

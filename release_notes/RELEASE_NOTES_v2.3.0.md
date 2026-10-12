@@ -97,7 +97,7 @@ This release documents an important finding for SX1302-based LoRa gateways:
 
 Use the bootstrap script:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo bash
 ```
 
 The upgrade will rebuild the HAL and packet forwarder with the clean-slate code, deploy updated Python files, and restart the service.

@@ -53,7 +53,7 @@ This mask is used in all three recovery paths: periodic AGC reload, L1 recovery,
 Use the bootstrap upgrade:
 
 ```bash
-curl -sL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo bash
+curl -sL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo bash
 ```
 
 The HAL binary will be rebuilt automatically. A service restart is included.

@@ -81,7 +81,7 @@ Fresh installs via the bootstrap one-liner are unchanged. For non-interactive in
 
 ```
 WM1303_REGION=AU915 WM1303_SYNC_WORD=public \
-  curl -sSL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh \
+  curl -sSL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh \
   | sudo -E bash
 ```
 

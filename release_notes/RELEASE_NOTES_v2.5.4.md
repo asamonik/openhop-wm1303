@@ -2,7 +2,7 @@
 
 **Release date:** 2026-06-07  
 **Type:** Release — hardware watchdog, HAL GPIO adaptivity, v2.5.3 hotfix rollup, systemd venv visibility fix  
-**Upgrade path:** `curl -sSL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo bash`
+**Upgrade path:** `curl -sSL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo bash`
 
 ---
 

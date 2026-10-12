@@ -26,7 +26,7 @@ _LAUNCHER = "/usr/local/sbin/wm1303-upgrade"
 _VERSION_FILES = (Path("/etc/openhop_repeater/version"), Path("/etc/pymc_repeater/version"))
 _CHANNEL = "main"  # bootstrap updates this branch; core/repeater refs belong to its scripts
 CHECK_CACHE_TTL = 600
-_REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/pyMC_WM1303", re.IGNORECASE)
+_REPOSITORY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/(?:openhop-wm1303|pyMC_WM1303)", re.IGNORECASE)
 _VERSION_RE = re.compile(r"[0-9]+(?:\.[0-9]+){1,3}")
 
 
@@ -66,7 +66,7 @@ def _run_helper(operation: str) -> str:
 
 
 def _fetch_url(url: str) -> str:
-    request = urllib.request.Request(url, headers={"User-Agent": "pyMC-WM1303-updater"})
+    request = urllib.request.Request(url, headers={"User-Agent": "openhop-wm1303-updater"})
     with urllib.request.urlopen(request, timeout=12) as response:
         content = response.read(2_000_001)
     if len(content) > 2_000_000:
@@ -132,7 +132,7 @@ class _UpdateState:
                 "current_version": current, "latest_version": self.latest_version,
                 "has_update": bool(self.latest_version and _has_update(current, self.latest_version)),
                 "last_checked": self.last_checked.isoformat() if self.last_checked else None,
-                "channel": _CHANNEL, "project": "pyMC_WM1303", "rate_limit_until": None,
+                "channel": _CHANNEL, "project": "openhop-wm1303", "rate_limit_until": None,
             }
 
     def check(self, force=False):

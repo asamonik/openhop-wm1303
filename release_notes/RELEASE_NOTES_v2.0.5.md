@@ -47,13 +47,13 @@ Combined with a loose 100 kHz frequency tolerance for Channel E matching, these 
 
 ### One-liner upgrade
 ```bash
-curl -sSL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/upgrade_bootstrap.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo bash
 ```
 
 ### Manual upgrade
 ```bash
 cd /tmp
-git clone https://github.com/HansvanMeer/pyMC_WM1303.git pymc_wm1303_upgrade
+git clone https://github.com/asamonik/openhop-wm1303.git pymc_wm1303_upgrade
 cd pymc_wm1303_upgrade
 sudo bash upgrade.sh
 ```

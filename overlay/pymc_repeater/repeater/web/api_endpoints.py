@@ -389,7 +389,7 @@ class APIEndpoints:
                 {
                     "key": "wm1303",
                     "name": "WM1303 LoRa Concentrator (SX1302/SX1303)",
-                    "description": "Multi-channel LoRa gateway module - requires pyMC_WM1303",
+                    "description": "Multi-channel LoRa gateway module - requires openhop-wm1303",
                     "config": {},
                 }
             )

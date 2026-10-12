@@ -90,7 +90,7 @@ sudo ./upgrade.sh
 ### One-liner bootstrap (fresh SenseCap M1 install or full rebuild)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo bash
 ```
 
 ### After upgrade

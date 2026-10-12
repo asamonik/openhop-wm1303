@@ -13,6 +13,14 @@ from repeater.web import update_endpoints as updates
 
 
 class UpdateTests(unittest.TestCase):
+    def test_repository_names_include_renamed_and_legacy_forks(self):
+        for repository, available in (("example/pyMC_WM1303", True),
+                                      ("example/openhop-wm1303", True),
+                                      ("asamonik/openhop_core", False)):
+            with self.subTest(repository=repository), \
+                    patch.object(updates, '_run_helper', return_value='Repository=' + repository):
+                self.assertEqual(updates._UpdateState().snapshot()['install_available'], available)
+
     def test_import_and_command_boundary_have_no_generic_pip_fallback(self):
         with patch('subprocess.run') as run, patch('shutil.rmtree') as remove, \
                 patch.object(Path, 'write_text') as write:
@@ -36,7 +44,7 @@ class UpdateTests(unittest.TestCase):
             run.assert_not_called()
 
     def test_versions_follow_installed_fork_and_job_survives_python_restart(self):
-        properties = 'Repository=example/pyMC_WM1303\nLoadState=loaded\nActiveState=active\nSubState=exited\nResult=success\nExecMainStatus=0\n'
+        properties = 'Repository=asamonik/openhop-wm1303\nLoadState=loaded\nActiveState=active\nSubState=exited\nResult=success\nExecMainStatus=0\n'
         with tempfile.TemporaryDirectory() as directory:
             version_file = Path(directory) / 'version'
             version_file.write_text('2.6.99\n')
@@ -47,7 +55,7 @@ class UpdateTests(unittest.TestCase):
                 self.assertEqual(state.snapshot()['state'], 'complete')
                 state._check_version(state.snapshot()['repository'])
                 self.assertTrue(state.snapshot()['has_update'])
-                self.assertIn('/example/pyMC_WM1303/main/VERSION', fetch.call_args.args[0])
+                self.assertIn('/asamonik/openhop-wm1303/main/VERSION', fetch.call_args.args[0])
                 state.install()
                 self.assertEqual(helper.call_args.args, ('start',))
                 self.assertEqual(state.snapshot()['state'], 'installing')

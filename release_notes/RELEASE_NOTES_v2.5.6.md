@@ -75,7 +75,7 @@ the test device demonstrates exactly the failure mode the fix targets: the warn 
 ## Upgrade Instructions
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo bash
 ```
 
 No configuration changes are required; this release only modifies the upgrade-script reporting logic.

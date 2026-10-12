@@ -1,7 +1,7 @@
 #!/bin/sh
-# detect_hardware.sh -- Hardware introspection helper for pyMC_WM1303
+# detect_hardware.sh -- Hardware introspection helper for openhop-wm1303
 #
-# Run this on a target board when adapting pyMC_WM1303 to a non-SenseCAP M1
+# Run this on a target board when adapting openhop-wm1303 to a non-SenseCAP M1
 # host (e.g. a different SX1302/SX1303 Pi HAT). It collects the information
 # needed to set the correct GPIO pin numbers and SPI device path in
 # config/reset_lgw.sh, config/power_cycle_lgw.sh, and config/global_conf.json.
@@ -12,7 +12,7 @@
 set -u
 
 echo '=========================================================='
-echo 'pyMC_WM1303 hardware detection'
+echo 'openhop-wm1303 hardware detection'
 echo '=========================================================='
 echo 'Date     :' "$(date -Iseconds 2>/dev/null || date)"
 echo 'Hostname :' "$(hostname 2>/dev/null || echo unknown)"
@@ -34,7 +34,7 @@ fi
 echo
 
 echo '------ 2. GPIO chip base offsets ------'
-echo 'pyMC_WM1303 uses BCM pin numbers + the kernel GPIO base offset.'
+echo 'openhop-wm1303 uses BCM pin numbers + the kernel GPIO base offset.'
 echo 'SenseCAP M1 (Pi 4 Bookworm) uses offset 512. Other boards/kernels may differ.'
 echo
 if ls /sys/class/gpio/gpiochip*/base >/dev/null 2>&1; then
@@ -60,7 +60,7 @@ fi
 echo
 
 echo '------ 3. SPI devices ------'
-echo 'pyMC_WM1303 expects /dev/spidev0.0 for SX1302 and /dev/spidev0.1 for SX1261.'
+echo 'openhop-wm1303 expects /dev/spidev0.0 for SX1302 and /dev/spidev0.1 for SX1261.'
 if ls /dev/spidev* >/dev/null 2>&1; then
     ls -l /dev/spidev* 2>/dev/null | sed 's/^/  /'
 else
@@ -123,7 +123,7 @@ echo 'or pass --device to lora_pkt_fwd.'
 echo
 echo '=========================================================='
 echo 'Detection complete. Share this output when reporting hardware'
-echo 'compatibility issues on https://github.com/HansvanMeer/pyMC_WM1303/issues'
+echo 'compatibility issues on https://github.com/asamonik/openhop-wm1303/issues'
 echo '=========================================================='
 
 exit 0

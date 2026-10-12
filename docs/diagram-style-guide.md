@@ -1,6 +1,6 @@
 # Diagram Style Guide
 
-> Visual design standards for all pyMC WM1303 diagrams and illustrations.
+> Visual design standards for all OpenHop WM1303 diagrams and illustrations.
 > Based on the WM1303 Manager UI look & feel.
 
 ## Color Palette
@@ -84,4 +84,4 @@ docs/images/
 
 ---
 
-*This style guide ensures visual consistency across all diagrams in the pyMC WM1303 documentation.*
+*This style guide ensures visual consistency across all diagrams in the OpenHop WM1303 documentation.*

@@ -1,10 +1,10 @@
 #!/bin/bash
 # =============================================================================
-# pyMC_WM1303 One-Line Installer / Upgrade Bootstrap (with Region+Preset Wizard)
+# openhop-wm1303 One-Line Installer / Upgrade Bootstrap (with Region+Preset Wizard)
 # =============================================================================
 #
 # Usage:
-#   curl -sSL https://raw.githubusercontent.com/asamonik/pyMC_WM1303/main/bootstrap.sh | sudo bash
+#   curl -sSL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo bash
 #
 # Optional environment overrides (skip interactive prompts):
 #   WM1303_REGION=EU868|US915|AU915|AS923|IN865|JP920|KR920|CUSTOM
@@ -16,11 +16,11 @@
 #   --non-interactive   skip all wizard prompts, fall back to EU-Default preset
 #   --user=<name>       preserve the installed non-root service user
 # INSTALL_DIR may select an existing integration checkout (used by the updater).
-# WM1303_REPO_URL may select a GitHub fork named pyMC_WM1303; never another project.
+# WM1303_REPO_URL may select a GitHub fork named openhop-wm1303 or pyMC_WM1303.
 #
 # This script:
 #   1. Installs git + jq (if not present)
-#   2. Clones or updates the pyMC_WM1303 repository
+#   2. Clones or updates the openhop-wm1303 repository
 #   3. On NEW install only: runs an interactive wizard to choose region + preset
 #      and writes /etc/openhop_repeater/wm1303_ui.json with those defaults.
 #   4. Detects existing installation:
@@ -40,12 +40,19 @@ wm1303_repository_slug() {
         ssh://git@github.com/*) slug="${slug#ssh://git@github.com/}" ;;
         *) return 1 ;;
     esac
-    [[ "$slug" =~ ^[a-z0-9][a-z0-9-]*/pymc_wm1303$ ]] || return 1
-    printf '%s/pyMC_WM1303\n' "${slug%/*}"
+    [[ "$slug" =~ ^[a-z0-9][a-z0-9-]*/(openhop-wm1303|pymc_wm1303)$ ]] || return 1
+    # This fork was renamed; other owners' legacy forks keep their own identity.
+    if [ "$slug" = asamonik/pymc_wm1303 ]; then
+        slug=asamonik/openhop-wm1303
+    fi
+    case "$slug" in
+        */pymc_wm1303) printf '%s/pyMC_WM1303\n' "${slug%/*}" ;;
+        *) printf '%s\n' "$slug" ;;
+    esac
 }
 
-WM1303_REPOSITORY=$(wm1303_repository_slug "${WM1303_REPO_URL:-https://github.com/asamonik/pyMC_WM1303.git}") || {
-    echo 'WM1303_REPO_URL must name a GitHub owner/pyMC_WM1303 repository.' >&2
+WM1303_REPOSITORY=$(wm1303_repository_slug "${WM1303_REPO_URL:-https://github.com/asamonik/openhop-wm1303.git}") || {
+    echo 'WM1303_REPO_URL must name a GitHub owner/openhop-wm1303 or owner/pyMC_WM1303 repository.' >&2
     exit 1
 }
 REPO_URL="https://github.com/${WM1303_REPOSITORY}.git"
@@ -74,6 +81,9 @@ require_expected_origin() {
     expected_slug="${expected_url,,}"
     expected_slug="${expected_slug#https://github.com/}"
     expected_slug="${expected_slug%.git}"
+    # Accept the known GitHub rename without changing existing checkout remotes.
+    [ "$slug" != asamonik/pymc_wm1303 ] || slug=asamonik/openhop-wm1303
+    [ "$expected_slug" != asamonik/pymc_wm1303 ] || expected_slug=asamonik/openhop-wm1303
     if [ "${slug}" != "${expected_slug}" ]; then
         # Do not print the actual URL: it might contain embedded credentials.
         printf 'Unexpected origin for %s. Expected %s (HTTPS or SSH). Repository and remote were not changed; inspect origin before retrying.\n' \
@@ -136,7 +146,13 @@ if [ ! -d "${PI_HOME}" ]; then
     echo "  ✗ Home directory '${PI_HOME}' for user '${PI_USER}' does not exist."
     exit 1
 fi
-INSTALL_DIR="${INSTALL_DIR:-${PI_HOME}/pyMC_WM1303}"
+if [ -z "${INSTALL_DIR:-}" ]; then
+    INSTALL_DIR="${PI_HOME}/openhop-wm1303"
+    # Reuse legacy installations in place so the rename does not duplicate them.
+    if [ ! -e "${INSTALL_DIR}/.git" ] && [ -e "${PI_HOME}/pyMC_WM1303/.git" ]; then
+        INSTALL_DIR="${PI_HOME}/pyMC_WM1303"
+    fi
+fi
 if [[ "$INSTALL_DIR" != /* ]] || [ "$INSTALL_DIR" = / ] || [ "$INSTALL_DIR" = "$PI_HOME" ]; then
     echo "  ✗ INSTALL_DIR must be an absolute, dedicated repository path." >&2
     exit 1
@@ -207,7 +223,7 @@ fi
 
 echo ""
 echo "  ╔══════════════════════════════════════════════════════════╗"
-echo "  ║     pyMC_WM1303 Bootstrap                                ║"
+echo "  ║     openhop-wm1303 Bootstrap                             ║"
 echo "  ╚══════════════════════════════════════════════════════════╝"
 echo ""
 
@@ -451,7 +467,7 @@ run_wizard() {
         echo "  ║                                                              ║"
         echo "  ║  To install for a different region, re-run with:             ║"
         echo "  ║    curl -sSL https://raw.githubusercontent.com/asamonik/     ║"
-        echo "  ║      pyMC_WM1303/main/bootstrap.sh |                        ║"
+        echo "  ║      openhop-wm1303/main/bootstrap.sh |                     ║"
         echo "  ║      sudo env WM1303_REGION=AU915 bash                     ║"
         echo "  ║                                                              ║"
         echo "  ║  Supported: EU868 US915 AU915 AS923 IN865 JP920 KR920 CUSTOM ║"

@@ -110,7 +110,7 @@ New 4-tier downsampling architecture preserves historical data at decreasing res
 
 Standard upgrade via bootstrap one-liner:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo bash
 ```
 
 After upgrade, the first retention cycle will create summary tables and perform initial aggregation. Database size will decrease significantly after the first run.

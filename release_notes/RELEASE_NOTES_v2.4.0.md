@@ -238,7 +238,7 @@ The pre-scan RSSI fix (section B) provides real measurements in the SX1261 drive
 
 Use the one-liner bootstrap:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo bash
 ```
 
 The HAL will be rebuilt automatically during upgrade. HAL LBT is enabled by default on Channel A and Channel E at −80 dBm; adjust per-channel via the UI if needed.

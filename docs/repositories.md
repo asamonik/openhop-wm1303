@@ -19,7 +19,7 @@ a separate Git project and is still required for concentrator hardware.
 
 | Repository | Type | Branch | Purpose |
 |-----------|------|--------|---------|
-| [HansvanMeer/pyMC_WM1303](https://github.com/HansvanMeer/pyMC_WM1303) | **This repo** | `main` | Installation, overlays, config, docs, scripts |
+| [asamonik/openhop-wm1303](https://github.com/asamonik/openhop-wm1303) | **This repo** | `main` | Installation, overlays, config, docs, scripts |
 | [Lora-net/sx1302_hal](https://github.com/Lora-net/sx1302_hal) | Canonical dependency | pinned `master` revision | HAL 2.1.0 plus WM1303 overlays |
 | [openhop-dev/openhop_core](https://github.com/openhop-dev/openhop_core) | Canonical dependency | `v1.1.3` + exact commit | MeshCore core plus WM1303 overlays |
 | [openhop-dev/openhop_repeater](https://github.com/openhop-dev/openhop_repeater) | Canonical dependency | `1.1.4` + exact commit | Repeater and matching dashboard plus WM1303 overlays |
@@ -47,8 +47,10 @@ Use the WM1303-aware Console updater or this repository's `bootstrap.sh` /
 a separate systemd job, using root-owned bootstrap/config copies installed under
 `/usr/local/lib/pymc-wm1303`. It captures and preserves the installed integration
 fork's GitHub owner/repository and follows `main`; the standalone bootstrap
-defaults to this fork (`asamonik/pyMC_WM1303`) unless `WM1303_REPO_URL` explicitly
-selects another GitHub fork named `pyMC_WM1303`. Dependency revisions come from
+defaults to this fork (`asamonik/openhop-wm1303`) unless `WM1303_REPO_URL` explicitly
+selects another GitHub fork named `openhop-wm1303` or `pyMC_WM1303`.
+The former `asamonik/pyMC_WM1303` URL resolves to this renamed fork; existing
+checkout paths and other forks retain their identities. Dependency revisions come from
 the integration's lock file, not the currently latest upstream branch tip.
 
 The detached Console job fetches the validated integration fork's `main` over
@@ -95,7 +97,7 @@ are selected through editable installs and the service's `PYTHONPATH`.
 Representative files:
 
 ```
-pyMC_WM1303/overlay/
+openhop-wm1303/overlay/
 ├── hal/                    → copied into sx1302_hal/
 │   ├── libloragw/src/      → HAL C source overlays
 │   ├── libloragw/inc/      → HAL C header overlays
@@ -195,7 +197,7 @@ Important file groups include:
 ## This Repository Structure
 
 ```
-pyMC_WM1303/
+openhop-wm1303/
 ├── overlay/                 # Source overlays (see above)
 │   ├── hal/
 │   ├── pymc_core/

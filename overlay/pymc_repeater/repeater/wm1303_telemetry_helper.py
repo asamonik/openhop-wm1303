@@ -27,7 +27,7 @@ Owner info layout (appended after upstream version/name/owner):
 - disk_total=<GiB>                  (always)
 - wm1303_eui=<8-byte hex EUI>      (when /tmp/concentrator_eui is present)
 
-This module is part of the pyMC_WM1303 overlay and does NOT modify
+This module is part of the openhop-wm1303 overlay and does NOT modify
 upstream pymc_repeater or openhop_core code.
 """
 

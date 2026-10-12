@@ -61,7 +61,7 @@ except ImportError:
     _TCP_AVAILABLE = False
     TCPLoRaRadio = None
 
-# Conditional import for WM1303Backend [pyMC_WM1303 overlay]
+# Conditional import for WM1303Backend [openhop-wm1303 overlay]
 try:
     from .wm1303_backend import WM1303Backend
 
@@ -70,7 +70,7 @@ except ImportError:
     _WM1303_AVAILABLE = False
     WM1303Backend = None
 
-# Conditional import for VirtualLoRaRadio [pyMC_WM1303 overlay]
+# Conditional import for VirtualLoRaRadio [openhop-wm1303 overlay]
 try:
     from .virtual_radio import VirtualLoRaRadio
 

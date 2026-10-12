@@ -2,7 +2,7 @@
 
 **Release date:** 2026-05-25  
 **Type:** Minor release — TCP companion fixes, radio calibration, WiFi stability  
-**Upgrade path:** `curl -sSL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo bash`
+**Upgrade path:** `curl -sSL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo bash`
 
 ---
 

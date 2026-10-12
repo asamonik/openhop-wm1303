@@ -53,7 +53,7 @@ Credit: **@fahimshariff-au** (issue #7).
 The `WM1303_REGION` environment variable was supported by `bootstrap.sh` since v2.4.9 but only documented in the script header itself. v2.4.11 adds an **Advanced installation** section to the README:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo WM1303_REGION=AU915 bash
+curl -sSL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo WM1303_REGION=AU915 bash
 ```
 
 Supported codes: `EU868`, `US915`, `AU915`, `AS923`, `IN865`, `JP920`, `KR920`, `CUSTOM`. When `WM1303_REGION` is set, the bootstrap selects the matching preset automatically and skips the interactive wizard — ideal for scripted / headless deployments.
@@ -114,7 +114,7 @@ This approach ensures that **every installation** automatically reports its own 
 Standard upgrade — no manual steps required, migration runs automatically:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo bash
 ```
 
 After upgrade, hard-refresh the UI (Ctrl+Shift+R) to clear any cached assets.

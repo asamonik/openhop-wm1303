@@ -193,7 +193,7 @@ All chart data is automatically cleaned up:
 
 Use the bootstrap one-liner (automatically detects install vs upgrade):
 ```bash
-curl -sL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo bash
+curl -sL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo bash
 ```
 
 Or manually from an existing installation:

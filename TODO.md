@@ -1,4 +1,4 @@
-# TODO — pyMC WM1303 Bridge/Repeater
+# TODO — OpenHop WM1303 Bridge/Repeater
 
 > List of open and completed tasks with description of content and motivation.
 > Last updated: 2026-10-01 (v2.7.7)

@@ -1,10 +1,10 @@
 # System Architecture
 
-> pyMC WM1303 — LoRa Multi-Channel Bridge/Repeater for SenseCAP M1
+> OpenHop WM1303 — LoRa Multi-Channel Bridge/Repeater for SenseCAP M1
 
 ## Overview
 
-The pyMC WM1303 system transforms a **SenseCAP M1** (Raspberry Pi 4 + WM1303 LoRa concentrator HAT) into a **MeshCore multi-channel bridge and repeater**. It supports up to **5 simultaneous LoRa channels** with independent frequency, bandwidth, and spreading factor configurations, bridging them together so MeshCore nodes on any channel can communicate through the repeater.
+The OpenHop WM1303 system transforms a **SenseCAP M1** (Raspberry Pi 4 + WM1303 LoRa concentrator HAT) into a **MeshCore multi-channel bridge and repeater**. It supports up to **5 simultaneous LoRa channels** with independent frequency, bandwidth, and spreading factor configurations, bridging them together so MeshCore nodes on any channel can communicate through the repeater.
 
 The system replaces the standard LoRaWAN packet forwarder stack with a custom integration that combines the Semtech SX1302 HAL, a modified packet forwarder, and the pyMC (Python MeshCore) software stack.
 

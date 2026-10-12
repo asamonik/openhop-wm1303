@@ -2,7 +2,7 @@
 
 **Release date**: 2026-07-14
 **Type**: Minor release with a **breaking change** in package identity, service name and config path.
-**Upgrade path**: `curl -sSL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo bash`
+**Upgrade path**: `curl -sSL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo bash`
 
 ---
 

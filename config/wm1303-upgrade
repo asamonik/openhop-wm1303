@@ -38,7 +38,10 @@ load_config() {
     [ -d "$UPDATER_DIR" ] && [ -f "$UPDATER_DIR/updater.conf" ] || die "Invalid updater configuration files."
     # Only the installer writes this root-owned, shell-quoted configuration.
     source "$UPDATER_DIR/updater.conf"
-    [[ "${WM1303_UPDATE_REPOSITORY:-}" =~ ^[a-z0-9][a-z0-9-]*/pyMC_WM1303$ ]] || die "Invalid updater repository."
+    [[ "${WM1303_UPDATE_REPOSITORY:-}" =~ ^[a-z0-9][a-z0-9-]*/(openhop-wm1303|pyMC_WM1303)$ ]] || die "Invalid updater repository."
+    if [ "$WM1303_UPDATE_REPOSITORY" = asamonik/pyMC_WM1303 ]; then
+        WM1303_UPDATE_REPOSITORY=asamonik/openhop-wm1303
+    fi
 }
 
 [ "$(id -u)" = 0 ] || die "Run wm1303-upgrade through sudo."

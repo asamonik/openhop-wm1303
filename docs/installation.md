@@ -24,13 +24,13 @@
 Use the bootstrap one-liner — it automatically detects fresh install vs upgrade:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/asamonik/pyMC_WM1303/main/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo bash
 ```
 
 For unattended installation, select a region with an environment variable:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/asamonik/pyMC_WM1303/main/bootstrap.sh | sudo env WM1303_REGION=AU915 bash
+curl -fsSL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo env WM1303_REGION=AU915 bash
 ```
 
 The wizard selects the region and device-wide sync word. All channels initially
@@ -40,8 +40,8 @@ On upgrades the wizard is skipped and existing settings are preserved.
 ### Manual Installation
 
 ```bash
-git clone https://github.com/asamonik/pyMC_WM1303.git
-cd pyMC_WM1303
+git clone https://github.com/asamonik/openhop-wm1303.git
+cd openhop-wm1303
 sudo bash install.sh
 ```
 
@@ -234,7 +234,7 @@ identity's data or an apparently empty contact list.
 The bootstrap script handles both fresh install and upgrade automatically:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/asamonik/pyMC_WM1303/main/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo bash
 ```
 
 `bootstrap.sh` preserves local integration-checkout changes in a Git stash before
@@ -261,7 +261,7 @@ read the persisted job status and log.
 The root-owned configuration in `/usr/local/lib/pymc-wm1303/updater.conf` captures
 the installed service user, integration checkout, and its GitHub repository.
 Updates follow that repository's `main` branch, including an explicitly installed
-fork named `pyMC_WM1303`; they do not silently switch forks or rewrite remotes.
+fork named `openhop-wm1303` or `pyMC_WM1303`; they do not silently switch forks or rewrite remotes.
 Detached updates fetch that fork over HTTPS, so an SSH checkout does not require
 an interactive SSH agent. Public forks work without credentials. Private forks
 require unattended HTTPS credentials configured for the installed service user;
@@ -282,17 +282,25 @@ last 500 lines of `/var/log/wm1303-update.log`. The log is retained until the ne
 update. A second start is refused while a job is running. Older installations
 without this launcher must first use the bootstrap/manual upgrade once.
 
-The standalone bootstrap defaults to this fork, `asamonik/pyMC_WM1303`. For an
+The standalone bootstrap defaults to this fork, `asamonik/openhop-wm1303`. For an
 intentional fork, set `WM1303_REPO_URL` to its GitHub HTTPS or SSH URL; its basename
-must be `pyMC_WM1303` and the existing checkout origin must match. The GUI launcher
+must be `openhop-wm1303` or `pyMC_WM1303` and the existing checkout origin must match. The GUI launcher
 supplies the saved fork automatically.
+
+The previous `asamonik/pyMC_WM1303` URL is recognized as an alias of
+`asamonik/openhop-wm1303`. New installs use `~/openhop-wm1303`; an existing
+`~/pyMC_WM1303` checkout is reused in place when the new directory has no checkout.
+An explicit `INSTALL_DIR` still takes precedence. Existing GUI launchers need one
+bootstrap/manual upgrade to install the updated repository-name checks.
 
 > **Note:** `upgrade_bootstrap.sh` has been removed and superseded by `bootstrap.sh`.
 
 ### Manual Upgrade (From Existing Clone)
 
+Use your existing checkout directory (`~/pyMC_WM1303` on older installations):
+
 ```bash
-cd ~/pyMC_WM1303
+cd ~/openhop-wm1303
 git pull origin main
 sudo bash upgrade.sh
 ```
@@ -390,7 +398,7 @@ Should show `32768`. If not, reboot the Pi.
 │   ├── global_conf.json
 │   ├── reset_lgw.sh
 │   └── power_cycle_lgw.sh
-└── pyMC_WM1303/                       # This repository (if cloned here)
+└── openhop-wm1303/                       # This repository (if cloned here)
 │
 /etc/systemd/system/
 └── openhop-repeater.service

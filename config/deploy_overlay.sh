@@ -21,6 +21,9 @@ require_expected_origin() {
     expected_slug="${expected_url,,}"
     expected_slug="${expected_slug#https://github.com/}"
     expected_slug="${expected_slug%.git}"
+    # Accept the known GitHub rename without changing existing checkout remotes.
+    [ "$slug" != asamonik/pymc_wm1303 ] || slug=asamonik/openhop-wm1303
+    [ "$expected_slug" != asamonik/pymc_wm1303 ] || expected_slug=asamonik/openhop-wm1303
     if [ "${slug}" != "${expected_slug}" ]; then
         # Do not print the actual URL: it might contain embedded credentials.
         printf 'Unexpected origin for %s. Expected %s (HTTPS or SSH). Repository and remote were not changed; inspect origin before retrying.\n' \
@@ -132,8 +135,15 @@ wm1303_repository_slug() {
         ssh://git@github.com/*) slug="${slug#ssh://git@github.com/}" ;;
         *) return 1 ;;
     esac
-    [[ "$slug" =~ ^[a-z0-9][a-z0-9-]*/pymc_wm1303$ ]] || return 1
-    printf '%s/pyMC_WM1303\n' "${slug%/*}"
+    [[ "$slug" =~ ^[a-z0-9][a-z0-9-]*/(openhop-wm1303|pymc_wm1303)$ ]] || return 1
+    # This fork was renamed; other owners' legacy forks keep their own identity.
+    if [ "$slug" = asamonik/pymc_wm1303 ]; then
+        slug=asamonik/openhop-wm1303
+    fi
+    case "$slug" in
+        */pymc_wm1303) printf '%s/pyMC_WM1303\n' "${slug%/*}" ;;
+        *) printf '%s\n' "$slug" ;;
+    esac
 }
 
 install_wm1303_updater() {
@@ -144,7 +154,7 @@ install_wm1303_updater() {
     [[ "$source_dir" == /* ]] && [ -f "$source_dir/bootstrap.sh" ] || return 1
     origin=$(git -c "safe.directory=$source_dir" -C "$source_dir" remote get-url origin) || return 1
     repository=$(wm1303_repository_slug "$origin") || {
-        printf 'WM1303 updater requires a GitHub origin whose repository is pyMC_WM1303.\n' >&2
+        printf 'WM1303 updater requires a GitHub origin named openhop-wm1303 or pyMC_WM1303.\n' >&2
         return 1
     }
     [ ! -L "$lib_dir" ] || return 1

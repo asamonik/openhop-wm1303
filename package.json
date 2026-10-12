@@ -1,4 +1,5 @@
 {
+  "name": "openhop-wm1303",
   "dependencies": {
     "puppeteer-core": "^21.11.0"
   }

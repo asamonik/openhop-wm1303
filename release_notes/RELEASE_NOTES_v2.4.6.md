@@ -195,7 +195,7 @@ Run the standard bootstrap one-liner — it will pull the new overlay files and
 restart services automatically:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo bash
 ```
 
 No configuration changes are required.  The `.last_vacuum` file will be

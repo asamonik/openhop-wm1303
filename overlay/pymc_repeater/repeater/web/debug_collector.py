@@ -1229,7 +1229,7 @@ class DebugCollector:
         # WM1303 version file
         try:
             with open(resolve_config_path('version')) as f:
-                out.append(f"pyMC_WM1303 (overlay): {f.read().strip()}")
+                out.append(f"openhop-wm1303 (overlay): {f.read().strip()}")
         except Exception:
             pass
 

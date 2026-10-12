@@ -73,7 +73,7 @@ Logging and startup quality-of-life release. Eliminates all spurious warnings an
 ## Upgrade Instructions
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo bash
 ```
 
 The upgrade script will automatically apply all overlay changes and restart the service.

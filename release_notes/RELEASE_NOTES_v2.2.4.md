@@ -117,7 +117,7 @@ This release resolves critical TX reliability issues on both channels and improv
 Use the one-liner bootstrap:
 
 ```bash
-curl -sL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo bash
+curl -sL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo bash
 ```
 
 The upgrade script will:
