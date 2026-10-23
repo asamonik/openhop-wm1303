@@ -1,8 +1,10 @@
 # Project website
 
-The project landing page is a small static site in `site/`. The hardware Manager
-remains a separate application on the device; the public site does not connect
-to the radio or expose the management API.
+The project website is a minimal static setup guide in `site/`: hardware
+requirements, installation, Manager access, and service commands. It uses plain
+HTML and CSS, without JavaScript, external fonts, or a site generator. The
+hardware Manager remains a separate application on the device; the public site
+does not connect to the radio or expose the management API.
 
 ## Local preview
 
@@ -15,9 +17,9 @@ python3 -m http.server 8080 --directory _site
 ```
 
 Open `http://localhost:8080`. No Node packages or site generator are required.
-The build stages the landing page and four existing documentation screenshots
-in `_site/`, which is ignored by Git. All site asset paths are relative so the
-page also works under the `/openhop-wm1303/` project path.
+The build stages only the HTML, stylesheet, and favicon in `_site/`, which is
+ignored by Git. All site asset paths are relative so the page also works under
+the `/openhop-wm1303/` project path.
 
 ## GitHub Pages setup
 

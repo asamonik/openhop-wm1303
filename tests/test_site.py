@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from urllib.parse import unquote, urlsplit
 
-from scripts.build_site import ROOT, SCREENSHOTS, build
+from scripts.build_site import ROOT, build
 
 
 class PageParser(HTMLParser):
@@ -31,8 +31,7 @@ class SiteTests(unittest.TestCase):
             output = build(Path(directory) / "public")
             (output / "stale-file.txt").write_text("Must not be redeployed")
             build(output)
-            expected = {"index.html", "styles.css", "main.js", ".nojekyll", "assets/favicon.svg"}
-            expected.update(f"assets/{name}.png" for name in SCREENSHOTS)
+            expected = {"index.html", "styles.css", ".nojekyll", "assets/favicon.svg"}
             self.assertEqual(expected, {p.relative_to(output).as_posix() for p in output.rglob("*") if p.is_file()})
             parser = PageParser()
             parser.feed((output / "index.html").read_text())

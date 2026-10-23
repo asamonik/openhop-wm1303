@@ -1,11 +1,10 @@
-"""Stage only the public landing page and its selected documentation images."""
+"""Stage only the public static setup guide and its assets."""
 
 from pathlib import Path
 import shutil
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCREENSHOTS = ("status", "channels", "bridge-rules", "spectrum")
 
 
 def build(output=None):
@@ -14,8 +13,6 @@ def build(output=None):
     if output.exists():
         shutil.rmtree(output)
     shutil.copytree(ROOT / "site", output)
-    for name in SCREENSHOTS:
-        shutil.copy2(ROOT / "screenshots" / f"{name}.png", output / "assets" / f"{name}.png")
     (output / ".nojekyll").touch()
     return output
 
