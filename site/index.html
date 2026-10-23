@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Turn a compatible WM1303 concentrator into a MeshCore bridge and repeater. Explore OpenHop hardware, installation, and the WM1303 Manager.">
+  <meta name="theme-color" content="#f7f8f3">
+  <title>OpenHop WM1303 — Connect your mesh.</title>
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+  <script src="main.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <div class="container header-inner">
+      <a class="brand" href="#" aria-label="OpenHop home"><img src="assets/favicon.svg" alt="" width="34" height="34">OpenHop<span>WM1303</span></a>
+      <nav aria-label="Main navigation">
+        <a href="#overview">Overview</a><a href="#manager">Manager</a><a href="#hardware">Hardware</a><a href="#docs">Docs</a>
+      </nav>
+      <a class="github-link" href="https://github.com/asamonik/openhop-wm1303">GitHub <span aria-hidden="true">↗</span></a>
+    </div>
+  </header>
+  <main id="main">
+    <section class="hero container" id="overview" aria-labelledby="hero-title">
+      <div class="hero-copy">
+        <p class="eyebrow"><span class="status-dot" aria-hidden="true"></span> BUILT FOR MESHCORE</p>
+        <h1 id="hero-title">More channels.<br>One connected<br><span>mesh.</span></h1>
+        <p class="hero-description">Give your WM1303 a new role. A configurable LoRa bridge and repeater that brings your channels together, with a clear view of every hop.</p>
+        <div class="actions"><a class="button primary" href="#get-started">Get started <span aria-hidden="true">↗</span></a><a class="button secondary" href="https://github.com/asamonik/openhop-wm1303/blob/main/docs/README.md">Read the docs <span aria-hidden="true">→</span></a></div>
+        <p class="hero-note">SenseCAP M1 · SX1302 / SX1303 · Raspberry Pi</p>
+      </div>
+      <div class="mesh-visual" role="img" aria-label="OpenHop connects up to six configurable LoRa channels, A through F.">
+        <div class="visual-caption"><span class="tiny-label">THE CHANNEL BRIDGE</span><span class="visual-pill">LoRa ↔ MeshCore</span></div>
+        <svg class="mesh-map" viewBox="0 0 540 430" aria-hidden="true">
+          <defs><pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" fill="#c8d8d0"/></pattern></defs>
+          <rect width="540" height="430" fill="url(#grid)"/>
+          <circle cx="270" cy="215" r="152" fill="none" stroke="#d1ddd5"/>
+          <circle cx="270" cy="215" r="104" fill="none" stroke="#d1ddd5" stroke-dasharray="3 7"/>
+          <g stroke="#91aaa0" stroke-width="1.5"><path d="M270 215 142 91M270 215 398 91M270 215 455 215M270 215 398 339M270 215 142 339M270 215 85 215"/></g>
+          <g fill="#15765b"><circle cx="207" cy="154" r="4"/><circle cx="335" cy="153" r="4"/><circle cx="363" cy="215" r="4"/><circle cx="334" cy="277" r="4"/><circle cx="207" cy="277" r="4"/><circle cx="177" cy="215" r="4"/></g>
+          <rect x="206" y="151" width="128" height="128" rx="28" fill="#173f34"/>
+          <g stroke="#c1e5c6" stroke-width="2.5" fill="none" stroke-linecap="round"><path d="M252 205q18-22 36 0M242 195q28-32 56 0M262 215q8-11 16 0"/><circle cx="270" cy="224" r="3" fill="#c1e5c6" stroke="none"/></g>
+          <text x="270" y="250" text-anchor="middle" fill="white" font-size="15" font-weight="650">OpenHop</text>
+          <g fill="#fdfefa" stroke="#c5d4ca"><rect x="110" y="59" width="64" height="64" rx="18"/><rect x="366" y="59" width="64" height="64" rx="18"/><rect x="423" y="183" width="64" height="64" rx="18"/><rect x="366" y="307" width="64" height="64" rx="18"/><rect x="110" y="307" width="64" height="64" rx="18"/><rect x="53" y="183" width="64" height="64" rx="18"/></g>
+          <g fill="#224c3e" text-anchor="middle" font-size="22" font-weight="600"><text x="142" y="99">A</text><text x="398" y="99">B</text><text x="455" y="223">C</text><text x="398" y="347">D</text><text x="142" y="347">E</text><text x="85" y="223">F</text></g>
+        </svg>
+        <div class="visual-footer"><span><i aria-hidden="true"></i> Configurable forwarding</span><span>Up to 6 channels</span></div>
+      </div>
+    </section>
+    <div class="spec-strip"><div class="container specs"><p><strong>6</strong><span>LoRa channels, A–F</span></p><p><strong>2</strong><span>Radio paths, one system</span></p><p><strong>1</strong><span>Web-based Manager</span></p><p class="spec-text">Your hardware.<br><strong>Your mesh.</strong></p></div></div>
+    <section class="section container" aria-labelledby="features-title">
+      <div class="section-heading"><div><p class="eyebrow">MADE TO CONNECT</p><h2 id="features-title">A little hardware.<br>A lot of possibility.</h2></div><p>Bring channels together, decide what gets forwarded, and understand what your radio is doing.</p></div>
+      <div class="features">
+        <article><span class="feature-number">01 / CONNECT</span><h3>Bridge your channels.</h3><p>Connect up to six LoRa channels with configurable forwarding rules. Keep control over which packets go where.</p><a href="https://github.com/asamonik/openhop-wm1303/blob/main/docs/radio.md">Explore the channel model <span aria-hidden="true">↗</span></a></article>
+        <article><span class="feature-number">02 / CONTROL</span><h3>Make every hop count.</h3><p>Use duplicate suppression and transmit queues to manage traffic. Start with the channels your mesh actually needs.</p><a href="https://github.com/asamonik/openhop-wm1303/blob/main/docs/tx_queue.md">Understand the transmit path <span aria-hidden="true">↗</span></a></article>
+        <article><span class="feature-number">03 / OBSERVE</span><h3>See the whole picture.</h3><p>Check radio settings, packet traces, and spectrum activity in the WM1303 Manager, right from your browser.</p><a href="#manager">Take a look at the Manager <span aria-hidden="true">↓</span></a></article>
+      </div>
+    </section>
+    <section class="manager-section section" id="manager" aria-labelledby="manager-title">
+      <div class="container">
+        <div class="section-heading"><div><p class="eyebrow">MEET YOUR CONTROL ROOM</p><h2 id="manager-title">Less guessing.<br>More understanding.</h2></div><p>From channel settings to spectrum scans, keep the details of your bridge in view.</p></div>
+        <div class="preview-toolbar"><div class="preview-buttons" role="group" aria-label="Manager screenshot views" hidden><button type="button" data-view="status" aria-pressed="true">Status</button><button type="button" data-view="channels" aria-pressed="false">Channels</button><button type="button" data-view="bridge-rules" aria-pressed="false">Bridge rules</button><button type="button" data-view="spectrum" aria-pressed="false">Spectrum</button></div><span class="tiny-label">WM1303 MANAGER / UI PREVIEW</span></div>
+        <figure class="manager-preview"><a id="preview-link" href="assets/status.png" target="_blank" rel="noopener" aria-label="Open full-size Manager screenshot in a new tab"><img id="preview-image" src="assets/status.png" width="1440" height="2200" alt="WM1303 Manager status screen showing hardware health, received and transmitted packets, and packet activity." loading="lazy"></a><figcaption><span id="preview-caption" aria-live="polite">Hardware health and packet activity at a glance.</span><a href="https://github.com/asamonik/openhop-wm1303/blob/main/docs/ui.md">Manager guide <span aria-hidden="true">↗</span></a></figcaption></figure>
+        <p class="screenshot-note">Screenshots from the repository show an earlier release; labels and layout may differ. Select the image to view it in full.</p>
+      </div>
+    </section>
+    <section class="section container hardware-section" id="hardware" aria-labelledby="hardware-title">
+      <div><p class="eyebrow">START WITH THE RIGHT HARDWARE</p><h2 id="hardware-title">A new chapter for<br>your SenseCAP M1.</h2><p class="section-description">The reference setup pairs a Raspberry Pi 4 with a WM1302/WM1303 HAT and an SX1261 companion radio.</p><a class="text-link" href="https://github.com/asamonik/openhop-wm1303/blob/main/docs/hardware.md">Check the hardware guide <span aria-hidden="true">↗</span></a></div>
+      <div class="hardware-card"><dl><div><dt>Reference platform</dt><dd>SenseCAP M1 / Raspberry Pi 4</dd></div><div><dt>Concentrator</dt><dd>SX1302 or SX1303</dd></div><div><dt>Companion radio</dt><dd>SX1261 in the tested setup</dd></div><div><dt>Operating system</dt><dd>Raspberry Pi OS Lite<br><small>Bookworm or newer</small></dd></div><div><dt>Access</dt><dd>SSH + internet connection</dd></div></dl><p class="hardware-note">A companion radio is required for channel activity detection. RAK2287-based hotspots are incompatible; other boards may need SPI and GPIO adaptation.</p></div>
+    </section>
+    <section class="start-section section" id="get-started" aria-labelledby="start-title"><div class="container">
+      <div class="section-heading"><div><p class="eyebrow">FROM HARDWARE TO FIRST HOP</p><h2 id="start-title">Up and running.<br>One step at a time.</h2></div><p>The same bootstrap command handles a fresh installation or an upgrade, preserving existing settings.</p></div>
+      <ol class="steps"><li><span class="step-index">01</span><div><h3>Prepare your Pi.</h3><p>Install Raspberry Pi OS Lite, connect an antenna, enable SSH, and check the <a href="https://github.com/asamonik/openhop-wm1303/blob/main/docs/installation.md#prerequisites">prerequisites</a>.</p></div></li><li><span class="step-index">02</span><div><h3>Install or upgrade.</h3><p>Run the bootstrap command over SSH. A fresh install guides you through the region and channel preset.</p></div></li><li><span class="step-index">03</span><div><h3>Meet your Manager.</h3><p>Open <code>http://&lt;pi-ip&gt;:8000/wm1303.html</code> on your local network, sign in, and configure your channels.</p></div></li></ol>
+      <div class="terminal"><div class="terminal-bar"><span>INSTALL / UPGRADE</span><button id="copy-command" type="button" hidden>Copy command</button></div><pre><code id="install-command">curl -fsSL https://raw.githubusercontent.com/asamonik/openhop-wm1303/main/bootstrap.sh | sudo bash</code></pre></div><p class="install-note"><span id="copy-status" role="status"></span>Run only on compatible hardware. <a href="https://github.com/asamonik/openhop-wm1303/blob/main/bootstrap.sh">Review the installer</a> or follow the <a href="https://github.com/asamonik/openhop-wm1303/blob/main/docs/installation.md">full installation guide</a>.</p>
+    </div></section>
+    <section class="section container" id="docs" aria-labelledby="docs-title"><div class="section-heading"><div><p class="eyebrow">GO A LITTLE DEEPER</p><h2 id="docs-title">A guide for every next step.</h2></div><a class="text-link" href="https://github.com/asamonik/openhop-wm1303/blob/main/docs/README.md">All documentation <span aria-hidden="true">↗</span></a></div>
+      <div class="doc-links"><a href="https://github.com/asamonik/openhop-wm1303/blob/main/docs/configuration.md"><span><strong>Configuration</strong><small>Regions, channels, and saved settings</small></span><span aria-hidden="true">↗</span></a><a href="https://github.com/asamonik/openhop-wm1303/blob/main/docs/spi-troubleshooting.md"><span><strong>Troubleshooting</strong><small>SPI, GPIO, and hardware detection</small></span><span aria-hidden="true">↗</span></a><a href="https://github.com/asamonik/openhop-wm1303/blob/main/docs/repositories.md"><span><strong>Under the hood</strong><small>Architecture, dependencies, and overlays</small></span><span aria-hidden="true">↗</span></a><a href="https://github.com/asamonik/openhop-wm1303/tree/main/release_notes"><span><strong>Release notes</strong><small>Follow the project's development</small></span><span aria-hidden="true">↗</span></a></div>
+    </section>
+  </main>
+  <footer class="site-footer"><div class="container"><div class="footer-top"><a class="brand" href="#"><img src="assets/favicon.svg" alt="" width="30" height="30">OpenHop<span>WM1303</span></a><p>Built on the work of <a href="https://github.com/HansvanMeer/pyMC_WM1303">Hans van Meer</a> and the <a href="https://github.com/openhop-dev">OpenHop community</a>.</p><a class="text-link" href="https://github.com/asamonik/openhop-wm1303">View source <span aria-hidden="true">↗</span></a></div><div class="footer-bottom"><p>Code: PolyForm Noncommercial 1.0.0 · Docs &amp; assets: CC BY-NC 4.0</p><div><a href="https://github.com/asamonik/openhop-wm1303/blob/main/LICENSE">License</a><a href="https://github.com/asamonik/openhop-wm1303/blob/main/COMMERCIAL.md">Commercial use</a></div></div></div></footer>
+</body>
+</html>

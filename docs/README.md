@@ -28,5 +28,6 @@ site is required.
 - [Testing](testing.md) — local checks, integration tests, and hardware verification
 - [Release notes](../release_notes/) — version history
 - [Screenshots](../screenshots/) — Manager UI examples
+- [Project website](website.md) — local preview and GitHub Pages deployment
 
 [Back to the project README](../README.md)
