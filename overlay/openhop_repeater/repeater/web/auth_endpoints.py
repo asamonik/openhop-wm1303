@@ -3,6 +3,7 @@ Authentication endpoints for login and token management
 """
 
 import hashlib
+import json
 import logging
 import math
 import threading
@@ -15,6 +16,32 @@ from .auth.middleware import require_auth
 logger = logging.getLogger(__name__)
 
 _MIN_ADMIN_PASSWORD_LEN = 8
+
+
+class _InvalidRequest(ValueError):
+    """Malformed client input, distinct from storage or signing failures."""
+
+
+def _read_json_object():
+    try:
+        body = cherrypy.request.body.read().decode("utf-8")
+        data = json.loads(body) if body else {}
+    except (ValueError, UnicodeError) as exc:
+        raise _InvalidRequest("Request body must contain valid UTF-8 JSON") from exc
+    if not isinstance(data, dict):
+        raise _InvalidRequest("Request body must be a JSON object")
+    return data
+
+
+def _text_field(data, name, *, default="", strip=False):
+    value = data.get(name, default)
+    if not isinstance(value, str):
+        raise _InvalidRequest(f"{name} must be a string")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise _InvalidRequest(f"{name} must contain valid UTF-8 text") from exc
+    return value.strip() if strip else value
 
 
 class _LoginThrottle:
@@ -184,11 +211,8 @@ class TokensAPIEndpoint:
 
         elif cherrypy.request.method == "POST":
             try:
-                import json
-
-                body = cherrypy.request.body.read().decode("utf-8")
-                data = json.loads(body) if body else {}
-                name = data.get("name", "").strip()
+                data = _read_json_object()
+                name = _text_field(data, "name", strip=True)
 
                 if not name:
                     cherrypy.response.status = 400
@@ -209,6 +233,9 @@ class TokensAPIEndpoint:
                     "warning": "Save this token securely - it will not be shown again",
                 }
 
+            except _InvalidRequest as exc:
+                cherrypy.response.status = 400
+                return {"success": False, "error": str(exc)}
             except Exception as e:
                 logger.error(f"Token generation error: {e}")
                 cherrypy.response.status = 500
@@ -239,7 +266,9 @@ class TokensAPIEndpoint:
                 # Convert to int
                 try:
                     token_id_int = int(token_id)
-                except ValueError:
+                    if not 1 <= token_id_int <= 0x7FFFFFFFFFFFFFFF:
+                        raise ValueError("Token ID outside SQLite integer range")
+                except (ValueError, TypeError, OverflowError):
                     cherrypy.response.status = 400
                     return {"success": False, "error": "Invalid token ID"}
 
@@ -311,17 +340,14 @@ class AuthEndpoints:
 
         try:
             # Parse JSON body manually since we can't use json_in decorator with OPTIONS
-            import json
-
-            body = cherrypy.request.body.read().decode("utf-8")
-            data = json.loads(body) if body else {}
-
-            username = data.get("username", "").strip()
-            password = data.get("password", "")
-            client_id = data.get("client_id", "").strip()
+            data = _read_json_object()
+            username = _text_field(data, "username", strip=True)
+            password = _text_field(data, "password")
+            client_id = _text_field(data, "client_id", strip=True)
             client_ip = self._get_request_ip()
 
             if not username or not password or not client_id:
+                cherrypy.response.status = 400
                 return json.dumps(
                     {
                         "success": False,
@@ -416,8 +442,12 @@ class AuthEndpoints:
                     {"success": False, "error": "Invalid username or password"}
                 ).encode("utf-8")
 
+        except _InvalidRequest as exc:
+            cherrypy.response.status = 400
+            return json.dumps({"success": False, "error": str(exc)}).encode("utf-8")
         except Exception as e:
             logger.error(f"Login error: {e}")
+            cherrypy.response.status = 500
             return json.dumps({"success": False, "error": "Internal server error"}).encode("utf-8")
 
     @cherrypy.expose
@@ -446,8 +476,6 @@ class AuthEndpoints:
             raise cherrypy.HTTPError(405, "Method not allowed")
 
         try:
-            import json
-
             # Manual authentication check (can't use @require_auth since we need to handle OPTIONS)
             auth_header = cherrypy.request.headers.get("Authorization", "")
             api_key = cherrypy.request.headers.get("X-API-Key", "")
@@ -479,17 +507,17 @@ class AuthEndpoints:
                     }
 
             if not user_info:
+                cherrypy.response.status = 401
                 return json.dumps(
                     {"success": False, "error": "Unauthorized - Valid JWT or API token required"}
                 ).encode("utf-8")
 
             # Parse request body
-            body = cherrypy.request.body.read().decode("utf-8")
-            data = json.loads(body) if body else {}
-
-            client_id = data.get("client_id", user_info.get("client_id", "")).strip()
+            data = _read_json_object()
+            client_id = _text_field(data, "client_id", default=user_info.get("client_id") or "", strip=True)
 
             if not client_id:
+                cherrypy.response.status = 400
                 return json.dumps({"success": False, "error": "Client ID is required"}).encode(
                     "utf-8"
                 )
@@ -510,16 +538,18 @@ class AuthEndpoints:
                 }
             ).encode("utf-8")
 
+        except _InvalidRequest as exc:
+            cherrypy.response.status = 400
+            return json.dumps({"success": False, "error": str(exc)}).encode("utf-8")
         except Exception as e:
             logger.error(f"Token refresh error: {e}")
+            cherrypy.response.status = 500
             return json.dumps({"success": False, "error": "Failed to refresh token"}).encode(
                 "utf-8"
             )
 
     @cherrypy.expose
     def change_password(self):
-
-        import json
 
         cherrypy.response.headers["Content-Type"] = "application/json"
 
@@ -580,11 +610,7 @@ class AuthEndpoints:
 
         try:
             # Parse JSON body manually
-            body = cherrypy.request.body.read().decode("utf-8")
-            data = json.loads(body) if body else {}
-            if not isinstance(data, dict):
-                cherrypy.response.status = 400
-                return json.dumps({"success": False, "error": "Request body must be a JSON object"}).encode("utf-8")
+            data = _read_json_object()
 
             current_password = data.get("current_password", "")
             new_password = data.get("new_password", "")
@@ -664,6 +690,9 @@ class AuthEndpoints:
                 "restart_required": not live_updated, "message": message,
             }).encode("utf-8")
 
+        except _InvalidRequest as exc:
+            cherrypy.response.status = 400
+            return json.dumps({"success": False, "error": str(exc)}).encode("utf-8")
         except Exception as e:
             logger.error(f"Password change error: {e}")
             cherrypy.response.status = 500

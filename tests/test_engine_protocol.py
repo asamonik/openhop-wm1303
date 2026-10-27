@@ -45,7 +45,9 @@ def load_overlay(name):
            ROUTE_TYPE_TRANSPORT_DIRECT=3, ROUTE_TYPE_TRANSPORT_FLOOD=0)
     module("openhop_core.protocol.packet_utils", PacketHeaderUtils=object, PacketTimingUtils=object,
            PathUtils=SimpleNamespace(encode_path_len=lambda width, count: ((width - 1) << 6) | count))
-    module("repeater")
+    # Unchanged upstream helpers must be available in isolated test runs too,
+    # without depending on another test having imported them first.
+    module("repeater", __path__=[str(ROOT / "tests/fixtures/upstream/repeater")])
     module("repeater.airtime", AirtimeManager=object)
     module("repeater.data_acquisition", StorageCollector=object)
     module("repeater.bridge_engine", _active_bridge=None)
@@ -199,13 +201,31 @@ class EngineProtocolTests(unittest.TestCase):
         # Matching a single byte or crossing a hop boundary is not a matching hash.
         self.assertFalse(self.handler._is_flood_looped(PacketFixture(b"\x00\x12\x34\x00", 2), "strict"))
 
+    def test_packet_expiration_survives_wall_clock_corrections(self):
+        packet = PacketFixture()
+        for correction in (-3600, 3600):
+            for action in ("is_duplicate", "cleanup_cache", "_evict_expired"):
+                with self.subTest(correction=correction, action=action):
+                    self.handler.seen_packets.clear()
+                    with patch.object(engine.time, "time", return_value=1000), \
+                         patch.object(engine.time, "monotonic", return_value=100):
+                        self.handler.mark_seen(packet, "packet")
+                    for elapsed, expected in ((10, True), (60, True), (61, False)):
+                        with patch.object(engine.time, "time", return_value=1000 + correction + elapsed), \
+                             patch.object(engine.time, "monotonic", return_value=100 + elapsed):
+                            if action == "is_duplicate":
+                                self.assertEqual(self.handler.is_duplicate(packet, "packet"), expected)
+                            else:
+                                getattr(self.handler, action)()
+                        self.assertEqual("packet" in self.handler.seen_packets, expected)
+
     def test_refreshed_packet_does_not_hide_expired_cache_entries(self):
         packet = PacketFixture()
-        with patch.object(engine.time, "time", return_value=0):
+        with patch.object(engine.time, "monotonic", return_value=0):
             self.handler.mark_seen(packet, "first")
-        with patch.object(engine.time, "time", return_value=1):
+        with patch.object(engine.time, "monotonic", return_value=1):
             self.handler.mark_seen(packet, "second")
-        with patch.object(engine.time, "time", return_value=50):
+        with patch.object(engine.time, "monotonic", return_value=50):
             self.handler.mark_seen(packet, "first")
         self.handler._evict_expired(now=70)
         self.assertEqual(list(self.handler.seen_packets), ["first"])

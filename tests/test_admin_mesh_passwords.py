@@ -1,6 +1,5 @@
 """The shared Console/MeshCore admin password keeps separate roles usable."""
 
-import ast
 from copy import deepcopy
 import io
 import json
@@ -20,19 +19,13 @@ sys.path.append(str(ROOT / "tests/fixtures/upstream"))
 sys.path.insert(0, str(ROOT / "overlay/openhop_core/src"))
 
 from repeater.config_manager import ConfigManager
+from test_auth_inputs import auth_module
 
 
 class AdminMeshPasswordTests(unittest.TestCase):
     def setUp(self):
-        source = ROOT / "overlay/openhop_repeater/repeater/web/auth_endpoints.py"
-        cls = next(node for node in ast.parse(source.read_text()).body
-                   if isinstance(node, ast.ClassDef) and node.name == "AuthEndpoints")
-        cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef)
-                    and node.name == "change_password"]
-        cls.body[0].decorator_list = []
-        namespace = {"cherrypy": cherrypy, "logger": Mock()}
-        exec(compile(ast.Module(body=[cls], type_ignores=[]), str(source), "exec"), namespace)
-        self.auth = namespace["AuthEndpoints"]()
+        cls = auth_module().AuthEndpoints
+        self.auth = cls.__new__(cls)
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.path = Path(self.directory.name) / "config.yaml"

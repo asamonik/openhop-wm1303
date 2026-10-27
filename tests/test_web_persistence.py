@@ -22,6 +22,24 @@ with patch("subprocess.check_output", return_value=""), \
 
 
 class WebPersistenceTests(unittest.TestCase):
+    def test_debug_redaction_never_returns_raw_data_at_depth_limit(self):
+        collector = debug_collector.DebugCollector.__new__(debug_collector.DebugCollector)
+        secret = {'password': 'fixture-private-value'}
+        config = secret
+        for _ in range(21):
+            config = {'nested': config}
+        sanitized = collector._sanitize_config(config)
+        self.assertNotIn('fixture-private-value', json.dumps(sanitized))
+        self.assertIn('[REDACTED]', json.dumps(sanitized))
+        self.assertEqual(secret['password'], 'fixture-private-value')
+
+    def test_debug_redaction_accepts_non_string_yaml_mapping_keys(self):
+        collector = debug_collector.DebugCollector.__new__(debug_collector.DebugCollector)
+        config = {7: {'api_key': 'fixture-private-value', 'enabled': True}}
+        sanitized = collector._sanitize_config(config)
+        self.assertEqual(sanitized, {7: {'api_key': '[REDACTED]', 'enabled': True}})
+        self.assertEqual(config[7]['api_key'], 'fixture-private-value')
+
     def test_neighbour_ping_accepts_public_keys_and_cleans_up_failed_sends(self):
         import ast
         import asyncio
@@ -899,6 +917,44 @@ class WebPersistenceTests(unittest.TestCase):
                         self.assertRaises(wm1303_api.cherrypy.HTTPError):
                     api._channel_f_post()
                 self.assertEqual(ui_path.read_bytes(), saved)
+
+    def test_channel_power_errors_leave_saved_settings_and_runtime_files_unchanged(self):
+        from test_radio_bridge import backend_module
+        api = wm1303_api.WM1303API.__new__(wm1303_api.WM1303API)
+        original = json.dumps({'channels': [], 'region': {'code': 'EU868'}})
+        with tempfile.TemporaryDirectory() as directory:
+            ui_path = Path(directory) / 'wm1303_ui.json'
+            with patch.object(wm1303_api, '_UI_JSON', ui_path), \
+                    patch.object(wm1303_api, '_sync_config_yaml_channels') as yaml_sync, \
+                    patch.object(wm1303_api, 'sync_global_conf', return_value={'status': 'ok'}) as hal_sync, \
+                    patch.dict(sys.modules, {'openhop_core.hardware.wm1303_backend': backend_module}):
+                for channel in ('a', 'e', 'f'):
+                    for power in (11, 128, 12, 27):
+                        with self.subTest(channel=channel, power=power):
+                            ui_path.write_text(original)
+                            yaml_sync.reset_mock()
+                            hal_sync.reset_mock()
+                            setting = dict(frequency=869525000, tx_power=power)
+                            if channel == 'a':
+                                setting['active'] = True
+                                body, save = [setting], api._channels_post
+                            else:
+                                setting['enabled'] = True
+                                body, save = setting, getattr(api, '_channel_' + channel + '_post')
+                            with patch.object(wm1303_api, '_body', return_value=body):
+                                if power not in (12, 27):
+                                    with self.assertRaises(wm1303_api.cherrypy.HTTPError) as caught:
+                                        save()
+                                    self.assertEqual(caught.exception.status, 400)
+                                    self.assertEqual(ui_path.read_text(), original)
+                                    yaml_sync.assert_not_called()
+                                    hal_sync.assert_not_called()
+                                else:
+                                    self.assertEqual(json.loads(save())['status'], 'ok')
+                                    saved = json.loads(ui_path.read_text())
+                                    saved_channel = saved['channels'][0] if channel == 'a' else saved['channel_' + channel]
+                                    self.assertEqual(saved_channel['tx_power'], power)
+                                    hal_sync.assert_called_once()
 
     def test_config_regeneration_does_not_start_a_competing_forwarder(self):
         generated = {"SX130x_conf": {"radio_0": {"freq": 869000000}}}

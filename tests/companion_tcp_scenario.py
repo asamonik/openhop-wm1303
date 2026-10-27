@@ -149,6 +149,38 @@ class CompanionTCPTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await restored.stop()
 
+    async def test_unicode_channel_names_keep_valid_fixed_width_replies(self):
+        self.enable_sqlite()
+        cases = [
+            ("a" * 32, "a" * 32),
+            ("ä" * 16, "ä" * 16),
+            ("a" * 31 + "ä", "a" * 31),
+            ("a" * 30 + "€", "a" * 30),
+            ("a" * 29 + "📻", "a" * 29),
+            ("  channel  ", "  channel  "),
+        ]
+        for index, (name, _) in enumerate(cases):
+            self.bridge.channels.set(index, Channel(name=name, secret=bytes(range(32))))
+        await self.server._save_channels()
+
+        def check_frame(frame, index):
+            self.assertEqual(frame[:2], bytes([codes.RESP_CODE_CHANNEL_INFO, index]))
+            self.assertEqual(len(frame), 50)
+            expected = cases[index][1] if index < len(cases) else ""
+            self.assertEqual(frame[2:34].split(b"\0", 1)[0].decode("utf-8"), expected)
+            self.assertEqual(frame[34:], bytes(range(16)) if index < len(cases) else bytes(16))
+
+        for index in range(len(cases)):
+            with self.subTest(index=index):
+                check_frame(await self.command(codes.CMD_GET_CHANNEL, bytes([index])), index)
+        check_frame(await self.command(codes.CMD_GET_CHANNEL), 0)
+        for index in range(1, self.bridge.channels.max_channels):
+            check_frame(await self.read_frame(), index)
+        stored = self.store.companion_load_channels(self.server._storage_key)
+        for index, (name, _) in enumerate(cases):
+            self.assertEqual(self.bridge.get_channel(index).name, name)
+            self.assertEqual(stored[index]["name"], name)
+
     async def test_failed_bind_can_retry_without_duplicate_callbacks(self):
         port = self.server._server.sockets[0].getsockname()[1]
         bridge = self.make_bridge()

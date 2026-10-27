@@ -374,11 +374,11 @@ int sx1302_update(void) {
 #endif
 
     /* Update internal timestamp counter wrapping status */
-    timestamp_counter_get(&counter_us, &inst, &pps);
+    int status = timestamp_counter_get(&counter_us, &inst, &pps);
 
     _meas_time_stop(2, tm, __FUNCTION__);
 
-    return LGW_REG_SUCCESS;
+    return status == LGW_REG_SUCCESS ? LGW_REG_SUCCESS : LGW_REG_ERROR;
 }
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
@@ -1237,10 +1237,21 @@ int sx1302_lora_syncword(bool public, uint8_t lora_service_sf) {
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
 
-uint32_t sx1302_timestamp_counter(bool pps) {
+int sx1302_timestamp_counter_get(bool pps, uint32_t *count_us) {
     uint32_t inst_cnt, pps_cnt;
-    timestamp_counter_get(&counter_us, &inst_cnt, &pps_cnt);
-    return ((pps == true) ? pps_cnt : inst_cnt);
+    CHECK_NULL(count_us);
+    if (timestamp_counter_get(&counter_us, &inst_cnt, &pps_cnt) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
+    *count_us = pps ? pps_cnt : inst_cnt;
+    return LGW_REG_SUCCESS;
+}
+
+uint32_t sx1302_timestamp_counter(bool pps) {
+    /* Preserve the legacy value-only API without returning uninitialized data. */
+    uint32_t count_us = 0;
+    sx1302_timestamp_counter_get(pps, &count_us);
+    return count_us;
 }
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */

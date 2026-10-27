@@ -1701,11 +1701,11 @@ int lgw_get_trigcnt(uint32_t* trig_cnt_us) {
 
     CHECK_NULL(trig_cnt_us);
 
-    *trig_cnt_us = sx1302_timestamp_counter(true);
+    int status = sx1302_timestamp_counter_get(true, trig_cnt_us);
 
     DEBUG_PRINTF(" --- %s\n", "OUT");
 
-    return LGW_HAL_SUCCESS;
+    return status == LGW_REG_SUCCESS ? LGW_HAL_SUCCESS : LGW_HAL_ERROR;
 }
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
@@ -1715,11 +1715,11 @@ int lgw_get_instcnt(uint32_t* inst_cnt_us) {
 
     CHECK_NULL(inst_cnt_us);
 
-    *inst_cnt_us = sx1302_timestamp_counter(false);
+    int status = sx1302_timestamp_counter_get(false, inst_cnt_us);
 
     DEBUG_PRINTF(" --- %s\n", "OUT");
 
-    return LGW_HAL_SUCCESS;
+    return status == LGW_REG_SUCCESS ? LGW_HAL_SUCCESS : LGW_HAL_ERROR;
 }
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
@@ -1774,7 +1774,8 @@ const char* lgw_version_info() {
 
 uint32_t lgw_time_on_air(const struct lgw_pkt_tx_s *packet) {
     double t_fsk;
-    uint32_t toa_ms, toa_us;
+    uint32_t toa_ms;
+    uint64_t toa_us;
 
     DEBUG_PRINTF(" --- %s\n", "IN");
 
@@ -1784,8 +1785,8 @@ uint32_t lgw_time_on_air(const struct lgw_pkt_tx_s *packet) {
     }
 
     if (packet->modulation == MOD_LORA) {
-        toa_us = lora_packet_time_on_air(packet->bandwidth, packet->datarate, packet->coderate, packet->preamble, packet->no_header, packet->no_crc, packet->size, NULL, NULL, NULL);
-        toa_ms = (uint32_t)( (double)toa_us / 1000.0 + 0.5 );
+        toa_us = lora_packet_time_on_air64(packet->bandwidth, packet->datarate, packet->coderate, packet->preamble, packet->no_header, packet->no_crc, packet->size, NULL, NULL, NULL);
+        toa_ms = (uint32_t)((toa_us + 500) / 1000);
         DEBUG_PRINTF("INFO: LoRa packet ToA: %u ms\n", toa_ms);
     } else if (packet->modulation == MOD_FSK) {
         /* PREAMBLE + SYNC_WORD + PKT_LEN + PKT_PAYLOAD + CRC

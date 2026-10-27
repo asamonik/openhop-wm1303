@@ -59,6 +59,7 @@ class PacketRouter:
         self.queue = asyncio.Queue(maxsize=500)
         self.running = False
         self.router_task = None
+        self._lifecycle_lock = asyncio.Lock()
         # Serialize injects so one local TX completes before the next is processed
         self._inject_lock = asyncio.Lock()
         # (Packet hash, bridge identity) -> expiry/result. A duplicate retains
@@ -86,46 +87,58 @@ class PacketRouter:
         self._cap_drop_count: int = 0
 
     async def start(self):
-        self.running = True
-        self.router_task = asyncio.create_task(self._process_queue())
-        logger.info("Packet router started")
+        async with self._lifecycle_lock:
+            if self.router_task is not None and not self.router_task.done():
+                return
+            self.running = True
+            self.router_task = asyncio.create_task(self._process_queue())
+            logger.info("Packet router started")
     
     async def stop(self):
-        self.running = False
-        if self.router_task:
-            self.router_task.cancel()
+        # Keep a restart from admitting new work while old routes still drain.
+        async with self._lifecycle_lock:
+            self.running = False
             try:
-                await self.router_task
-            except asyncio.CancelledError:
-                pass
+                if self.router_task:
+                    self.router_task.cancel()
+                    # The consumer's own cancellation is expected. Cancellation
+                    # of this stop caller must still propagate after cleanup.
+                    await asyncio.gather(self.router_task, return_exceptions=True)
+                    if not self.router_task.cancelled():
+                        error = self.router_task.exception()
+                        if error is not None:
+                            raise error
 
-        # Drain in-flight tasks gracefully, then cancel any that outlast the
-        # timeout.  This mirrors what the old _route_tasks set enabled and gives
-        # in-progress packets a fair chance to finish (e.g. their TX delay sleep
-        # + send) before the process exits.
-        if self._route_tasks:
-            pending_snapshot = set(self._route_tasks)
-            logger.info(
-                "Draining %d in-flight route task(s) (5 s timeout)...",
-                len(pending_snapshot),
-            )
-            _, still_pending = await asyncio.wait(pending_snapshot, timeout=5.0)
-            if still_pending:
+                # Give delayed transmissions a chance to finish before shutdown.
+                if self._route_tasks:
+                    pending_snapshot = set(self._route_tasks)
+                    logger.info(
+                        "Draining %d in-flight route task(s) (5 s timeout)...",
+                        len(pending_snapshot),
+                    )
+                    _, still_pending = await asyncio.wait(pending_snapshot, timeout=5.0)
+                    if still_pending:
+                        logger.warning(
+                            "Cancelling %d route task(s) that did not finish within the shutdown timeout",
+                            len(still_pending),
+                        )
+            finally:
+                self.router_task = None
+                # Also join routes when stop is cancelled during either the
+                # consumer join or the drain, before releasing lifecycle ownership.
+                remaining = set(self._route_tasks)
+                for task in remaining:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*remaining, return_exceptions=True)
+
+            if self._cap_drop_count:
                 logger.warning(
-                    "Cancelling %d route task(s) that did not finish within the shutdown timeout",
-                    len(still_pending),
+                    "In-flight cap dropped %d packet(s) during this session — "
+                    "consider raising _max_in_flight if this is frequent",
+                    self._cap_drop_count,
                 )
-                for task in still_pending:
-                    task.cancel()
-                await asyncio.gather(*still_pending, return_exceptions=True)
-
-        if self._cap_drop_count:
-            logger.warning(
-                "In-flight cap dropped %d packet(s) during this session — "
-                "consider raising _max_in_flight if this is frequent",
-                self._cap_drop_count,
-            )
-        logger.info("Packet router stopped")
+            logger.info("Packet router stopped")
 
     def _on_route_done(self, task: asyncio.Task) -> None:
         """Done-callback for _route_packet tasks: decrement counter and surface errors."""

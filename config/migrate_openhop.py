@@ -24,6 +24,41 @@ def present(path):
     return path.exists() or path.is_symlink()
 
 
+def check_package_inventory(path):
+    """A recovery inventory must be usable before taking services offline."""
+    if path.is_symlink():
+        raise MigrationError(f"Package inventory must not be a symlink: {path}")
+    try:
+        packages = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(packages, list) or any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("name"), str) or not item["name"]
+            or not isinstance(item.get("version"), str) or not item["version"]
+            or (item.get("direct_url") is not None and not isinstance(item["direct_url"], dict))
+            for item in packages
+        ):
+            raise ValueError("expected a list of package names and versions")
+    except (OSError, ValueError) as exc:
+        raise MigrationError(f"Cannot read package inventory {path}; retain the old venv for recovery: {exc}") from exc
+
+
+def write_package_inventory(path, packages, owner):
+    """Publish a complete recovery inventory without replacing an older one."""
+    contents = json.dumps(packages, indent=2) + "\n"
+    fd, temporary = tempfile.mkstemp(prefix=".openhop-inventory-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            current = os.fstat(stream.fileno())
+            if (current.st_uid, current.st_gid) != (owner.st_uid, owner.st_gid):
+                os.fchown(stream.fileno(), owner.st_uid, owner.st_gid)
+            stream.write(contents)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, path)
+    finally:
+        os.unlink(temporary)
+
+
 def check_tree(source, target, *, canonical_wins=False):
     """Reject ambiguous trees and SQLite families before changing either side."""
     if source.is_symlink():
@@ -84,19 +119,49 @@ def archive(path):
 
 
 def copy_missing(source, target):
-    for item in source.iterdir():
-        dest = target / item.name
-        if not present(dest):
-            if item.is_symlink():
-                dest.symlink_to(os.readlink(item))
-            elif item.is_dir():
-                shutil.copytree(item, dest, symlinks=True, copy_function=copy_owned)
-                shutil.copystat(item, dest)
-                os.chown(dest, item.stat().st_uid, item.stat().st_gid)
-            else:
-                copy_owned(item, dest)
-        elif item.is_dir() and dest.is_dir() and not item.is_symlink() and not dest.is_symlink():
-            copy_missing(item, dest)
+    created = []
+
+    def copy_children(source_dir, target_dir):
+        for item in source_dir.iterdir():
+            dest = target_dir / item.name
+            if not present(dest):
+                # Record ownership before starting a possibly partial copy.
+                created.append(dest)
+                if item.is_symlink():
+                    dest.symlink_to(os.readlink(item))
+                elif item.is_dir():
+                    shutil.copytree(item, dest, symlinks=True, copy_function=copy_owned)
+                    # copytree preserves directory modes, but not ownership.
+                    # Repair all new descendants without following symlinks.
+                    for directory, _, _ in os.walk(item, followlinks=False):
+                        original = Path(directory)
+                        copied = dest / original.relative_to(item)
+                        info = original.stat()
+                        os.chown(copied, info.st_uid, info.st_gid)
+                        shutil.copystat(original, copied)
+                else:
+                    copy_owned(item, dest)
+            elif item.is_dir() and dest.is_dir() and not item.is_symlink() and not dest.is_symlink():
+                copy_children(item, dest)
+
+    try:
+        copy_children(source, target)
+    except BaseException as error:
+        # A failed WAL copy must not leave a newly copied .db that makes the
+        # next preflight reject its own partial migration as a foreign history.
+        # Originals and every preexisting canonical path remain untouched.
+        failures = []
+        for dest in reversed(created):
+            try:
+                if dest.is_dir() and not dest.is_symlink():
+                    shutil.rmtree(dest)
+                else:
+                    dest.unlink(missing_ok=True)
+            except OSError as exc:
+                failures.append(f"{dest}: {exc}")
+        if failures:
+            raise MigrationError("Copy failed and rollback was incomplete: " + "; ".join(failures)) from error
+        raise
 
 
 def copy_owned(source, target):
@@ -186,6 +251,10 @@ class Migration:
         return self.root / str(absolute).lstrip("/")
 
     def check(self):
+        for base in (self.old_base, self.base):
+            inventory = base / ".pre-openhop-packages.json"
+            if present(inventory):
+                check_package_inventory(inventory)
         for source, target, canonical_wins in self.pairs:
             check_tree(source, target, canonical_wins=canonical_wins)
         for base in (self.old_base, self.base):
@@ -228,7 +297,16 @@ class Migration:
                         if name and version:
                             packages.append({"name": name, "version": version,
                                              "direct_url": json.loads(dist.read_text("direct_url.json") or "null")})
-                inventory.write_text(json.dumps(packages, indent=2) + "\n")
+                write_package_inventory(inventory, packages, (self.base / "venv").stat())
+            # Synchronize existing inventories too: a previous attempt may
+            # have published the file but failed before its directory flush.
+            with inventory.open("rb") as stream:
+                os.fsync(stream.fileno())
+            directory = os.open(self.base, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
             archive(self.base / "venv")
         replacements = [
             ("/opt/pymc_repeater/repos/pyMC_core", "/opt/openhop_repeater/repos/openhop_core"),

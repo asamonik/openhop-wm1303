@@ -160,6 +160,63 @@ class TXObservationTests(IsolatedAsyncioTestCase):
         self.acknowledge(backend, [self.sent_ack()])
         self.assertTrue((await backend.send('channel_a', frame(kind=5)))['ok'])
 
+    async def test_unconfirmed_native_completion_keeps_guard_and_charges_airtime(self):
+        records = []
+        backend = self.backend(records)
+        manager = backend._tx_queue_manager = tx.TXQueueManager()
+        manager.add_channel('channel_a', 869618000)
+        budget = Mock()
+        budget.can_transmit.return_value = (True, 0)
+        scheduler = tx.GlobalTXScheduler(backend._send_for_scheduler, manager.queues,
+                                         airtime_manager=budget)
+        self.acknowledge(backend, [dict(self.sent_ack(), tx_result='tx_unconfirmed')])
+        await scheduler.start()
+        try:
+            result = await asyncio.wait_for(backend.send('channel_a', frame(kind=5)), 1)
+            self.assertFalse(result['ok'])
+            self.assertEqual(result['error'], 'tx_unconfirmed')
+            self.assertTrue(result['ack_received'])
+            self.assertTrue(result.get('airtime_uncertain'))
+            self.assertGreater(backend._last_tx_end, time.monotonic() + 0.25)
+            budget.record_tx.assert_called_once()
+            self.assertGreater(budget.record_tx.call_args.args[0], 0)
+            self.assertEqual(backend._sock.sendto.call_count, 1)
+            self.assertEqual(manager.queues['channel_a'].stats['total_sent'], 0)
+            self.assertEqual(backend._hourly_tx_fail, 1)
+            self.assertFalse(backend._pending_tx_acks)
+            self.assertFalse(backend._tx_echo_hashes)
+            self.assertEqual(records[0]['tx_result'], 'tx_unconfirmed')
+        finally:
+            await scheduler.stop()
+
+    async def test_native_power_rejection_finishes_without_retry_or_false_echo(self):
+        records = []
+        backend = self.backend(records)
+        manager = backend._tx_queue_manager = tx.TXQueueManager()
+        manager.add_channel('channel_a', 869618000)
+        scheduler = tx.GlobalTXScheduler(backend._send_for_scheduler, manager.queues)
+        self.acknowledge(backend, [
+            {'error': 'TX_POWER', 'phase': 'post_tx', 'tx_result': 'rejected',
+             'cad': {'enabled': False, 'detected': False, 'retries': 0, 'reason': ''},
+             'lbt': {'enabled': False, 'pass': None, 'retries': 0, 'rssi_dbm': None}},
+        ])
+        await scheduler.start()
+        try:
+            result = await asyncio.wait_for(backend.send('channel_a', frame(kind=5)), 1)
+            self.assertFalse(result['ok'])
+            self.assertEqual(result['error'], 'TX_POWER')
+            self.assertTrue(result['ack_received'])
+            self.assertEqual(result['tx_result'], 'rejected')
+            self.assertEqual(backend._sock.sendto.call_count, 1)
+            self.assertEqual(manager.queues['channel_a'].stats['total_sent'], 0)
+            self.assertFalse(backend._pending_tx_acks)
+            self.assertFalse(backend._tx_echo_hashes)
+            self.assertEqual(len(records), 1)
+            self.assertTrue(records[0]['ack_received'])
+            self.assertEqual(records[0]['tx_result'], 'rejected')
+        finally:
+            await scheduler.stop()
+
     async def test_missing_ack_and_cancelled_send_keep_unknown_checks(self):
         records = []
         backend = self.backend(records)

@@ -16,11 +16,13 @@ import logging
 import threading
 import time
 from collections import OrderedDict
+from copy import deepcopy
 from datetime import datetime, timezone
 
 logger = logging.getLogger('PacketTrace')
 
 _collector: TraceCollector | None = None
+_collector_lock = threading.Lock()
 
 MAX_TRACES = 1000  # v2.4.7+: raised from 200 to support all-channel tracing (channel_a/b/c/d/e)
 MAX_STEPS_PER_TRACE = 30
@@ -146,18 +148,20 @@ class TraceCollector:
                     'hash_size': hash_size,
                     'src_hash': src_hash,
                     'dst_hash': dst_hash,
-                    'path_hashes': path_hashes or [],
+                    'path_hashes': list(path_hashes) if path_hashes is not None else None,
                     'payload_hex': payload_hex,
                     'payload_full_size': payload_full_size,
                 }
                 # Evict oldest if at capacity
                 if len(self._traces) >= self._maxlen:
-                    evicted_key, _ = self._traces.popitem(last=False)
-                    # Clean up _active_key if it points to the evicted key
-                    for bh, ak in list(self._active_key.items()):
-                        if ak == evicted_key:
-                            del self._active_key[bh]
-                            break
+                    evicted_key, evicted = self._traces.popitem(last=False)
+                    base_hash = evicted['pkt_hash']
+                    # An older occurrence may be evicted while a newer trace
+                    # still uses its sequence. Retire bookkeeping only when
+                    # the active (most recent) occurrence leaves the buffer.
+                    if self._active_key.get(base_hash) == evicted_key:
+                        del self._active_key[base_hash]
+                        self._seq.pop(base_hash, None)
                 self._traces[lookup_key] = trace
             else:
                 # Move to end (most recent)
@@ -170,16 +174,18 @@ class TraceCollector:
             for key, value in (
                 ('channel', channel), ('type', pkt_type),
                 ('pkt_hash_full', pkt_hash_full), ('src_hash', src_hash),
-                ('dst_hash', dst_hash), ('path_hashes', path_hashes),
+                ('dst_hash', dst_hash),
                 ('payload_hex', payload_hex),
             ):
                 if value and not trace.get(key):
                     trace[key] = value
+            if path_hashes is not None and trace.get('path_hashes') is None:
+                trace['path_hashes'] = list(path_hashes)
             for key, value in (
                 ('hops', hops), ('hash_size', hash_size),
                 ('payload_full_size', payload_full_size),
             ):
-                if value is not None and not trace.get(key):
+                if value is not None and trace.get(key) is None:
                     trace[key] = value
 
             # Compute elapsed from first step
@@ -189,6 +195,7 @@ class TraceCollector:
             if len(trace['steps']) < MAX_STEPS_PER_TRACE:
                 _step = {
                     'name': step_name,
+                    'channel': channel,
                     'time': iso_now,
                     'elapsed_ms': elapsed_ms,
                     'detail': detail,
@@ -259,14 +266,28 @@ class TraceCollector:
         with self._lock:
             traces = list(self._traces.values())
 
-        # Filter
-        if status:
-            traces = [t for t in traces if t.get('status') == status]
-        if channel:
-            traces = [t for t in traces if t.get('channel') == channel]
+            if status:
+                # Echoes are observations within a trace, not a replacement
+                # for its TX outcome. Match the dashboard's echo selectors
+                # without turning a successful send into a dropped packet.
+                echo_steps = {
+                    'self_echo': {'self_echo', 'echo_dedup'},
+                    'mesh_echo': {'mesh_echo'},
+                    'echo_dedup': {'self_echo', 'mesh_echo', 'echo_dedup'},
+                }.get(status)
+                if echo_steps:
+                    traces = [t for t in traces if t.get('status') == status
+                              or any(s['name'] in echo_steps for s in t['steps'])]
+                else:
+                    traces = [t for t in traces if t.get('status') == status]
+            if channel:
+                names = {channel, _friendly_channel(channel)}
+                traces = [t for t in traces if t.get('channel') in names]
 
-        # Reverse for newest-first, apply limit
-        traces = list(reversed(traces))[:limit]
+            # Snapshot only the selected traces while writers are excluded.
+            # Nested steps and paths must not change during JSON encoding or
+            # allow a consumer to mutate the collector's retained history.
+            traces = deepcopy(list(reversed(traces))[:limit])
 
         # Strip internal fields before returning
         result = []
@@ -304,8 +325,12 @@ def get_collector() -> TraceCollector:
     """Get or create the module-level singleton TraceCollector."""
     global _collector
     if _collector is None:
-        _collector = TraceCollector(maxlen=MAX_TRACES)
-        logger.info('PacketTrace: collector initialized (maxlen=%d, gap_threshold=%.0fs)', MAX_TRACES, GAP_THRESHOLD)
+        with _collector_lock:
+            # UDP, bridge and HTTP threads may all reach first use together.
+            # Publishing separate collectors would lose the earlier events.
+            if _collector is None:
+                _collector = TraceCollector(maxlen=MAX_TRACES)
+                logger.info('PacketTrace: collector initialized (maxlen=%d, gap_threshold=%.0fs)', MAX_TRACES, GAP_THRESHOLD)
     return _collector
 
 

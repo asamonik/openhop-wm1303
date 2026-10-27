@@ -4,6 +4,7 @@ Run explicitly with the installed core/repeater on PYTHONPATH. All policy files,
 SQLite outcomes, authentication fixtures, and HTTP sockets are test-local.
 """
 
+import base64
 import json
 import tempfile
 import threading
@@ -11,7 +12,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from wsgiref.simple_server import WSGIRequestHandler, make_server
@@ -22,6 +23,9 @@ import yaml
 from repeater.data_acquisition.sqlite_handler import SQLiteHandler
 from repeater.web.api_endpoints import APIEndpoints
 from repeater.web.auth.cherrypy_tool import register_require_auth_tool
+from repeater.web.auth_endpoints import AuthEndpoints
+from repeater.web import packet_trace, wm1303_api
+from repeater.web.wm1303_api import WM1303API
 from repeater.web.http_server import _cors_response_headers
 
 
@@ -47,11 +51,13 @@ class AnalyticsHTTPTests(unittest.TestCase):
         self.saved_config = dict(cherrypy.config)
         self.saved_apps = dict(cherrypy.tree.apps)
         self.addCleanup(self.restore_cherrypy)
+        self.jwt = SimpleNamespace(verify_jwt=lambda token: {
+            "sub": "http-fixture", "client_id": "fixture",
+        } if token == "fixture-token" else None,
+            create_jwt=Mock(return_value="new-fixture-token"), expiry_minutes=15)
         cherrypy.config.update({
             "log.screen": False,
-            "jwt_handler": SimpleNamespace(verify_jwt=lambda token: {
-                "sub": "http-fixture", "client_id": "fixture",
-            } if token == "fixture-token" else None),
+            "jwt_handler": self.jwt,
             "token_manager": SimpleNamespace(verify_token=lambda token: None),
         })
         register_require_auth_tool()
@@ -59,6 +65,14 @@ class AnalyticsHTTPTests(unittest.TestCase):
             "tools.require_auth.on": True,
             "tools.response_headers.on": True,
             "tools.response_headers.headers": _cors_response_headers(),
+        }})
+        self.auth_manager = Mock()
+        auth = AuthEndpoints({"repeater": {"security": {"admin_password": "fixture-password"}}},
+                             self.jwt, cherrypy.config["token_manager"], self.auth_manager)
+        cherrypy.tree.mount(auth, "/api/auth", {"/": {"tools.require_auth.on": False}})
+        cherrypy.tree.mount(WM1303API.__new__(WM1303API), "/api/wm1303", {"/": {
+            "tools.require_auth.on": True,
+            "tools.trailing_slash.on": False,
         }})
 
         def application(environ, start_response):
@@ -91,7 +105,7 @@ class AnalyticsHTTPTests(unittest.TestCase):
         data = None
         if body is not None:
             headers["Content-Type"] = "application/json"
-            data = json.dumps(body).encode("utf-8")
+            data = body if isinstance(body, bytes) else json.dumps(body).encode("utf-8")
         req = Request(self.base + path, data=data, headers=headers, method=method)
         try:
             response = urlopen(req, timeout=3)
@@ -101,6 +115,97 @@ class AnalyticsHTTPTests(unittest.TestCase):
             status, headers, raw = response.status, response.headers, response.read()
         payload = json.loads(raw) if raw and headers.get_content_type() == "application/json" else raw
         return status, headers, payload
+
+    def test_region_edits_refresh_the_live_transport_key_cache(self):
+        from openhop_core.protocol import Packet
+        from openhop_core.protocol.transport_keys import calc_transport_code
+        from repeater.engine import RepeaterHandler
+
+        handler = RepeaterHandler.__new__(RepeaterHandler)
+        handler.storage = self.db
+        handler._transport_keys_cache = None
+        handler._transport_keys_cache_time = 0
+        handler._transport_keys_cache_ttl = 60
+        handler._transport_keys_cache_lock = threading.RLock()
+        self.api.daemon_instance.repeater_handler = handler
+        key = b'k' * 16
+        packet = Packet()
+        packet.header = 15 << 2  # RAW_CUSTOM over TRANSPORT_FLOOD
+        packet.payload = bytearray(b'transport-cache-http-fixture')
+        packet.payload_len = len(packet.payload)
+        packet.transport_codes = [calc_transport_code(key, packet), 0]
+
+        status, _, payload = self.request('/api/transport_keys', 'POST', {
+            'name': 'test-region', 'flood_policy': 'allow',
+            'transport_key': base64.b64encode(key).decode(),
+        })
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(payload['success'], payload)
+        key_id = payload['data']['id']
+        self.assertTrue(handler._check_transport_codes(packet)[0])
+        for policy, allowed in (('deny', False), ('allow', True)):
+            status, _, payload = self.request(f'/api/transport_key/{key_id}', 'PUT', {
+                'flood_policy': policy,
+            })
+            self.assertEqual(status, 200, payload)
+            self.assertTrue(payload['success'], payload)
+            self.assertEqual(handler._check_transport_codes(packet)[0], allowed)
+        status, _, payload = self.request(f'/api/transport_key/{key_id}', 'DELETE')
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(payload['success'], payload)
+        self.assertFalse(handler._check_transport_codes(packet)[0])
+
+    def test_auth_input_errors_are_json_http_errors_without_mutation(self):
+        for endpoint in ("login", "refresh", "change_password"):
+            for body in ([], None, b"{", b"\xff"):
+                with self.subTest(endpoint=endpoint, body=body):
+                    status, headers, payload = self.request(
+                        "/api/auth/" + endpoint, "POST", b"null" if body is None else body)
+                    self.assertEqual(status, 400, payload)
+                    self.assertEqual(headers.get_content_type(), "application/json")
+                    self.assertFalse(payload["success"])
+        self.jwt.create_jwt.assert_not_called()
+        self.auth_manager.update_and_save.assert_not_called()
+        self.assertEqual(self.request("/api/auth/refresh", "POST", {}, authenticated=False)[0], 401)
+        status, _, payload = self.request("/api/auth/login", "POST", {
+            "username": "admin", "password": "fixture-password", "client_id": "fixture",
+        }, authenticated=False)
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(payload["success"])
+        self.jwt.create_jwt.assert_called_once_with("admin", "fixture")
+
+    def test_radio_power_errors_preserve_settings_through_actual_http_routes(self):
+        ui_path = self.path / 'wm1303_ui.json'
+        original = json.dumps({'channels': [], 'region': {'code': 'EU868'}})
+        with patch.object(wm1303_api, '_UI_JSON', ui_path), \
+                patch.object(wm1303_api, '_sync_config_yaml_channels') as yaml_sync, \
+                patch.object(wm1303_api, 'sync_global_conf', return_value={'status': 'ok'}) as hal_sync:
+            for resource in ('channels', 'channel_e', 'channel_f'):
+                for power in (11, 128, 12, 27):
+                    with self.subTest(resource=resource, power=power):
+                        ui_path.write_text(original)
+                        yaml_sync.reset_mock()
+                        hal_sync.reset_mock()
+                        channel = {'frequency': 869525000, 'tx_power': power}
+                        if resource == 'channels':
+                            channel['active'] = True
+                            body = [channel]
+                        else:
+                            channel['enabled'] = True
+                            body = channel
+                        status, _, result = self.request('/api/wm1303/' + resource, 'POST', body)
+                        if power not in (12, 27):
+                            self.assertEqual(status, 400, result)
+                            self.assertEqual(ui_path.read_text(), original)
+                            yaml_sync.assert_not_called()
+                            hal_sync.assert_not_called()
+                        else:
+                            self.assertEqual(status, 200, result)
+                            self.assertEqual(result['status'], 'ok')
+                            saved = json.loads(ui_path.read_text())
+                            saved_channel = saved['channels'][0] if resource == 'channels' else saved[resource]
+                            self.assertEqual(saved_channel['tx_power'], power)
+                            hal_sync.assert_called_once()
 
     def test_lbt_http_summary_errors_preflight_and_auth(self):
         record = dict(timestamp=time.time() - 60, channel_id="channel_e", packet_type=5,
@@ -137,6 +242,25 @@ class AnalyticsHTTPTests(unittest.TestCase):
         self.assertEqual(headers["Access-Control-Allow-Origin"], "*")
         self.assertIn(result, ("", b""))  # Newer auth tools short-circuit preflight.
         self.assertEqual(self.request("/api/lbt_diagnostics", authenticated=False)[0], 401)
+
+    def test_trace_http_filters_repeated_queries_and_internal_errors(self):
+        collector = packet_trace.TraceCollector()
+        with patch.object(packet_trace, '_CHANNEL_FRIENDLY_NAMES', {'channel_a': 'High Alpine'}):
+            collector.trace_event('fixture-packet', 'received', channel='channel_a')
+            collector.trace_event('fixture-packet', 'self_echo')
+            with patch.object(packet_trace, 'get_collector', return_value=collector):
+                status, _, payload = self.request(
+                    '/api/wm1303/packet_traces?channel=channel_a&status=self_echo&limit=1')
+                self.assertEqual(status, 200, payload)
+                self.assertEqual([trace['pkt_hash'] for trace in payload['traces']], ['fixture-packet'])
+        for query in ('limit=-1', 'limit=1&limit=2', 'channel=a&channel=b', 'status=ok&status=error'):
+            with self.subTest(query=query):
+                self.assertEqual(self.request('/api/wm1303/packet_traces?' + query)[0], 400)
+        self.assertEqual(self.request('/api/wm1303/packet_traces', authenticated=False)[0], 401)
+        with patch.object(packet_trace, 'get_traces', side_effect=RuntimeError('fixture-private-path')):
+            status, _, payload = self.request('/api/wm1303/packet_traces')
+        self.assertEqual(status, 500)
+        self.assertNotIn('fixture-private-path', str(payload))
 
     def test_policy_http_read_validate_save_and_group_json_bodies(self):
         status, _, result = self.request("/api/policy")

@@ -220,7 +220,9 @@ Returns CAD event history.
 **Response includes:**
 - Per-channel CAD events with timestamps
 - **Clear** and **Detected** counts per channel
-- Detected means activity was found on all 5 CAD retries and the packet was force-sent
+- Detected means activity persisted through the native CAD retry limit (currently
+  15 retries); CAD permits proceeding, subject to enabled HAL LBT. It does not
+  prove that the packet was transmitted.
 
 > **v2.1.0 change:** The previous HW/SW source distinction has been removed. CAD now reports only Clear and Detected outcomes. The orphaned `/api/wm1303/cad_history` endpoint (which read from `spectrum_history.db`) has been removed.
 
@@ -262,31 +264,51 @@ Returns per-channel origin statistics — how many packets each channel sources 
 
 ## Deduplication Endpoints
 
-### GET `/api/wm1303/dedup/stats`
+### GET `/api/wm1303/dedup`
 
-Returns deduplication statistics.
+Returns `buckets` and `stats` for the dedup chart. The legacy `/dedup/stats`
+and `/dedup/events` paths resolve to this same handler and response format.
 
-**Response:**
-```json
-{
-  "total_seen": 15234,
-  "total_dropped_duplicate": 892,
-  "total_dropped_echo": 67,
-  "total_forwarded": 14275,
-  "per_channel": {
-    "channel_a": { "rx": 5234, "dedup": 312, "forwarded": 4922 },
-    "channel_b": { ... }
-  }
-}
-```
+Query parameters:
 
-### GET `/api/wm1303/dedup/events`
+- `range` — `1h` (default), `6h`, `24h`, `3d`, or `7d`.
+- `since`, `until` — Custom Unix timestamps; `since` is inclusive and `until`
+  is exclusive (defaults to now). Require `0 <= since < until`; supplying
+  `until` also requires `since`.
+- `bucket` — Positive integer bucket width in minutes; chosen automatically
+  when omitted. Its value in seconds must fit a signed 64-bit integer.
+  Retained summary data can require a coarser width, reported in each
+  bucket's `bucket_seconds`.
+- `raw=true` — Return `events`, `stats`, and `mode: "raw"` instead of buckets.
+  At most 10,000 retained raw events are returned in timestamp order.
 
-Returns recent dedup events for the dedup chart.
+`stats.total_forwarded`, `stats.total_duplicate`, the other event totals, and
+`stats.dedup_ratio` all describe the returned history. `dedup_seen_active` and
+`dedup_events_buffered` are current live-buffer gauges. Historical summary
+buckets overlapping a range boundary are included whole because exact counts
+within those buckets are no longer available.
 
-**Query parameters:**
-- `period` — Time window
-- `limit` — Max events
+If the database is missing or a query fails, the same formats use the bridge's
+recent in-memory buffer (at most 500 events). This fallback cannot recover
+older history. Malformed query values return HTTP 400.
+
+### GET `/api/wm1303/packet_traces`
+
+Returns recent in-memory traces in `traces`, newest first. Optional `limit`,
+`status`, and `channel` parameters select the returned traces. Each trace's
+`channel` identifies its first known channel; individual `steps` also carry
+their own `channel`, preserving complete names for multi-channel forwarding.
+The response is a snapshot: later events do not change an already returned
+trace. This bounded history is cleared when the process restarts.
+
+`limit` must be an integer from 1 to 1,000 (default 50). Channel filters accept
+canonical IDs such as `channel_a` or the configured display name. The
+`self_echo`, `mesh_echo`, and `echo_dedup` filters match observations within a
+trace; they do not replace its overall TX outcome. `self_echo` includes legacy
+`echo_dedup` steps, and `echo_dedup` selects all three echo step types, matching
+the dashboard's echo badges. Repeated/non-string filters and invalid limits
+return HTTP 400; a collector failure returns HTTP 500 without a traceback in
+the endpoint payload.
 
 ## System Endpoints
 

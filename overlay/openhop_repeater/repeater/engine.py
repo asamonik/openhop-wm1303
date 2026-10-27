@@ -3,6 +3,7 @@ import copy
 import logging
 import math
 import secrets
+import threading
 import time
 from collections import OrderedDict, deque
 from collections.abc import Mapping
@@ -198,6 +199,7 @@ class RepeaterHandler(BaseHandler):
         self._transport_keys_cache = None
         self._transport_keys_cache_time = 0
         self._transport_keys_cache_ttl = 60  # Cache for 60 seconds
+        self._transport_keys_cache_lock = threading.RLock()
 
         # Serialise all radio TX calls.
         #
@@ -676,7 +678,8 @@ class RepeaterHandler(BaseHandler):
             if prev_pkt is not None:
                 if "duplicates" not in prev_pkt:
                     prev_pkt["duplicates"] = []
-                prev_pkt["duplicates"].append(packet_record)
+                if len(prev_pkt["duplicates"]) < self.max_duplicates_per_packet:
+                    prev_pkt["duplicates"].append(packet_record)
             else:
                 self._append_recent_packet(packet_record)
         else:
@@ -684,7 +687,7 @@ class RepeaterHandler(BaseHandler):
 
     def cleanup_cache(self):
 
-        now = time.time()
+        now = time.monotonic()
         expired = [k for k, ts in self.seen_packets.items() if now - ts > self.cache_ttl]
         for k in expired:
             del self.seen_packets[k]
@@ -844,8 +847,8 @@ class RepeaterHandler(BaseHandler):
         effectively atomic within the asyncio event loop.  Do NOT add any await
         here without revisiting that invariant.
         """
-        # TTL-based dedup: expire entries older than cache_ttl seconds
-        now = time.time()
+        # Cache lifetimes use elapsed time, independent of clock corrections.
+        now = time.monotonic()
         self._evict_expired(now)
 
         pkt_hash = packet_hash or packet.calculate_packet_hash().hex().upper()
@@ -854,7 +857,7 @@ class RepeaterHandler(BaseHandler):
     def _evict_expired(self, now: float = None):
         """Remove entries from seen_packets that are older than cache_ttl."""
         if now is None:
-            now = time.time()
+            now = time.monotonic()
         cutoff = now - self.cache_ttl
         # OrderedDict is insertion-ordered; oldest entries are first
         while self.seen_packets:
@@ -867,7 +870,7 @@ class RepeaterHandler(BaseHandler):
     def mark_seen(self, packet: Packet, packet_hash: Optional[str] = None):
 
         pkt_hash = packet_hash or packet.calculate_packet_hash().hex().upper()
-        self.seen_packets[pkt_hash] = time.time()
+        self.seen_packets[pkt_hash] = time.monotonic()
         # Updating an existing key does not change OrderedDict insertion order.
         # Keep the oldest timestamp first so expiry can safely stop at it.
         self.seen_packets.move_to_end(pkt_hash)
@@ -930,6 +933,12 @@ class RepeaterHandler(BaseHandler):
         )
         return local_count >= max_counters[hash_size - 1]
 
+    def invalidate_transport_keys_cache(self) -> None:
+        """Invalidate after an HTTP edit without racing an RX snapshot refresh."""
+        with self._transport_keys_cache_lock:
+            self._transport_keys_cache = None
+            self._transport_keys_cache_time = 0
+
     def _check_transport_codes(self, packet: Packet) -> Tuple[bool, str]:
 
         if not self.storage:
@@ -939,17 +948,17 @@ class RepeaterHandler(BaseHandler):
         try:
             from openhop_core.protocol.transport_keys import calc_transport_code
 
-            # Check cache validity
-            current_time = time.time()
-            if (
-                self._transport_keys_cache is None
-                or current_time - self._transport_keys_cache_time > self._transport_keys_cache_ttl
-            ):
-                # Refresh cache
-                self._transport_keys_cache = self.storage.get_transport_keys()
-                self._transport_keys_cache_time = current_time
-
-            transport_keys = self._transport_keys_cache
+            # Serialize refresh/publication with HTTP invalidation. Each packet
+            # keeps its local snapshot after releasing the lock.
+            with self._transport_keys_cache_lock:
+                current_time = time.monotonic()
+                if (
+                    self._transport_keys_cache is None
+                    or current_time - self._transport_keys_cache_time > self._transport_keys_cache_ttl
+                ):
+                    self._transport_keys_cache = self.storage.get_transport_keys()
+                    self._transport_keys_cache_time = current_time
+                transport_keys = self._transport_keys_cache
 
             if not transport_keys:
                 return False, "No transport keys configured"

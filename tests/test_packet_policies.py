@@ -135,7 +135,7 @@ class PacketPolicyTests(unittest.TestCase):
         previous = self.path.read_bytes()
         runtime = self.service.engine
         saved_config = yaml.safe_dump(self.config)
-        with patch.object(service_module.os, "replace", side_effect=OSError("disk full")):
+        with patch("os.replace", side_effect=OSError("disk full")):
             with self.assertRaises(OSError):
                 self.service.update(document([], default_action="drop"))
         self.assertEqual(self.path.read_bytes(), previous)

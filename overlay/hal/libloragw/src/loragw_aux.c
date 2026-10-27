@@ -108,14 +108,15 @@ void wait_ms(unsigned long delay_ms) {
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
 
-uint32_t lora_packet_time_on_air(const uint8_t bw, const uint8_t sf, const uint8_t cr, const uint16_t n_symbol_preamble,
+uint64_t lora_packet_time_on_air64(const uint8_t bw, const uint8_t sf, const uint8_t cr, const uint16_t n_symbol_preamble,
                                  const bool no_header, const bool no_crc, const uint8_t size,
-                                 double * out_nb_symbols, uint32_t * out_nb_symbols_payload, uint16_t * out_t_symbol_us) {
+                                 double * out_nb_symbols, uint32_t * out_nb_symbols_payload, uint32_t * out_t_symbol_us) {
     uint8_t H, DE, n_bit_crc;
     uint8_t bw_pow;
-    uint16_t t_symbol_us;
+    uint32_t t_symbol_us;
     double n_symbol;
-    uint32_t toa_us, n_symbol_payload;
+    uint32_t n_symbol_payload;
+    uint64_t toa_us;
 
     /* Check input parameters */
     if (IS_LORA_DR(sf) == false) {
@@ -176,9 +177,9 @@ uint32_t lora_packet_time_on_air(const uint8_t bw, const uint8_t sf, const uint8
     n_symbol = (double)n_symbol_preamble + ((sf >= 7) ? 4.25 : 6.25) + 8.0 + (double)n_symbol_payload;
 
     /* Duration of packet in microseconds */
-    toa_us = (uint32_t)( (double)n_symbol * (double)t_symbol_us );
+    toa_us = (uint64_t)(n_symbol * (double)t_symbol_us);
 
-    DEBUG_PRINTF("INFO: LoRa packet ToA: %u us (n_symbol:%f, t_symbol_us:%u)\n", toa_us, n_symbol, t_symbol_us);
+    DEBUG_PRINTF("INFO: LoRa packet ToA: %llu us (n_symbol:%f, t_symbol_us:%u)\n", (unsigned long long)toa_us, n_symbol, t_symbol_us);
 
     /* Return details if required */
     if (out_nb_symbols != NULL) {
@@ -192,6 +193,29 @@ uint32_t lora_packet_time_on_air(const uint8_t bw, const uint8_t sf, const uint8
     }
 
     return toa_us;
+}
+
+/* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/* Preserve the upstream ABI for timestamp-correction callers. Those use
+   125/250/500kHz; narrower TX symbols and long packets use the wide API. */
+uint32_t lora_packet_time_on_air(const uint8_t bw, const uint8_t sf, const uint8_t cr, const uint16_t n_symbol_preamble,
+                               const bool no_header, const bool no_crc, const uint8_t size,
+                               double * out_nb_symbols, uint32_t * out_nb_symbols_payload, uint16_t * out_t_symbol_us) {
+    double symbols;
+    uint32_t payload_symbols, symbol_us;
+    uint64_t toa_us = lora_packet_time_on_air64(bw, sf, cr, n_symbol_preamble,
+                                               no_header, no_crc, size,
+                                               &symbols, &payload_symbols, &symbol_us);
+    if (toa_us == 0 || toa_us > UINT32_MAX ||
+        (out_t_symbol_us != NULL && symbol_us > UINT16_MAX)) {
+        printf("ERROR: LoRa airtime does not fit the requested legacy result\n");
+        return 0;
+    }
+    if (out_nb_symbols != NULL) *out_nb_symbols = symbols;
+    if (out_nb_symbols_payload != NULL) *out_nb_symbols_payload = payload_symbols;
+    if (out_t_symbol_us != NULL) *out_t_symbol_us = (uint16_t)symbol_us;
+    return (uint32_t)toa_us;
 }
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */

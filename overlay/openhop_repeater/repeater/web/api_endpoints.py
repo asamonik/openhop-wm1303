@@ -3398,9 +3398,7 @@ class APIEndpoints:
     def _invalidate_region_cache(self):
         handler = getattr(self.daemon_instance, "repeater_handler", None)
         if handler is not None:
-            # HTTP and RX run on different threads. Expire the snapshot without
-            # replacing it with None while an in-flight packet is reading it.
-            handler._transport_keys_cache_time = 0
+            handler.invalidate_transport_keys_cache()
 
     @staticmethod
     def _region_last_used(value):

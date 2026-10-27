@@ -205,6 +205,137 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await scheduler.stop()
 
+    async def test_duty_blocked_narrow_packet_does_not_expire_eligible_ack(self):
+        narrow = tx.ChannelTXQueue('channel_e', 869618000, 62.5, 12, 8, ttl_seconds=0.05)
+        fast = tx.ChannelTXQueue('channel_a', 869618000, 125, 7, 5, ttl_seconds=0.05)
+        budget = SimpleNamespace(
+            can_transmit=Mock(side_effect=lambda airtime: (airtime < 100, 1.0)),
+            record_tx=Mock(),
+        )
+        send = AsyncMock(return_value={'ok': True})
+        scheduler = tx.GlobalTXScheduler(send, {q.channel_id: q for q in (narrow, fast)},
+                                         airtime_manager=budget)
+        callers = [asyncio.create_task(narrow.enqueue(frame(payload=b'x' * 100))),
+                   asyncio.create_task(fast.enqueue(frame(kind=3, payload=b'ack!')))]
+        await asyncio.sleep(0)
+        await scheduler.start()
+        try:
+            slow_result, ack_result = await asyncio.wait_for(asyncio.gather(*callers), 1)
+            self.assertEqual(slow_result['error'], 'ttl_expired')
+            self.assertTrue(ack_result['ok'], ack_result)
+            send.assert_awaited_once()
+            self.assertEqual(send.await_args.args[1], 'channel_a')
+            budget.record_tx.assert_called_once()
+        finally:
+            await scheduler.stop()
+            await asyncio.gather(*callers, return_exceptions=True)
+
+    async def test_duty_held_bulk_retains_fifo_capacity_and_allows_same_channel_ack(self):
+        queue = self.queue(queue_size=2)
+        held = asyncio.Event()
+        allow_bulk = False
+
+        def can_transmit(airtime):
+            if not allow_bulk and airtime > 100:
+                held.set()
+                return False, 60
+            return True, 0
+
+        budget = SimpleNamespace(can_transmit=can_transmit, record_tx=Mock())
+        sent = []
+
+        async def send(txpk, *args, **kwargs):
+            sent.append(base64.b64decode(txpk['data']))
+            return {'ok': True}
+
+        scheduler = tx.GlobalTXScheduler(send, {queue.channel_id: queue}, airtime_manager=budget)
+        first, cancelled, last = [frame(payload=char * 100) for char in (b'a', b'b', b'c')]
+        callers = []
+        await scheduler.start()
+        try:
+            callers.append(asyncio.create_task(queue.enqueue(first)))
+            await asyncio.wait_for(held.wait(), 1)
+            self.assertEqual(queue.stats['pending'], 1)
+            abandoned = asyncio.create_task(queue.enqueue(cancelled))
+            await asyncio.sleep(0)
+            abandoned.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await abandoned
+            callers.append(asyncio.create_task(queue.enqueue(last)))
+            ack = frame(kind=3, payload=b'ack!')
+            self.assertTrue((await asyncio.wait_for(queue.enqueue(ack), 1))['ok'])
+            self.assertEqual(sent, [ack])
+            self.assertEqual(queue.stats['pending'], 2)
+            self.assertEqual(queue.stats['dropped_overflow'], 0)
+            allow_bulk = True
+            results = await asyncio.wait_for(asyncio.gather(*callers), 1)
+            self.assertTrue(all(result['ok'] for result in results))
+            self.assertEqual(sent, [ack, first, last])
+            self.assertEqual(budget.record_tx.call_count, 3)
+            await asyncio.wait_for(queue.queue.join(), 1)
+        finally:
+            await scheduler.stop()
+            await asyncio.gather(*callers, return_exceptions=True)
+
+    async def test_join_does_not_report_held_work_as_drained(self):
+        queue = self.queue()
+        held, rechecked = asyncio.Event(), asyncio.Event()
+        allowed = False
+        checks = 0
+
+        def can_transmit(airtime):
+            nonlocal checks
+            checks += 1
+            held.set()
+            if checks >= 3:
+                rechecked.set()
+            return allowed, 60
+
+        scheduler = tx.GlobalTXScheduler(AsyncMock(return_value={'ok': True}),
+            {queue.channel_id: queue},
+            airtime_manager=SimpleNamespace(can_transmit=can_transmit, record_tx=Mock()))
+        await scheduler.start()
+        caller = asyncio.create_task(queue.enqueue(frame()))
+        drained = None
+        try:
+            await asyncio.wait_for(held.wait(), 1)
+            drained = asyncio.create_task(queue.queue.join())
+            await asyncio.wait_for(rechecked.wait(), 1)
+            self.assertFalse(drained.done(), 'Held work must remain part of queue drain accounting')
+            self.assertEqual(queue.queue.qsize(), 1)
+            allowed = True
+            self.assertTrue((await asyncio.wait_for(caller, 1))['ok'])
+            await asyncio.wait_for(drained, 1)
+        finally:
+            await scheduler.stop()
+            if drained is not None:
+                drained.cancel()
+                await asyncio.gather(drained, return_exceptions=True)
+            await asyncio.gather(caller, return_exceptions=True)
+
+    async def test_random_delay_is_chosen_once_while_waiting_for_budget(self):
+        queue = self.queue()
+        allowed = False
+        budget = SimpleNamespace(can_transmit=lambda airtime: (allowed, 60), record_tx=Mock())
+        send = AsyncMock(return_value={'ok': True})
+        scheduler = tx.GlobalTXScheduler(send, {queue.channel_id: queue}, airtime_manager=budget)
+        scheduler._tx_delay_factor = 0.1
+        await scheduler.start()
+        caller = None
+        try:
+            with patch.object(tx.random, 'uniform', return_value=1.0) as random_delay:
+                caller = asyncio.create_task(queue.enqueue(frame(payload=b'hold')))
+                await asyncio.sleep(0.06)
+                send.assert_not_awaited()
+                random_delay.assert_called_once()
+                allowed = True
+                self.assertTrue((await asyncio.wait_for(caller, 1))['ok'])
+                random_delay.assert_called_once()
+        finally:
+            await scheduler.stop()
+            if caller is not None:
+                await asyncio.gather(caller, return_exceptions=True)
+
     async def test_duty_accounting_distinguishes_refusals_from_unknown_transmissions(self):
         outcomes = [
             ({'ok': False, 'tx_result': 'blocked', 'ack_received': True}, False),
@@ -277,10 +408,10 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         queue = self.queue()
         send = AsyncMock(return_value={"ok": True})
         entered = asyncio.Event()
-        hold_until = asyncio.get_running_loop().time() + 0.03
+        holding = True
         def hold():
             entered.set()
-            return hold_until
+            return asyncio.get_running_loop().time() + 1 if holding else 0
         scheduler = tx.GlobalTXScheduler(send, {queue.channel_id: queue}, tx_hold_getter=hold)
         await scheduler.start()
         try:
@@ -289,8 +420,10 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             caller.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await caller
-            await asyncio.sleep(0.05)
-            send.assert_not_awaited()
+            holding = False
+            self.assertTrue((await asyncio.wait_for(queue.enqueue(b"still live"), 1))['ok'])
+            send.assert_awaited_once()
+            self.assertEqual(base64.b64decode(send.await_args.args[0]['data']), b"still live")
             self.assertEqual(queue.stats["dropped_stale"], 1)
         finally:
             await scheduler.stop()
@@ -352,6 +485,43 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     await scheduler.stop()
 
+    async def test_abandoned_ack_releases_priority_capacity_without_evicting_live_ack(self):
+        for abandoned_by in ('cancellation', 'timeout'):
+            with self.subTest(abandoned_by=abandoned_by):
+                queue = self.queue(queue_size=2)
+                oldest = asyncio.create_task(queue.enqueue(frame(kind=3, payload=b'old!')))
+                tasks = [oldest]
+                try:
+                    await asyncio.sleep(0)
+                    if abandoned_by == 'cancellation':
+                        abandoned = asyncio.create_task(queue.enqueue(frame(kind=3, payload=b'gone')))
+                        tasks.append(abandoned)
+                        await asyncio.sleep(0)
+                        abandoned.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await abandoned
+                    else:
+                        real_timeout = asyncio.timeout
+
+                        def short_deadline(timeout):
+                            return real_timeout(0.001)
+
+                        with patch.object(tx.asyncio, 'timeout', side_effect=short_deadline):
+                            result = await queue.enqueue(frame(kind=3, payload=b'gone'))
+                        self.assertEqual(result['error'], 'timeout')
+                    newest = asyncio.create_task(queue.enqueue(frame(kind=3, payload=b'new!')))
+                    tasks.append(newest)
+                    await asyncio.sleep(0)
+                    self.assertFalse(oldest.done(), 'An abandoned ACK must not evict a live one')
+                    self.assertEqual(queue.stats['dropped_priority_overflow'], 0)
+                    self.assertEqual(queue.stats['dropped_stale'], 1)
+                    self.assertEqual(queue.stats['pending_priority'], 2)
+                    self.assertEqual([entry['payload'] for entry in queue._priority_queue],
+                                     [frame(kind=3, payload=b'old!'), frame(kind=3, payload=b'new!')])
+                finally:
+                    queue.stop()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
     async def test_retry_keeps_original_ttl(self):
         queue = self.queue(ttl_seconds=0.01)
         async def send(*args, **kwargs):
@@ -366,6 +536,95 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             backend.assert_awaited_once()
         finally:
             await scheduler.stop()
+
+    async def test_jit_retry_keeps_ack_priority_and_does_not_need_bulk_capacity(self):
+        for capacity in (1, 2):
+            with self.subTest(capacity=capacity):
+                queue = self.queue(queue_size=capacity)
+                ack = frame(kind=3, payload=b'ack!')
+                bulk = frame(payload=b'bulk')
+                entered, release = asyncio.Event(), asyncio.Event()
+                sent = []
+
+                async def send(txpk, *args, **kwargs):
+                    sent.append(base64.b64decode(txpk['data']))
+                    if len(sent) == 1:
+                        entered.set()
+                        await release.wait()
+                        return {'ok': False, 'tx_result': 'dropped', 'ack_received': True}
+                    return {'ok': True}
+
+                scheduler = tx.GlobalTXScheduler(send, {queue.channel_id: queue})
+                await scheduler.start()
+                callers = []
+                try:
+                    callers.append(asyncio.create_task(queue.enqueue(ack)))
+                    await asyncio.wait_for(entered.wait(), 1)
+                    callers.append(asyncio.create_task(queue.enqueue(bulk)))
+                    await asyncio.sleep(0)
+                    release.set()
+                    results = await asyncio.wait_for(asyncio.gather(*callers), 1)
+                    self.assertTrue(all(result['ok'] for result in results), results)
+                    self.assertEqual(sent, [ack, ack, bulk])
+                    self.assertEqual(queue.stats['total_retried'], 1)
+                finally:
+                    release.set()
+                    await scheduler.stop()
+                    await asyncio.gather(*callers, return_exceptions=True)
+
+    async def test_ack_retry_does_not_evict_an_already_admitted_ack(self):
+        queue = self.queue(queue_size=1)
+        entered, release = asyncio.Event(), asyncio.Event()
+        first, second = [frame(kind=3, payload=payload) for payload in (b'one!', b'two!')]
+        sent = []
+
+        async def send(txpk, *args, **kwargs):
+            payload = base64.b64decode(txpk['data'])
+            sent.append(payload)
+            if payload == first:
+                entered.set()
+                await release.wait()
+                return {'ok': False, 'tx_result': 'dropped', 'ack_received': True}
+            return {'ok': True}
+
+        scheduler = tx.GlobalTXScheduler(send, {queue.channel_id: queue})
+        await scheduler.start()
+        callers = []
+        try:
+            callers.append(asyncio.create_task(queue.enqueue(first)))
+            await asyncio.wait_for(entered.wait(), 1)
+            callers.append(asyncio.create_task(queue.enqueue(second)))
+            await asyncio.sleep(0)
+            release.set()
+            rejected, accepted = await asyncio.wait_for(asyncio.gather(*callers), 1)
+            self.assertFalse(rejected['ok'])
+            self.assertTrue(accepted['ok'])
+            self.assertEqual(sent, [first, second])
+            self.assertEqual(queue.stats['dropped_priority_overflow'], 0)
+        finally:
+            release.set()
+            await scheduler.stop()
+            await asyncio.gather(*callers, return_exceptions=True)
+
+    async def test_priority_sent_counts_confirmed_sends_not_dequeues(self):
+        ack = frame(kind=3, payload=b'ack!')
+        for success in (False, True):
+            with self.subTest(success=success):
+                queue = self.queue()
+                scheduler = tx.GlobalTXScheduler(AsyncMock(return_value={'ok': success}),
+                                                 {queue.channel_id: queue})
+                await scheduler.start()
+                try:
+                    await asyncio.wait_for(queue.enqueue(ack), 1)
+                    self.assertEqual(queue.stats['priority_sent'], int(success))
+                finally:
+                    await scheduler.stop()
+        queue = self.queue()
+        caller = asyncio.create_task(queue.enqueue(ack))
+        await asyncio.sleep(0)
+        queue.stop()
+        self.assertEqual((await caller)['error'], 'queue_stopped')
+        self.assertEqual(queue.stats['priority_sent'], 0)
 
     async def test_bad_backend_result_does_not_kill_scheduler(self):
         queue = self.queue()
@@ -383,8 +642,128 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await scheduler.stop()
 
+    async def test_restart_waits_for_inflight_shutdown_and_retains_worker(self):
+        queue = self.queue()
+        entered, cleaning, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def send(*args, **kwargs):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cleaning.set()
+                await release.wait()
+                raise
+
+        scheduler = tx.GlobalTXScheduler(send, {queue.channel_id: queue})
+        await scheduler.start()
+        caller = asyncio.create_task(queue.enqueue(b'old session'))
+        stopping = restarting = new_worker = None
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            stopping = asyncio.create_task(scheduler.stop())
+            await asyncio.wait_for(cleaning.wait(), 1)
+            restarting = asyncio.create_task(scheduler.start())
+            await asyncio.sleep(0)
+            new_worker = scheduler._task
+            self.assertFalse(restarting.done(), 'Restart must join the previous worker first')
+            release.set()
+            await asyncio.wait_for(asyncio.gather(stopping, restarting), 1)
+            self.assertIsNotNone(scheduler._task)
+            self.assertFalse(scheduler._task.done())
+            self.assertFalse(queue._stopped)
+            scheduler._send_func = AsyncMock(return_value={'ok': True})
+            self.assertTrue((await asyncio.wait_for(queue.enqueue(b'new session'), 1))['ok'])
+            self.assertEqual((await caller)['error'], 'scheduler_stopped')
+        finally:
+            release.set()
+            for task in (stopping, restarting):
+                if task is not None:
+                    await asyncio.gather(task, return_exceptions=True)
+            await scheduler.stop()
+            # The regression used to lose this worker when stop cleared _task.
+            if new_worker is not None and not new_worker.done():
+                new_worker.cancel()
+                await asyncio.gather(new_worker, return_exceptions=True)
+            await asyncio.gather(caller, return_exceptions=True)
+
+
+    async def test_cancelled_stop_cleans_queues_and_propagates_cancellation(self):
+        queue = self.queue()
+        entered, cleaning, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def send(*args, **kwargs):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaning.set()
+                await release.wait()
+
+        scheduler = tx.GlobalTXScheduler(send, {queue.channel_id: queue})
+        await scheduler.start()
+        active = asyncio.create_task(queue.enqueue(b'in flight'))
+        queued = stopping = None
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            queued = asyncio.create_task(queue.enqueue(b'waiting'))
+            await asyncio.sleep(0)
+            stopping = asyncio.create_task(scheduler.stop())
+            await asyncio.wait_for(cleaning.wait(), 1)
+            stopping.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(stopping, 1)
+            self.assertIsNone(scheduler._task)
+            self.assertTrue(queue._stopped)
+            self.assertEqual((await asyncio.wait_for(active, 1))['error'], 'scheduler_stopped')
+            self.assertEqual((await asyncio.wait_for(queued, 1))['error'], 'queue_stopped')
+        finally:
+            release.set()
+            for task in (stopping, active, queued):
+                if task is not None:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            await scheduler.stop()
+
 
 class BridgeResultTests(unittest.IsolatedAsyncioTestCase):
+    async def test_queued_tx_trace_channels_are_destinations_for_radios_and_endpoints(self):
+        from repeater.web.packet_trace import TraceCollector
+        collector = TraceCollector()
+        target = SimpleNamespace(channel_id='channel_b', channel_config={},
+                                 send=AsyncMock(return_value={'ok': True}))
+        bridge = bridge_engine.BridgeEngine([target], rules=[
+            {'source': 'channel_a', 'target': channel}
+            for channel in ('channel_b', 'channel_e', 'channel_f')
+        ])
+        for channel in ('channel_e', 'channel_f'):
+            bridge._endpoint_handlers[channel] = AsyncMock(return_value={'ok': True})
+        with patch.object(bridge_engine, '_trace', side_effect=collector.trace_event):
+            await bridge._forward_by_rules('channel_a', frame(), packet_hash(frame()), 'RAW_CUSTOM')
+        queued = [step for trace in collector.get_traces() for step in trace['steps']
+                  if step['name'] == 'tx_enqueue']
+        self.assertEqual([step['channel'] for step in queued], ['channel_b', 'channel_e', 'channel_f'])
+
+    async def test_invalid_rx_cannot_poison_dedup_or_hide_behind_a_valid_packet(self):
+        valid = frame(payload=b'identity')
+        invalid = bytes([valid[0] | 0x40]) + valid[1:]  # Unsupported payload version.
+        self.assertEqual(packet_hash(invalid), packet_hash(valid))
+        source = SimpleNamespace(channel_id='channel_a', wait_for_rx=AsyncMock(
+            side_effect=[invalid, valid, invalid, valid, asyncio.CancelledError()]))
+        bridge = bridge_engine.BridgeEngine([source])
+        bridge._running = True
+        bridge._forward_by_rules = AsyncMock(return_value=True)
+        bridge._update_repeater_counters = Mock()
+        try:
+            await asyncio.wait_for(bridge._rx_loop(source), 1)
+            bridge._forward_by_rules.assert_awaited_once()
+            self.assertEqual(bridge._forward_by_rules.await_args.args[1], valid)
+            self.assertEqual(bridge.dropped_protocol_violation, 2)
+            self.assertEqual(bridge.dropped_duplicate, 1)
+        finally:
+            bridge.stop()
+            await bridge.wait_closed()
+
     async def test_shutdown_drains_accepted_batch_without_blocking_loop(self):
         bridge = bridge_engine.BridgeEngine([])
         entered, release = threading.Event(), threading.Event()
@@ -592,6 +971,27 @@ class VirtualRadioTests(unittest.IsolatedAsyncioTestCase):
 
 
 class BackendHelperTests(unittest.TestCase):
+    def test_transmitting_channels_require_power_supported_by_generated_lut(self):
+        for channel in ('a', 'e', 'f'):
+            for power in (-129, 0, 11, 28, 128, 12, 27):
+                with self.subTest(channel=channel, power=power):
+                    settings = dict(frequency=869525000, tx_power=power)
+                    if channel == 'a':
+                        settings['active'] = True
+                        ui = {'channels': [settings]}
+                    else:
+                        settings['enabled'] = True
+                        ui = {'channel_' + channel: settings}
+                    if power in (12, 27):
+                        conf = backend_module._generate_bridge_conf({}, ui)['SX130x_conf']
+                        self.assertIn(power, [entry['rf_power'] for entry in conf['radio_0']['tx_gain_lut']])
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'tx_power'):
+                            backend_module._generate_bridge_conf({}, ui)
+                    # Receive-only channels do not apply their stored TX power.
+                    settings['tx_enabled'] = False
+                    backend_module._generate_bridge_conf({}, ui)
+
     def test_companion_reports_active_channel_snapshot_and_power_capability(self):
         backend = backend_module.WM1303Backend.__new__(backend_module.WM1303Backend)
         narrow = dict(enabled=True, frequency=869618000, bandwidth=62500,
@@ -687,6 +1087,20 @@ class BackendHelperTests(unittest.TestCase):
             with self.subTest(section=section, key=key), self.assertRaises(ValueError):
                 backend_module._generate_bridge_conf({}, candidate)
 
+    def test_lbt_defaults_match_e_and_f_receiver_bandwidths(self):
+        for channel, expected_bandwidth in (('channel_e', 62500), ('channel_f', 250000)):
+            with self.subTest(channel=channel):
+                # Omitted bandwidth has an established per-radio default.
+                ui = {channel: dict(enabled=True, frequency=869525000, lbt_enabled=True)}
+                before = json.dumps(ui, sort_keys=True)
+                config = backend_module._generate_bridge_conf({}, ui)['SX130x_conf']
+                receiver = (config['sx1261_conf']['lora_rx'] if channel == 'channel_e'
+                            else config['chan_Lora_std'])
+                self.assertEqual(receiver['bandwidth'], expected_bandwidth)
+                self.assertEqual(config['sx1261_conf']['lbt']['channels'][0]['bandwidth'],
+                                 expected_bandwidth)
+                self.assertEqual(json.dumps(ui, sort_keys=True), before)
+
     def test_receive_datarate_is_exact_and_rejects_bad_values(self):
         self.assertEqual(backend_module._parse_datr("SF8BW62"), (8, 62500))
         self.assertEqual(backend_module._parse_datr("SF8BW62.5"), (8, 62500))
@@ -722,6 +1136,131 @@ class BackendLifecycleTests(unittest.IsolatedAsyncioTestCase):
         backend._pull_addr = ('127.0.0.1', 9999)
         backend._sock = Mock()
         return backend
+
+    async def test_tx_ack_gateway_id_bytes_do_not_change_json_boundary(self):
+        backend = self.backend()
+        body = json.dumps({'txpk_ack': {'error': 'NONE', 'phase': 'post_tx',
+                                       'tx_result': 'sent'}}).encode()
+        # A gateway EUI is arbitrary binary, and can contain JSON delimiters.
+        gateway_ids = [bytes(8), b'']  # Current and legacy four-byte headers.
+        gateway_ids.extend(bytes([0xff] * offset + [0x7b] + [0xfe] * (7 - offset))
+                           for offset in range(8))
+        for token, gateway_id in enumerate(gateway_ids):
+            with self.subTest(gateway_id=gateway_id.hex()):
+                future = backend._tx_ack_register_future(token)
+                try:
+                    backend._handle_udp(bytes([2, 0, token, backend_module.PKT_TX_ACK])
+                                        + gateway_id + body, backend._pull_addr)
+                    await asyncio.sleep(0)  # Deliver the thread-safe future result.
+                    self.assertTrue(future.done(), 'The post-TX ACK must resolve its pending send')
+                    self.assertTrue(future.result()['ok'])
+                finally:
+                    backend._tx_ack_unregister_future(token)
+                    future.cancel()
+
+    async def test_malformed_tx_ack_shape_preserves_wait_for_actual_outcome(self):
+        backend = self.backend()
+        invalid_acks = [None, [], 'sent', 7,
+                        {'error': [], 'phase': 'post_tx', 'tx_result': 'sent'},
+                        {'error': 'NONE', 'phase': 'post_tx', 'tx_result': ['sent']}]
+        for token, payload in enumerate(invalid_acks):
+            with self.subTest(payload=payload):
+                future = backend._tx_ack_register_future(token)
+                header = bytes([2, 0, token, backend_module.PKT_TX_ACK]) + bytes(8)
+                try:
+                    backend._handle_udp(header + json.dumps({'txpk_ack': payload}).encode(),
+                                        backend._pull_addr)
+                    await asyncio.sleep(0)
+                    self.assertFalse(future.done())
+                    backend._handle_udp(header + json.dumps({'txpk_ack': {
+                        'error': 'NONE', 'phase': 'post_tx', 'tx_result': 'blocked',
+                    }}).encode(), backend._pull_addr)
+                    await asyncio.sleep(0)
+                    self.assertEqual(future.result()['tx_result'], 'blocked')
+                finally:
+                    backend._tx_ack_unregister_future(token)
+                    future.cancel()
+
+    async def test_invalid_optional_ack_diagnostics_remain_unknown(self):
+        backend = self.backend()
+        future = backend._tx_ack_register_future(1)
+        try:
+            ack = {'txpk_ack': {'error': 'NONE', 'phase': 'post_tx', 'tx_result': 'sent',
+                               'cad': ['clear'], 'lbt': 'passed'}}
+            backend._handle_udp(bytes([2, 0, 1, backend_module.PKT_TX_ACK]) + bytes(8)
+                                + json.dumps(ack).encode(), backend._pull_addr)
+            await asyncio.sleep(0)
+            result = future.result()
+            self.assertTrue(result['ok'])
+            self.assertEqual(result['cad'], {})
+            self.assertEqual(result['lbt'], {})
+            self.assertIsNone(result['cad_detected'])
+            self.assertIsNone(result['lbt_pass'])
+        finally:
+            backend._tx_ack_unregister_future(1)
+            future.cancel()
+
+    async def test_delayed_duplicate_tx_ack_cannot_complete_the_next_transmission(self):
+        backend = self.backend()
+        backend.channels = {'channel_a': {'frequency': 869618000, 'spreading_factor': 8,
+                                          'bandwidth': 125000, 'coding_rate': 5}}
+        backend._next_tx_token = 0xFFFF  # Exercise the wire-sized sequence wrap too.
+        datagrams = []
+
+        def acknowledgement(datagram, result):
+            return (bytes([2, datagram[1], datagram[2], backend_module.PKT_TX_ACK]) + bytes(8)
+                    + json.dumps({'txpk_ack': {'error': 'NONE', 'phase': 'post_tx',
+                                              'tx_result': result}}).encode())
+
+        def sendto(datagram, address):
+            datagrams.append(datagram)
+            if len(datagrams) == 2:
+                # UDP may duplicate/reorder a response from the previous TX.
+                backend._loop.call_soon(backend._handle_udp,
+                                        acknowledgement(datagrams[0], 'sent'), address)
+            backend._loop.call_soon(backend._handle_udp, acknowledgement(
+                datagram, 'sent' if len(datagrams) == 1 else 'blocked'), address)
+
+        backend._sock.sendto.side_effect = sendto
+        with patch.object(backend_module.random, 'randint', return_value=7):
+            first = await asyncio.wait_for(backend.send('channel_a', frame(payload=b'first')), 1)
+            second = await asyncio.wait_for(backend.send('channel_a', frame(payload=b'second')), 1)
+        self.assertTrue(first['ok'])
+        self.assertFalse(second['ok'], 'An earlier ACK must not prove this packet was sent')
+        self.assertEqual(second['tx_result'], 'blocked')
+        self.assertNotEqual(datagrams[0][1:3], datagrams[1][1:3])
+        self.assertEqual([packet[1:3] for packet in datagrams], [b'\xff\xff', b'\x00\x00'])
+        self.assertNotIn(packet_hash(frame(payload=b'second')), backend._tx_echo_hashes)
+        self.assertFalse(backend._pending_tx_acks)
+
+    async def test_rx_accepts_short_valid_frames_and_rejects_truncated_frames(self):
+        backend = self.backend()
+        radio = SimpleNamespace(channel_config={
+            'frequency': 869525000, 'bandwidth': 125000, 'spreading_factor': 9,
+        }, enqueue_rx=Mock())
+        backend.virtual_radios = {'channel_a': radio}
+        backend._update_rx_stats = Mock()
+        backend._calculate_dynamic_tx_hold = Mock(return_value=0)
+        # CONTROL and MULTIPART may have one payload byte; RAW_CUSTOM may
+        # have none. All of these are shorter than the former 5-byte cutoff.
+        accepted = [frame(kind=kind, payload=payload) for kind, payload in (
+            (15, b''), (15, b'x'), (15, b'xx'), (11, b'x'), (10, b'x'),
+        )]
+        rejected = [b'\x3d', frame(kind=11, payload=b''),
+                    frame(kind=10, payload=b''), frame(kind=3, payload=b'x')]
+        with patch.object(bridge_engine, '_active_bridge', None):
+            for packet in accepted + rejected:
+                with self.subTest(packet=packet):
+                    radio.enqueue_rx.reset_mock()
+                    backend._dispatch_rx({
+                        'freq': 869.525, 'datr': 'SF9BW125', 'stat': 1,
+                        'rssi': -90, 'lsnr': 3,
+                        'data': base64.b64encode(packet).decode(),
+                    })
+                    if packet in accepted:
+                        radio.enqueue_rx.assert_called_once_with(packet, rssi=-90, snr=3)
+                    else:
+                        radio.enqueue_rx.assert_not_called()
 
     async def test_missing_queue_cannot_bypass_bound_airtime_manager(self):
         backend = self.backend()

@@ -3,16 +3,14 @@
 from copy import deepcopy
 import logging
 import math
-import os
 from pathlib import Path
 import re
-import stat
-import tempfile
 import threading
 
 import yaml
 
 from .policy_engine import PolicyEngine, SUPPORTED_ACTIONS, default_policy_engine_config
+from .atomic_file import atomic_write_text
 
 
 logger = logging.getLogger("PolicyService")
@@ -362,23 +360,9 @@ class PolicyService:
             return normalize_document(payload, existing["groups"], project_groups=not preview or "groups" in payload)
 
     def _persist(self, document):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        previous = self.path.stat() if self.path.exists() else None
-        descriptor, temporary = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.path.parent)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                if previous is not None:
-                    current = os.fstat(stream.fileno())
-                    if (previous.st_uid, previous.st_gid) != (current.st_uid, current.st_gid):
-                        os.fchown(stream.fileno(), previous.st_uid, previous.st_gid)
-                    os.fchmod(stream.fileno(), stat.S_IMODE(previous.st_mode))
-                yaml.safe_dump(document, stream, sort_keys=False, allow_unicode=True)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, self.path)
-        finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
+        # Share config-file ownership, cleanup and directory-flush semantics.
+        # Serialize first, so invalid YAML values cannot affect the saved file.
+        atomic_write_text(self.path, yaml.safe_dump(document, sort_keys=False, allow_unicode=True))
 
     def _save(self, document):
         # Compile and persist completely before publishing the new engine.

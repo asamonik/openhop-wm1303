@@ -277,8 +277,6 @@ class BridgeEngine:
         self._repeater_engine = None     # RepeaterHandler instance for counter updates
         self._endpoint_handlers: dict[str, callable] = {}  # name -> callback
 
-        self._endpoint_handlers: dict[str, callable] = {}  # name -> callback
-
         # Origin channel counters: track how many packets each channel sources for the repeater
         self._origin_channel_counts: dict[str, int] = {}
         self._origin_channel_lock = threading.Lock()
@@ -964,7 +962,7 @@ class BridgeEngine:
                 # unified rf_sends serialization below, so we can reorder them.
                 if rule_target in self.RF_ENDPOINTS:
                     rf_sends.append((rule_target, rule_id, tx_delay, 'endpoint', handler, rule_display))
-                    _trace(pkt_hash8, 'tx_enqueue', channel=source_cid, pkt_type=pkt_type_name,
+                    _trace(pkt_hash8, 'tx_enqueue', channel=rule_target, pkt_type=pkt_type_name,
                            detail='Queued TX %s \u2192 %s (rule: %s)' % (
                                self._dn(source_cid), self._dn(rule_target), rule_display))
                     logger.info('BridgeEngine: queuing RF endpoint TX %d bytes: %s -> %s '
@@ -1021,7 +1019,7 @@ class BridgeEngine:
 
             tcid = getattr(target, 'channel_id', 'unknown')
             rf_sends.append((tcid, rule_id, tx_delay, 'radio', target, rule_display))
-            _trace(pkt_hash8, 'tx_enqueue', channel=source_cid, pkt_type=pkt_type_name, detail='Queued TX %s \u2192 %s (rule: %s)' % (self._dn(source_cid), self._dn(tcid), rule_display))
+            _trace(pkt_hash8, 'tx_enqueue', channel=tcid, pkt_type=pkt_type_name, detail='Queued TX %s \u2192 %s (rule: %s)' % (self._dn(source_cid), self._dn(tcid), rule_display))
             logger.info('BridgeEngine: queuing TX %d bytes: %s -> %s '
                        '(rule=%s, type=%s, hash=%s)',
                        len(data), source_cid, tcid, rule_id,
@@ -1494,10 +1492,7 @@ class BridgeEngine:
                                 pass
                         return
 
-            eng.recent_packets.append(packet_record)
-            max_recent = getattr(eng, 'max_recent_packets', 50)
-            if len(eng.recent_packets) > max_recent:
-                eng.recent_packets.pop(0)
+            eng._append_recent_packet(packet_record)
 
             # Store to persistent SQLite storage for dashboard API
             if hasattr(eng, 'storage') and eng.storage:
@@ -1543,6 +1538,24 @@ class BridgeEngine:
             # TX echoes and duplicates.  Do NOT call _fire_raw_rx_callbacks
             # here to avoid double-pushing non-echo packets.
 
+            # Validate before hashing into the seen/echo caches. Packet identity
+            # deliberately ignores payload-version bits, so an invalid version
+            # must neither reserve a valid packet's hash nor hide behind it.
+            try:
+                from repeater.protocol_validator import validate_and_record
+                _vresult = validate_and_record(
+                    data, channel=cid, rssi=_rx_rssi, snr=_rx_snr)
+                if not _vresult.is_valid:
+                    self.dropped_protocol_violation = getattr(
+                        self, 'dropped_protocol_violation', 0) + 1
+                    logger.warning(
+                        'BridgeEngine: dropping RX on %s — protocol violation: %s',
+                        cid, _vresult.reason)
+                    continue
+            except Exception as _val_err:
+                logger.debug(
+                    'protocol_validator skipped (non-fatal): %s', _val_err)
+
             # TX echo check: drop our own transmissions bouncing back
             if self._is_tx_echo(data, cid):
                 _echo_hash = _stable_hash(data, 8)
@@ -1584,28 +1597,6 @@ class BridgeEngine:
             # Emit `received` BEFORE `dedup_check` to match channel_e ordering
             self.emit_received_trace(pkt_hash8, cid, pkt_type_name, len(data), rssi=_rx_rssi, snr=_rx_snr, noise_floor=_rx_nf)
             _trace(_pass_hash8, 'dedup_check', channel=cid, detail='Dedup check passed on %s' % self._dn(cid), status='ok')
-
-            # Layer 2 — central MeshCore protocol validator.
-            # Drops malformed packets (reserved hash_size=4 spammer, invalid
-            # route_type, truncated, length-implausible, etc.) BEFORE they
-            # reach the bridge inject path / MQTT publish.  Forensics are
-            # persisted to the invalid_packets table (Layer 3) automatically.
-            # Fire-and-forget: any validator error is logged but never blocks
-            # the RX path (project design principle: RX availability is #1).
-            try:
-                from repeater.protocol_validator import validate_and_record
-                _vresult = validate_and_record(
-                    data, channel=cid, rssi=_rx_rssi, snr=_rx_snr)
-                if not _vresult.is_valid:
-                    self.dropped_protocol_violation = getattr(
-                        self, 'dropped_protocol_violation', 0) + 1
-                    logger.warning(
-                        'BridgeEngine: dropping RX on %s \u2014 protocol violation: %s',
-                        cid, _vresult.reason)
-                    continue
-            except Exception as _val_err:
-                logger.debug(
-                    'protocol_validator skipped (non-fatal): %s', _val_err)
 
             # Emit `bridge_inject` to match channel_e trace flow (received -> dedup_check -> bridge_inject)
             _trace(pkt_hash8, 'bridge_inject', channel=cid, pkt_type=pkt_type_name, detail='Injected %d bytes from %s' % (len(data), self._dn(cid)))
