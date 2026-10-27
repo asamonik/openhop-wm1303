@@ -148,6 +148,12 @@ TX power is controlled through the SX1250 PA settings:
 
 - Power range depends on the RF chain and antenna setup
 - LUT (Look-Up Table) values define the PA DAC settings per power level
+- The forwarder selects the closest calibrated power at or below the requested
+  power after subtracting antenna gain. If no such setting exists, it rejects
+  the transmission with `TX_POWER`; it does not raise power to the first entry.
+- Manager saves and startup validation require transmitting channels to use the
+  generated table's 12–27 dBm range. Receive-only channels do not apply their
+  stored TX power.
 - Incorrect LUT values can cause:
   - Poor TX performance (too low)
   - Excessive power draw (too high)

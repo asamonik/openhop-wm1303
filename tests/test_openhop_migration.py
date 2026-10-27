@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlparse
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -78,6 +79,96 @@ class DeviceMigrationTests(unittest.TestCase):
         self.assertFalse((self.job.base / "venv").exists())
         self.assertTrue((self.job.base / "venv.pre-openhop/bin/python").exists())
 
+    def test_bad_recovery_inventory_is_rejected_before_moving_or_archiving_venv(self):
+        interpreter = self.put('/opt/pymc_repeater/venv/bin/python', 'original interpreter')
+        self.put('/opt/pymc_repeater/.rebuild-venv', '')
+        inventory = self.put('/opt/pymc_repeater/.pre-openhop-packages.json', '')
+        for invalid in ('', '[{', '{}', '[null]', '[{"name":"plugin","version":1}]',
+                        '[{"name":"plugin","version":"1","direct_url":"broken"}]'):
+            with self.subTest(invalid=invalid):
+                inventory.write_text(invalid)
+                with self.assertRaisesRegex(migration.MigrationError, 'inventory'):
+                    self.job.check()
+                with self.assertRaises(migration.MigrationError):
+                    self.job.apply()
+                self.assertEqual(interpreter.read_text(), 'original interpreter')
+                self.assertEqual(inventory.read_text(), invalid)
+                self.assertFalse(self.job.base.exists())
+
+    def test_failed_inventory_publication_can_retry_without_losing_extra_packages(self):
+        self.put('/opt/pymc_repeater/venv/bin/python', 'original interpreter')
+        self.put('/opt/pymc_repeater/venv/lib/python3.12/site-packages/plugin_dep-1.0.dist-info/METADATA',
+                 'Metadata-Version: 2.1\nName: plugin-dep\nVersion: 1.0\n')
+        inventory = self.job.base / '.pre-openhop-packages.json'
+        real_link = os.link
+
+        def refuse_inventory(source, destination, *args, **kwargs):
+            if Path(destination) == inventory:
+                raise OSError('fixture inventory publication failed')
+            return real_link(source, destination, *args, **kwargs)
+
+        with patch.object(migration.os, 'link', side_effect=refuse_inventory):
+            with self.assertRaisesRegex(OSError, 'publication failed'):
+                self.job.apply()
+        self.assertFalse(inventory.exists())
+        self.assertFalse(list(self.job.base.glob('.openhop-inventory-*')))
+        self.assertTrue((self.job.base / 'venv/bin/python').exists())
+        self.assertFalse((self.job.base / 'venv.pre-openhop').exists())
+        self.job.apply()
+        self.assertEqual(json.loads(inventory.read_text()), [
+            {'name': 'plugin-dep', 'version': '1.0', 'direct_url': None},
+        ])
+        self.assertEqual(stat.S_IMODE(inventory.stat().st_mode), 0o600)
+        self.assertEqual((self.job.base / 'venv.pre-openhop/bin/python').read_text(), 'original interpreter')
+
+    def test_inventory_flush_failure_does_not_retire_venv(self):
+        self.put('/opt/openhop_repeater/.rebuild-venv', '')
+        interpreter = self.put('/opt/openhop_repeater/venv/bin/python', 'original interpreter')
+        with patch.object(migration.os, 'fsync', side_effect=OSError('fixture disk failure')):
+            with self.assertRaisesRegex(OSError, 'disk failure'):
+                self.job.apply()
+        self.assertEqual(interpreter.read_text(), 'original interpreter')
+        self.assertFalse((self.job.base / '.pre-openhop-packages.json').exists())
+        self.assertFalse(list(self.job.base.glob('.openhop-inventory-*')))
+
+    def test_published_inventory_directory_flush_failure_is_retryable(self):
+        self.put('/opt/openhop_repeater/.rebuild-venv', '')
+        interpreter = self.put('/opt/openhop_repeater/venv/bin/python', 'original interpreter')
+        real_fsync = os.fsync
+
+        def fail_directory(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError('fixture directory flush failure')
+            return real_fsync(fd)
+
+        with patch.object(migration.os, 'fsync', side_effect=fail_directory):
+            with self.assertRaisesRegex(OSError, 'directory flush failure'):
+                self.job.apply()
+        self.assertEqual(interpreter.read_text(), 'original interpreter')
+        inventory = self.job.base / '.pre-openhop-packages.json'
+        self.assertEqual(json.loads(inventory.read_text()), [])
+        self.job.apply()
+        self.assertTrue((self.job.base / 'venv.pre-openhop/bin/python').exists())
+        self.assertEqual(json.loads(inventory.read_text()), [])
+
+    def test_inventory_symlink_is_rejected_without_changing_target(self):
+        target = self.put('/custom/inventory.json', '[]')
+        self.put('/opt/pymc_repeater/venv/bin/python', 'original interpreter')
+        inventory = self.job.old_base / '.pre-openhop-packages.json'
+        inventory.symlink_to(target)
+        with self.assertRaisesRegex(migration.MigrationError, 'inventory.*symlink'):
+            self.job.check()
+        self.assertEqual(target.read_text(), '[]')
+        self.assertFalse(self.job.base.exists())
+
+    def test_existing_valid_inventory_keeps_original_package_versions(self):
+        self.put('/opt/openhop_repeater/.rebuild-venv', '')
+        self.put('/opt/openhop_repeater/venv/bin/python', 'partly rebuilt environment')
+        contents = '[{"name":"original-plugin", "version":"1.2.3"}]\n'
+        inventory = self.put('/opt/openhop_repeater/.pre-openhop-packages.json', contents)
+        self.job.apply()
+        self.assertEqual(inventory.read_text(), contents)
+
     def test_repeated_upgrade_keeps_new_venv(self):
         self.put("/opt/openhop_repeater/venv/bin/python", "canonical interpreter")
         self.put("/opt/openhop_repeater/repos/openhop_core/local.txt", "local edits")
@@ -132,6 +223,23 @@ jwt_secret: fixture-secret
         copied = self.root / "etc/openhop_repeater/plugins/custom/settings.yaml"
         self.assertEqual(copied.read_text(), "enabled: true")
         self.assertEqual(stat.S_IMODE(copied.stat().st_mode), 0o600)
+
+    def test_missing_nested_directories_keep_their_ownership(self):
+        nested = self.put('/etc/pymc_repeater/plugins/custom/private/settings.yaml', 'enabled: true')
+        nested.parent.chmod(0o700)
+        self.put('/etc/openhop_repeater/config.yaml', 'node: current')
+        directories = [nested.parent.parent.parent, nested.parent.parent, nested.parent]
+        expected = {(self.root / 'etc/openhop_repeater' / path.relative_to(self.root / 'etc/pymc_repeater')):
+                    (path.stat().st_uid, path.stat().st_gid) for path in directories}
+        # Verify the ownership operations at the OS boundary; ordinary CI
+        # cannot create source directories owned by a different service user.
+        with patch.object(migration.os, 'chown', wraps=os.chown) as chown:
+            self.job.apply()
+        ownership = {Path(call.args[0]): call.args[1:] for call in chown.call_args_list}
+        for path, owner in expected.items():
+            with self.subTest(directory=path):
+                self.assertEqual(ownership.get(path), owner)
+        self.assertEqual(stat.S_IMODE((self.root / 'etc/openhop_repeater/plugins/custom/private').stat().st_mode), 0o700)
 
     def test_sqlite_committed_wal_survives_migration(self):
         db = self.put("/var/lib/pymc_repeater/repeater.db", "")
@@ -210,6 +318,47 @@ os._exit(0)
         self.job.apply()
         self.assertEqual((self.root / "etc/openhop_repeater/identity.key").read_text(), "keep")
 
+    def test_failed_merge_rolls_back_new_paths_including_partial_database_families(self):
+        for layout in ('root', 'new_directory', 'existing_directory'):
+            nested = layout != 'root'
+            with self.subTest(layout=layout), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                source, target = root / 'old', root / 'new'
+                source.mkdir()
+                target.mkdir()
+                (target / 'existing.txt').write_text('canonical data')
+                if layout == 'existing_directory':
+                    (target / 'private').mkdir()
+                    (target / 'private' / 'keep.txt').write_text('existing private data')
+                before = {p.relative_to(target): p.read_bytes() for p in target.rglob('*') if p.is_file()}
+                parent = source / 'private' if nested else source
+                parent.mkdir(exist_ok=True)
+                (parent / 'repeater.db').write_bytes(b'database')
+                (parent / 'repeater.db-wal').write_bytes(b'committed WAL')
+                copied = migration.copy_owned
+                calls = 0
+
+                def fail_after_first_file(original, destination):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        raise OSError('fixture disk full')
+                    return copied(original, destination)
+
+                with patch.object(migration, 'copy_owned', side_effect=fail_after_first_file):
+                    with self.assertRaisesRegex((OSError, shutil.Error), 'fixture disk full'):
+                        migration.move_tree(source, target)
+                after = {p.relative_to(target): p.read_bytes() for p in target.rglob('*') if p.is_file()}
+                self.assertEqual(after, before)
+                if layout == 'new_directory':
+                    self.assertFalse((target / 'private').exists())
+                self.assertEqual((parent / 'repeater.db-wal').read_bytes(), b'committed WAL')
+                migration.move_tree(source, target)
+                copied_parent = target / 'private' if nested else target
+                self.assertEqual((copied_parent / 'repeater.db').read_bytes(), b'database')
+                self.assertEqual((copied_parent / 'repeater.db-wal').read_bytes(), b'committed WAL')
+                self.assertEqual((target / 'existing.txt').read_text(), 'canonical data')
+
     def test_preserves_service_overrides_and_updater(self):
         self.put("/etc/systemd/system/pymc-repeater.service.d/custom.conf",
                  "[Service]\nEnvironment=PYTHONPATH=/opt/pymc_repeater/repos/pyMC_Repeater:/opt/pymc_repeater/repos/pyMC_core/src\n")
@@ -273,6 +422,59 @@ class MigrationContracts(unittest.TestCase):
                       {"url": "file:///opt/pymc_repeater/my-plugin", "dir_info": {"editable": True}}}]
         self.assertEqual(list(packages.missing_requirements(inventory, {"cherrypy"})),
                          [["plugin-dep==2.3"], ["-e", "/opt/openhop_repeater/my-plugin"]])
+
+    def test_restored_archives_keep_recorded_digest(self):
+        digest = "a1" * 32
+        for archive in ({"hashes": {"sha256": digest}}, {"hash": "sha256=" + digest},
+                        {"hashes": {"sha256": digest, "md5": "b2" * 16}}):
+            with self.subTest(archive=archive):
+                inventory = [{"name": "plugin", "version": "1", "direct_url": {
+                    "url": "https://example.invalid/plugin.whl", "archive_info": archive,
+                }}]
+                requirement, = list(packages.missing_requirements(inventory, set()))
+                url = requirement[0].split(" @ ", 1)[1]
+                self.assertEqual(parse_qs(urlparse(url).fragment)["sha256"], [digest])
+
+    def test_restored_archive_hash_and_subdirectory_share_one_fragment(self):
+        digest = "a1" * 32
+        inventory = [{"name": "plugin", "version": "1", "direct_url": {
+            "url": "https://example.invalid/source.zip?download=1#custom=value",
+            "archive_info": {"hashes": {"sha256": digest}}, "subdirectory": "plugins/my plugin",
+        }}]
+        requirement, = list(packages.missing_requirements(inventory, set()))
+        url = urlparse(requirement[0].split(" @ ", 1)[1])
+        self.assertEqual(url.query, "download=1")
+        self.assertEqual(parse_qs(url.fragment), {
+            "sha256": [digest], "subdirectory": ["plugins/my plugin"], "custom": ["value"],
+        })
+
+    def test_relocated_archive_keeps_existing_url_components(self):
+        url = "file:///opt/pymc_repeater/plugin%20archives/source.zip?download=1#sha256=" + "a1" * 32
+        inventory = [{"name": "plugin", "version": "1", "direct_url": {
+            "url": url, "archive_info": {},
+        }}]
+        self.assertEqual(list(packages.missing_requirements(inventory, set())),
+                         [["plugin @ " + url.replace("/opt/pymc_repeater/", "/opt/openhop_repeater/")]])
+
+    def test_unusable_archive_hash_cannot_silently_restore_without_verification(self):
+        for archive in ({"hashes": {"unknown": "a1"}}, {"hashes": {"sha256": "not-hex"}},
+                        {"hashes": {"sha256": "a1"}}, {"hashes": "bad"}, {"hash": "bad"}):
+            with self.subTest(archive=archive):
+                inventory = [{"name": "plugin", "version": "1", "direct_url": {
+                    "url": "https://example.invalid/plugin.whl", "archive_info": archive,
+                }}]
+                with self.assertRaisesRegex(ValueError, "archive hash"):
+                    list(packages.missing_requirements(inventory, set()))
+
+    def test_restored_vcs_package_uses_recorded_commit_and_subdirectory(self):
+        inventory = [{"name": "plugin", "version": "1", "direct_url": {
+            "url": "https://example.invalid/plugins.git", "vcs_info": {
+                "vcs": "git", "requested_revision": "main", "commit_id": "a1" * 20,
+            }, "subdirectory": "my plugin",
+        }}]
+        self.assertEqual(list(packages.missing_requirements(inventory, set())),
+                         [["plugin @ git+https://example.invalid/plugins.git@" + "a1" * 20 +
+                           "#subdirectory=my%20plugin"]])
 
     def test_native_binary_must_use_both_canonical_ipc_paths(self):
         with tempfile.TemporaryDirectory() as temp:

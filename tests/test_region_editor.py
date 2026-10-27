@@ -43,7 +43,7 @@ class RegionEditorTests(unittest.TestCase):
         self.api = namespace['APIEndpoints']()
         self.api._get_storage = lambda: self.db
         self.api.config = {'mesh': {}}
-        self.engine = SimpleNamespace(_transport_keys_cache=['old snapshot'], _transport_keys_cache_time=123)
+        self.engine = SimpleNamespace(invalidate_transport_keys_cache=Mock())
         self.api.daemon_instance = SimpleNamespace(repeater_handler=self.engine)
         self.request = SimpleNamespace(method='POST', json={})
         request_patch = patch.object(cherrypy, 'request', self.request)
@@ -64,8 +64,7 @@ class RegionEditorTests(unittest.TestCase):
         self.request.method, self.request.json = 'PUT', {'parent_id': None}
         self.assertTrue(self.api.transport_key(child)['success'])
         self.assertIsNone(self.db.get_transport_key_by_id(child)['parent_id'])
-        self.assertEqual(self.engine._transport_keys_cache_time, 0)
-        self.assertEqual(self.engine._transport_keys_cache, ['old snapshot'])
+        self.engine.invalidate_transport_keys_cache.assert_called_once_with()
         self.assertTrue(self.db.update_transport_key(child, parent_id=parent))
         self.assertTrue(self.db.delete_transport_key(parent))
         self.assertIsNone(self.db.get_transport_key_by_id(child)['parent_id'])

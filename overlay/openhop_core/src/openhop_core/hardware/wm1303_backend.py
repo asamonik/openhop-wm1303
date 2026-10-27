@@ -418,6 +418,12 @@ def _generate_bridge_conf(channels: dict[str, dict], ui_config: dict | None = No
     _chf_d = ui_data.get('channel_f', {})
     if not isinstance(_che_d, dict) or not isinstance(_chf_d, dict):
         raise ValueError('channel_e and channel_f must be objects')
+    # Apply each receiver's bandwidth default before validation and LBT
+    # generation too. A shared 125 kHz fallback would register the wrong
+    # LBT channel for E's 62.5 kHz or F's 250 kHz TX. Keep the caller's UI
+    # document unchanged.
+    _che_d = {'bandwidth': EXTRA_CHANNEL_DEFAULTS['channel_e']['bandwidth'], **_che_d}
+    _chf_d = {'bandwidth': EXTRA_CHANNEL_DEFAULTS['channel_f']['bandwidth'], **_chf_d}
     # Validate before truth-testing flags or truncating numeric values. This
     # also covers file-loaded settings that never passed through the web API.
     configured_channels = [(f'Channel {chr(65 + idx)}', ch)
@@ -447,6 +453,8 @@ def _generate_bridge_conf(channels: dict[str, dict], ui_config: dict | None = No
         active_channels.append(('Channel E', _che_d, (62500, 125000, 250000, 500000)))
     if _chf_d.get('enabled', False):
         active_channels.append(('Channel F', _chf_d, (125000, 250000, 500000)))
+    tx_power_min = min(entry['rf_power'] for entry in DEFAULT_TX_GAIN_LUT)
+    tx_power_max = max(entry['rf_power'] for entry in DEFAULT_TX_GAIN_LUT)
     for label, ch, bandwidths in active_channels:
         try:
             if int(ch.get('frequency', 0)) <= 0:
@@ -462,6 +470,9 @@ def _generate_bridge_conf(channels: dict[str, dict], ui_config: dict | None = No
                 raise ValueError('coding_rate must be 4/5, 4/6, 4/7 or 4/8')
             if not 6 <= int(ch.get('preamble_length', 17)) <= 65535:
                 raise ValueError('preamble_length must be 6..65535')
+            if ch.get('tx_enabled', ch.get('tx_enable', True)):
+                if not tx_power_min <= int(ch.get('tx_power', 14)) <= tx_power_max:
+                    raise ValueError(f'tx_power must be {tx_power_min}..{tx_power_max} dBm for the generated calibration table')
             if not -128 <= int(ch.get('lbt_threshold', ch.get('lbt_rssi_target', -80))) <= 127:
                 raise ValueError('LBT threshold must be -128..127 dBm')
         except (ValueError, TypeError) as exc:
@@ -1081,6 +1092,12 @@ class WM1303Backend:
         self._tx_ack_cache_ttl = 30.0  # seconds
         self._tx_ack_cache_max = 512
         self._tx_ack_lock = threading.Lock()
+        # Sends are serialized by _tx_lock. Advance a 16-bit sequence rather
+        # than drawing each token independently: an immediate random collision
+        # lets a delayed/duplicate ACK complete the wrong transmission. Keep
+        # the sequence across forwarder restarts; randomize only the initial
+        # offset of a new backend instance.
+        self._next_tx_token = random.randint(0, 0xFFFF)
 
 
 
@@ -3173,20 +3190,31 @@ class WM1303Backend:
             err = 'NONE'
             if len(data) > 4:
                 raw_payload = data[4:]
-                # WM1303: the HAL emits TX_ACK with a 12-byte header
-                # (4-byte Semtech proto + 8-byte gateway MAC) before the
-                # optional JSON body. Older code assumed 4-byte header and
-                # silently failed to parse JSON. Find the first '{' to
-                # locate the JSON body robustly.
-                _brace_idx = raw_payload.find(b'{')
-                _json_bytes = raw_payload[_brace_idx:] if _brace_idx >= 0 else b''
                 try:
-                    if not _json_bytes:
-                        raise json.JSONDecodeError('no JSON body', '', 0)
-                    ack = json.loads(_json_bytes.decode())
-                    txpk_ack = ack.get('txpk_ack', {}) if isinstance(ack, dict) else {}
+                    # The HAL uses a 12-byte header, including an arbitrary
+                    # binary gateway EUI. A '{' in that EUI is not JSON.
+                    # Retain the older four-byte-header format as a fallback.
+                    ack = None
+                    for offset in (12, 4):
+                        body = data[offset:].lstrip()
+                        if not body.startswith(b'{'):
+                            continue
+                        try:
+                            ack = json.loads(body.decode())
+                            break
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            continue
+                    if ack is None:
+                        raise json.JSONDecodeError('no valid TX_ACK JSON body', '', 0)
+                    txpk_ack = ack.get('txpk_ack')
+                    if not isinstance(txpk_ack, dict):
+                        logger.warning('WM1303Backend: ignoring TX_ACK with invalid txpk_ack object')
+                        return
                     err = txpk_ack.get('error', 'NONE')
                     is_post_tx = (txpk_ack.get('phase') == 'post_tx')
+                    if not isinstance(err, str) or (is_post_tx and not isinstance(txpk_ack.get('tx_result'), str)):
+                        logger.warning('WM1303Backend: ignoring TX_ACK with invalid result fields')
+                        return
                     if is_post_tx:
                         # WM1303 post-TX ack: carries CAD/LBT outcomes
                         ack_info = {
@@ -3194,8 +3222,8 @@ class WM1303Backend:
                             'error': err,
                             'tx_result': txpk_ack.get('tx_result', 'unknown'),
                             'phase': 'post_tx',
-                            'cad': txpk_ack.get('cad', {}) or {},
-                            'lbt': txpk_ack.get('lbt', {}) or {},
+                            'cad': txpk_ack['cad'] if isinstance(txpk_ack.get('cad'), dict) else {},
+                            'lbt': txpk_ack['lbt'] if isinstance(txpk_ack.get('lbt'), dict) else {},
                         }
                         # Flatten convenience fields for consumers
                         cad = ack_info['cad']
@@ -3438,10 +3466,10 @@ class WM1303Backend:
             payload = base64.b64decode(payload_b64)
 
             # ── Minimum packet size filter ─────────────────────────────────
-            # Real MeshCore packets are ≥ 5 bytes (header + path_raw + payload).
-            # Tiny CRC_ERROR fragments (2-4 bytes) from noise/interference flood
-            # the bridge and cause feedback loops.  Discard them early.
-            _MIN_MC_PACKET = 5
+            # Only the header and path-length byte are universally required.
+            # RAW_CUSTOM can have no payload; CONTROL/MULTIPART can have one
+            # byte. The structural validator below applies type-specific minima.
+            _MIN_MC_PACKET = 2
             if len(payload) < _MIN_MC_PACKET:
                 logger.debug('WM1303Backend: noise filter: discarding %d-byte packet '
                              '(min=%d) freq=%.3f rssi=%s snr=%s',
@@ -4061,7 +4089,8 @@ class WM1303Backend:
 
             if not self._running or self._pull_addr is None:
                 return {'ok': False, 'error': 'backend_stopped', 'send_ms': 0}
-            token = random.randint(0, 0xFFFF)
+            token = self._next_tx_token
+            self._next_tx_token = (token + 1) & 0xFFFF
             # WM1303: register future BEFORE sendto to avoid race where the
             # post-TX ack arrives before we register (reader thread is fast).
             body  = json.dumps({'txpk': txpk}).encode()
@@ -4126,7 +4155,7 @@ class WM1303Backend:
                     cr=_cr, crc=not txpk.get('ncrc', False))
                 _airtime_ms_val = round(_airtime_s * 1000, 1)
                 # Set a CONSERVATIVE _last_tx_end in case ACK never arrives.
-                # This will be overwritten with now + 50ms after ACK (TX already done).
+                # A confirmed completion replaces it with a 50ms margin.
                 self._last_tx_end = time.monotonic() + _airtime_s + 2.0
                 logger.info('WM1303Backend: TX airtime %.1fms (SF%d BW%d %d bytes)',
                            _airtime_ms_val, _sf, _bw, txpk.get('size', 0))
@@ -4135,11 +4164,9 @@ class WM1303Backend:
             # self._schedule_agc_reset()
 
             # WM1303 Approach 3: await post-TX ack for CAD/LBT data.
-            # The post-TX ACK arrives AFTER the TX is complete (the C code
-            # polls TX_STATUS until TX_FREE before sending the ACK).
-            # Since TX is already done when we receive the ACK, we set
-            # _last_tx_end = now + 50ms (small safety margin), overwriting
-            # the conservative fallback set earlier.
+            # A "sent" ACK follows a TX_FREE observation in native polling.
+            # Completion replaces the fallback with a 50ms safety margin;
+            # tx_unconfirmed and a missing ACK retain the conservative guard.
             _result = {'ok': False, 'error': 'ack_timeout',
                        'freq': txpk['freq'], 'datr': txpk['datr'],
                        'airtime_ms': _airtime_ms_val, 'send_ms': _send_ms,
@@ -4162,7 +4189,14 @@ class WM1303Backend:
                                'lbt_threshold_dbm', 'lbt_retries'):
                         if _k in _post_ack:
                             _result[_k] = _post_ack[_k]
-                    if _post_ack.get('tx_result') == 'dropped':
+                    if _post_ack.get('tx_result') == 'tx_unconfirmed':
+                        # HAL accepted the send but never observed TX_FREE.
+                        # Retain the conservative guard and charge the airtime;
+                        # this is not evidence of a refusal or a completed TX.
+                        _result['airtime_uncertain'] = True
+                        logger.warning('WM1303Backend: TX completion unconfirmed '
+                                       '(token=0x%04x); retaining conservative RF guard', token)
+                    elif _post_ack.get('tx_result') == 'dropped':
                         # Packet was dropped by JIT (TOO_LATE/COLLISION),
                         # never transmitted. Reset _last_tx_end to now —
                         # no RF airtime to wait for.

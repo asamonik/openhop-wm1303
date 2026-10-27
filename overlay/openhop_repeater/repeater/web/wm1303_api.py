@@ -1822,231 +1822,146 @@ class WM1303API:
         return _j(resp)
 
     def _dedup_events_get(self, **params):
-        """Return dedup events with time-range aggregation for charting.
+        """Return dedup history for [since, until), or a named time range.
 
-        Query params:
-          range  - '1h','6h','24h','3d','7d' (default '1h')
-          bucket - aggregation bucket in minutes (auto if omitted)
-          since  - unix timestamp (custom range start)
-          until  - unix timestamp (custom range end)
-          raw    - 'true' to return individual events instead of buckets
+        ``bucket`` is a positive number of minutes; ``raw=true`` returns
+        individual events. If SQLite is unavailable, use the recent memory
+        buffer with the same range, response format and counting rules.
         """
-        import time as _time
-        import sqlite3 as _sqlite3
+        import sqlite3
 
         bridge = None
         try:
             from repeater.bridge_engine import _active_bridge
             bridge = _active_bridge
-        except Exception:
+        except ImportError:
             pass
 
-        # --- Parse time range ---
-        now = _time.time()
+        now = time.time()
         range_str = params.get('range', '1h')
-        AUTO_BUCKETS = {
-            '1h':  (3600,       1),    # 1 min buckets -> 60 points
-            '6h':  (6*3600,     5),    # 5 min buckets -> 72 points
-            '24h': (24*3600,   15),    # 15 min buckets -> 96 points
-            '3d':  (3*24*3600, 60),    # 1 hour buckets -> 72 points
-            '7d':  (7*24*3600, 120),   # 2 hour buckets -> 84 points
+        auto_buckets = {
+            '1h': (3600, 1), '6h': (6 * 3600, 5), '24h': (24 * 3600, 15),
+            '3d': (3 * 24 * 3600, 60), '7d': (7 * 24 * 3600, 120),
         }
-
+        if not isinstance(range_str, str) or range_str not in auto_buckets:
+            raise cherrypy.HTTPError(400, 'range must be 1h, 6h, 24h, 3d or 7d')
         if 'since' in params:
-            since_ts = float(params['since'])
-            until_ts = float(params.get('until', now))
+            since_ts = _request_float(params['since'], 'since')
+            until_ts = _request_float(params.get('until', now), 'until')
+            if since_ts < 0 or until_ts <= since_ts:
+                raise cherrypy.HTTPError(400, 'Require 0 <= since < until')
             span = until_ts - since_ts
-            # Auto bucket based on span
-            if span <= 3600:
-                bucket_min = 1
-            elif span <= 6*3600:
-                bucket_min = 5
-            elif span <= 24*3600:
-                bucket_min = 15
-            elif span <= 3*24*3600:
-                bucket_min = 60
-            else:
-                bucket_min = 120
+            bucket_min = next((width for seconds, width in auto_buckets.values()
+                               if span <= seconds), 120)
         else:
-            span_secs, bucket_min = AUTO_BUCKETS.get(range_str, (3600, 1))
-            since_ts = now - span_secs
-            until_ts = now
-
+            if 'until' in params:
+                raise cherrypy.HTTPError(400, 'until requires since')
+            span, bucket_min = auto_buckets[range_str]
+            since_ts, until_ts = now - span, now
         if 'bucket' in params:
-            bucket_min = int(params['bucket'])
+            bucket_min = _request_int(params['bucket'], 'bucket')
+            if not 1 <= bucket_min <= 0x7FFFFFFFFFFFFFFF // 60:
+                raise cherrypy.HTTPError(400, 'bucket must be positive and fit SQLite integer seconds')
+        raw = params.get('raw', 'false')
+        if not isinstance(raw, str) or raw.lower() not in ('true', 'false'):
+            raise cherrypy.HTTPError(400, 'raw must be true or false')
+        want_raw = raw.lower() == 'true'
+        bucket_secs = bucket_min * 60
 
-        want_raw = params.get('raw', 'false').lower() == 'true'
-
-        # --- Gather bridge stats (always from live bridge) ---
-        live_stats = {}
+        event_types = ('forwarded', 'duplicate', 'tx_echo', 'filtered',
+                       'hal_tx_echo', 'hal_mesh_echo', 'hal_unknown_echo',
+                       'multi_demod', 'companion_dedup')
+        period_stats = {'total_' + kind: 0 for kind in event_types}
+        period_stats.update(period_start=since_ts, period_end=until_ts, dedup_ratio=0.0)
         if bridge is not None:
-            st = bridge.get_stats()
-            live_stats = {
-                "total_forwarded": st.get('forwarded_packets', 0),
-                "total_duplicate": st.get('dropped_duplicate', 0),
-                "total_tx_echo": st.get('fwd_echo_detected', 0),
-                "total_filtered": st.get('dropped_filtered', 0),
-                "dedup_seen_active": st.get('dedup_seen_active', 0),
-                "dedup_events_buffered": st.get('dedup_events_buffered', 0),
-            }
+            live = bridge.get_stats()
+            # These are current buffer gauges. Event totals and their ratio
+            # must all describe the selected period, not the process lifetime.
+            for key in ('dedup_seen_active', 'dedup_events_buffered'):
+                period_stats[key] = live.get(key, 0)
 
-        # --- Try SQLite for historical data ---
-        db_path = _DB_PATH
-        buckets = []
-        period_stats = {"total_forwarded": 0, "total_duplicate": 0,
-                        "total_tx_echo": 0, "total_filtered": 0,
-                        "total_hal_tx_echo": 0, "total_hal_mesh_echo": 0,
-                        "total_hal_unknown_echo": 0, "total_multi_demod": 0,
-                        "total_companion_dedup": 0,
-                        "period_start": since_ts, "period_end": until_ts,
-                        "dedup_ratio": 0.0}
-
+        events = None
+        tiered_rows = None
         try:
-            import os as _os
-            if _os.path.exists(db_path):
-                with _db_conn(db_path) as conn:
-                    conn.row_factory = _sqlite3.Row
-
+            if Path(_DB_PATH).exists():
+                with _db_conn(_DB_PATH) as conn:
+                    conn.row_factory = sqlite3.Row
                     if want_raw:
-                        # Return individual events
                         rows = conn.execute(
                             "SELECT ts, event_type, source, pkt_hash, pkt_size, pkt_type "
-                            "FROM dedup_events WHERE ts >= ? AND ts <= ? ORDER BY ts ASC LIMIT 10000",
-                            (since_ts, until_ts)
+                            "FROM dedup_events WHERE ts >= ? AND ts < ? ORDER BY ts ASC LIMIT 10000",
+                            (since_ts, until_ts),
                         ).fetchall()
-                        events = [{"ts": r["ts"], "type": r["event_type"], "src": r["source"],
-                                   "hash": r["pkt_hash"], "size": r["pkt_size"],
-                                   "pkt_type": r["pkt_type"]} for r in rows]
-                        # Compute stats from raw events
-                        for e in events:
-                            k = "total_" + e["type"]
-                            if k in period_stats:
-                                period_stats[k] += 1
-                        total = len(events)
-                        if total > 0:
-                            # Dedup ratio = (all non-forwarded events) / total.
-                            # Includes duplicates, echoes (bridge/HAL/mesh/unknown),
-                            # filtered, multi-demod, and companion-dedup.
-                            _dedup_sum = (
-                                period_stats.get("total_duplicate", 0)
-                                + period_stats.get("total_tx_echo", 0)
-                                + period_stats.get("total_filtered", 0)
-                                + period_stats.get("total_hal_tx_echo", 0)
-                                + period_stats.get("total_hal_mesh_echo", 0)
-                                + period_stats.get("total_hal_unknown_echo", 0)
-                                + period_stats.get("total_multi_demod", 0)
-                                + period_stats.get("total_companion_dedup", 0)
-                            )
-                            period_stats["dedup_ratio"] = round(_dedup_sum / total, 4)
-                        period_stats.update(live_stats)
-                        return _j({"events": events, "stats": period_stats, "mode": "raw"})
+                        events = [dict(ts=row['ts'], type=row['event_type'], src=row['source'],
+                                       hash=row['pkt_hash'], size=row['pkt_size'], pkt_type=row['pkt_type'])
+                                  for row in rows]
+                    else:
+                        tiered_rows = tiered_dedup_query(conn, since_ts, until_ts, bucket_secs)
+        except Exception as exc:
+            logger.warning('dedup SQLite query error: %s', exc)
 
-                    # Aggregated buckets
-                    # Aggregated buckets via tiered query
-                    bucket_secs = bucket_min * 60
-                    _EVENT_TYPES = ('forwarded', 'duplicate', 'tx_echo', 'filtered',
-                                    'hal_tx_echo', 'hal_mesh_echo', 'hal_unknown_echo',
-                                    'multi_demod', 'companion_dedup')
-                    tiered_rows = tiered_dedup_query(conn, since_ts, until_ts, bucket_secs)
-                    # Pivot: one row per (bucket_ts, event_type) -> one dict per bucket_ts
-                    bkt_map = {}
-                    for r in tiered_rows:
-                        bts = int(r["bucket_ts"])
-                        if bts not in bkt_map:
-                            bkt_map[bts] = {"ts": bts, "bucket_seconds": r["bucket_seconds"],
-                                            "forwarded": 0, "duplicate": 0,
-                                            "tx_echo": 0, "filtered": 0, "hal_tx_echo": 0,
-                                            "hal_mesh_echo": 0, "hal_unknown_echo": 0,
-                                            "multi_demod": 0, "companion_dedup": 0}
-                        et = r.get("event_type", "")
-                        cnt = r.get("sample_count") or 0
-                        if et in bkt_map[bts]:
-                            bkt_map[bts][et] += cnt
-                    buckets = [bkt_map[k] for k in sorted(bkt_map.keys())]
+        if events is None and tiered_rows is None:
+            recent = bridge.get_dedup_events(since=since_ts, limit=500) if bridge is not None else []
+            events = sorted((event for event in recent if since_ts <= event['ts'] < until_ts),
+                            key=lambda event: event['ts'])
 
-                    # Compute period totals from the pivoted buckets
-                    for b in buckets:
-                        for et in _EVENT_TYPES:
-                            k = "total_" + et
-                            if k in period_stats:
-                                period_stats[k] += b.get(et, 0)
-                    total = sum(period_stats.get("total_" + et, 0) for et in _EVENT_TYPES)
-                    if total > 0:
-                        # Dedup ratio = (all non-forwarded events) / total.
-                        _dedup_sum = (
-                            period_stats.get("total_duplicate", 0)
-                            + period_stats.get("total_tx_echo", 0)
-                            + period_stats.get("total_filtered", 0)
-                            + period_stats.get("total_hal_tx_echo", 0)
-                            + period_stats.get("total_hal_mesh_echo", 0)
-                            + period_stats.get("total_hal_unknown_echo", 0)
-                            + period_stats.get("total_multi_demod", 0)
-                            + period_stats.get("total_companion_dedup", 0)
-                        )
-                        period_stats["dedup_ratio"] = round(_dedup_sum / total, 4)
+        buckets_by_time = {}
 
-        except Exception as _e:
-            import logging
-            logging.getLogger("WM1303API").warning("dedup SQLite query error: %s", _e)
-            # Fall back to in-memory deque if SQLite fails
-            if bridge is not None:
-                events = bridge.get_dedup_events(since=since_ts, limit=500)
-                # Build simple buckets from in-memory events
-                bucket_secs = bucket_min * 60
-                bkt_map = {}
-                for ev in events:
-                    bts = int(ev['ts'] / bucket_secs) * bucket_secs
-                    if bts not in bkt_map:
-                        bkt_map[bts] = {"ts": bts, "bucket_seconds": bucket_secs,
-                                        "forwarded": 0, "duplicate": 0, "tx_echo": 0,
-                                        "filtered": 0, "hal_tx_echo": 0, "hal_mesh_echo": 0,
-                                        "hal_unknown_echo": 0, "multi_demod": 0,
-                                        "companion_dedup": 0}
-                    et = ev.get('type', '')
-                    if et in bkt_map[bts]:
-                        bkt_map[bts][et] += 1
-                for ev in events:
-                    k = "total_" + ev.get('type', '')
-                    if k in period_stats:
-                        period_stats[k] += 1
-                total = len(events)
-                if total > 0:
-                    # Dedup ratio = (all non-forwarded events) / total.
-                    _dedup_sum = (
-                        period_stats.get("total_duplicate", 0)
-                        + period_stats.get("total_tx_echo", 0)
-                        + period_stats.get("total_filtered", 0)
-                        + period_stats.get("total_hal_tx_echo", 0)
-                        + period_stats.get("total_hal_mesh_echo", 0)
-                        + period_stats.get("total_hal_unknown_echo", 0)
-                        + period_stats.get("total_multi_demod", 0)
-                        + period_stats.get("total_companion_dedup", 0)
-                    )
-                    period_stats["dedup_ratio"] = round(_dedup_sum / total, 4)
+        def add_bucket(timestamp, width, kind, count):
+            bucket = buckets_by_time.setdefault(timestamp, dict.fromkeys(event_types, 0))
+            bucket.update(ts=timestamp, bucket_seconds=width)
+            if kind in event_types:
+                bucket[kind] += count
 
-        period_stats.update(live_stats)
-        widths = {point["bucket_seconds"] for point in buckets}
+        if want_raw:
+            for event in events:
+                if event['type'] in event_types:
+                    period_stats['total_' + event['type']] += 1
+        else:
+            if tiered_rows is not None:
+                for row in tiered_rows:
+                    add_bucket(int(row['bucket_ts']), row['bucket_seconds'],
+                               row['event_type'], row.get('sample_count') or 0)
+            else:
+                for event in events:
+                    timestamp = int(event['ts'] // bucket_secs) * bucket_secs
+                    add_bucket(timestamp, bucket_secs, event['type'], 1)
+            for bucket in buckets_by_time.values():
+                for kind in event_types:
+                    period_stats['total_' + kind] += bucket[kind]
+
+        total = sum(period_stats['total_' + kind] for kind in event_types)
+        if total:
+            period_stats['dedup_ratio'] = round((total - period_stats['total_forwarded']) / total, 4)
+        if want_raw:
+            return _j({'events': events, 'stats': period_stats, 'mode': 'raw'})
+        buckets = [buckets_by_time[key] for key in sorted(buckets_by_time)]
+        widths = {bucket['bucket_seconds'] for bucket in buckets}
         return _j({
-            "buckets": buckets,
-            "stats": period_stats,
-            "range": range_str,
-            "bucket_minutes": next(iter(widths)) / 60 if len(widths) == 1 else None,
-            "requested_bucket_seconds": bucket_min * 60,
+            'buckets': buckets, 'stats': period_stats, 'range': range_str,
+            'bucket_minutes': next(iter(widths)) / 60 if len(widths) == 1 else None,
+            'requested_bucket_seconds': bucket_secs,
         })
 
     # -- packet traces ---------------------------------------------------------
     def _packet_traces_get(self, **params):
         """Return recent packet traces from the in-memory ring buffer."""
+        from repeater.web.packet_trace import MAX_TRACES, get_traces
+
+        limit = _request_int(params.get('limit', 50), 'limit')
+        if not 1 <= limit <= MAX_TRACES:
+            raise cherrypy.HTTPError(400, f'limit must be between 1 and {MAX_TRACES}')
+        status = params.get('status', '')
+        channel = params.get('channel', '')
+        if not isinstance(status, str) or not isinstance(channel, str):
+            raise cherrypy.HTTPError(400, 'status and channel must be single strings')
         try:
-            from repeater.web.packet_trace import get_traces
-            limit = int(params.get('limit', 50))
-            status = params.get('status', '')
-            channel = params.get('channel', '')
             traces = get_traces(limit=limit, status=status, channel=channel)
             return _j({"traces": traces})
-        except Exception as e:
-            import traceback
-            return _j({"error": str(e), "detail": traceback.format_exc()})
+        except Exception:
+            logger.exception('Packet trace retrieval failed')
+            cherrypy.response.status = 500
+            return _j({'error': 'Unable to read packet traces'})
 
     # -- rfchains --------------------------------------------------------------
     def _rfchains_get(self):

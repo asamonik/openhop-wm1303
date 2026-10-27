@@ -13,6 +13,10 @@ const root = path.resolve(__dirname, '..');
 const overlayHtml = path.join(root, 'overlay/openhop_repeater/repeater/web/html');
 const originalHtml = process.argv[2];
 if (!originalHtml || !fs.existsSync(path.join(originalHtml, 'index.html'))) throw new Error('Supply the upstream compiled Console HTML directory');
+const chromium = process.env.CHROMIUM_PATH || (process.env.PATH || '').split(path.delimiter)
+  .flatMap(directory => ['chromium', 'chromium-browser', 'google-chrome'].map(name => path.join(directory, name)))
+  .find(candidate => {try {fs.accessSync(candidate, fs.constants.X_OK); return true;} catch {return false;}});
+if (!chromium) throw new Error('Install Chromium or set CHROMIUM_PATH to its executable');
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'wm1303-dashboard-'));
 const htmlDir = path.join(temporary, 'html');
 fs.cpSync(originalHtml, htmlDir, {recursive: true});
@@ -55,6 +59,13 @@ function response(url, body) {
   }
   if (url.pathname === '/api/wm1303/channels') return {channels: [channel]};
   if (url.pathname === '/api/wm1303/channels/live') return {channels: [{...channel, rx_packets: 1234567, tx_packets: 43210, tx_duty_pct: 3.031, rx_duty_pct: 1.234}], duty_cycle: {tx_duty_pct: 3.031, rx_duty_pct: 1.234, rx_availability_pct: 96.969}};
+  if (url.pathname === '/api/wm1303/packet_traces') return {traces: [{
+    pkt_hash: 'abcdef12', pkt_hash_full: 'abcdef1234567890', channel: channel.name || 'channel_a',
+    first_seen: new Date(now * 1000).toISOString(), type: 'RAW_CUSTOM',
+    total_ms: 4, hops: 0, path_hashes: [], status: 'forwarded',
+    steps: [{name: 'received', elapsed_ms: 0, status: 'ok', detail: 'Received fixture'},
+      {name: 'tx_send', elapsed_ms: 4, status: 'ok', detail: 'TX on channel_a (rule: fixture)'}],
+  }]};
   if (/\/channel_[ef]$/.test(url.pathname)) return {enabled: false};
   if (url.pathname === '/api/wm1303/duty_cycle_history') {
     const hours = Number(url.searchParams.get('hours'));
@@ -90,9 +101,18 @@ const server = http.createServer(async (req, res) => {
   try {
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
     const origin = 'http://127.0.0.1:' + server.address().port;
-    browser = await puppeteer.launch({executablePath: process.env.CHROMIUM_PATH || '/etc/profiles/per-user/andreas/bin/chromium', headless: true, args: ['--no-sandbox']});
+    browser = await puppeteer.launch({executablePath: chromium, headless: true, args: ['--no-sandbox']});
     const page = await browser.newPage();
     page.on('pageerror', error => errors.push(error.message));
+    // Keep every navigation independent of external fonts, analytics and CDN
+    // availability. Manager chart fixtures are supplied explicitly below.
+    const cdn = new Map();
+    await page.setRequestInterception(true);
+    page.on('request', request => {
+      if (cdn.has(request.url())) request.respond({status: 200, contentType: 'application/javascript', body: cdn.get(request.url())});
+      else if (request.url().startsWith(origin + '/')) request.continue();
+      else request.abort();
+    });
     const token='fixture.'+Buffer.from(JSON.stringify({exp: now+36000, sub: 'admin', role: 'admin'})).toString('base64url')+'.signature';
     await page.evaluateOnNewDocument(token => {
       localStorage.setItem('pymc_jwt_token', token);
@@ -158,14 +178,7 @@ const server = http.createServer(async (req, res) => {
     await page.waitForFunction(() => document.body.textContent.includes('Scope: unknown scope'));
 
     // Use the real Chart.js/adapter for the Manager while avoiding unrelated CDN dependencies.
-    const cdn = new Map();
     for (const url of ['https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js', 'https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js']) cdn.set(url, execFileSync('curl', ['-fsSL', url]));
-    await page.setRequestInterception(true);
-    page.on('request', request => {
-      if (cdn.has(request.url())) request.respond({status: 200, contentType: 'application/javascript', body: cdn.get(request.url())});
-      else if (request.url().startsWith(origin)) request.continue();
-      else request.abort();
-    });
     await page.goto(origin + '/wm1303.html', {waitUntil: 'networkidle0'});
     await page.waitForFunction(() => document.getElementById('st-rx-duty').textContent === '1.234%');
     await page.evaluate(() => showTab('spectrum'));
@@ -180,6 +193,34 @@ const server = http.createServer(async (req, res) => {
       assert.ok(requests.includes('/api/wm1303/duty_cycle_history?hours=' + hours));
     }
     assert.ok((await page.$eval('#specScanHelp', e => e.textContent)).includes('40 minutes'));
+    await page.evaluate(() => showTab('channels'));
+    await page.waitForNetworkIdle();
+    const channelFields = await page.$$('#ch-list input, #ch-list select, #ch-list button');
+    const fieldNames = [];
+    for (const field of channelFields) {
+      const accessible = await page.accessibility.snapshot({root: field});
+      assert.ok(accessible?.name, 'Channel control needs an accessible name: ' + await field.evaluate(e => e.outerHTML));
+      fieldNames.push(accessible.name);
+    }
+    assert.equal(fieldNames.length, 12);
+    assert.equal(new Set(fieldNames).size, fieldNames.length, 'Channel controls need distinct names');
+    assert.ok(fieldNames.includes('Channel A frequency (MHz)'));
+    assert.ok(fieldNames.includes('Channel A enabled'));
+    channel.name = channel.friendly_name = 'Hill " & <b data-fixture-name>mesh</b>';
+    await page.evaluate(async () => {await loadCh(); showTab('tracing');});
+    await page.waitForFunction(name => document.querySelector('#traceList [title^="Source channel:"]')?.textContent === name, {}, channel.name);
+    assert.equal(await page.$eval('#traceList [title^="Source channel:"]', e => e.title), 'Source channel: ' + channel.name);
+    assert.equal(await page.$eval('#traceStatsGrid', (e, name) => e.textContent.includes(name), channel.name), true);
+    assert.equal(await page.$$eval('#traceList [data-fixture-name], #traceStatsGrid [data-fixture-name]', e => e.length), 0);
+    for (const name of ['constructor', '__proto__', 'toString']) {
+      channel.name = channel.friendly_name = name;
+      await page.evaluate(async () => {await loadCh(); traceLoad();});
+      await page.waitForFunction(expected => {
+        const card = [...document.querySelector('#traceStatsGrid').children].find(e => e.textContent.includes('Top Channel'));
+        return card?.textContent.includes(expected) && card.textContent.includes('1 \u00d7');
+      }, {}, name);
+      assert.equal(await page.$eval('#traceList [title^="Source channel:"]', e => e.textContent), name);
+    }
     assert.deepEqual(errors, []);
     console.log(JSON.stringify({passed: true, dutyIntervals: [1, 6, 12, 24, 72, 168], screenshots: temporary}, null, 2));
   } finally {

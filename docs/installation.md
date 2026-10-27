@@ -372,6 +372,21 @@ after installing the tested OpenHop dependencies. A dependency conflict stops
 the upgrade with the old environment retained. The migration marker makes an
 interrupted run retryable; rerun the same upgrade command.
 
+For extra packages installed from direct archive or wheel URLs, recovery carries
+forward the recorded checksum so pip rejects changed content at that URL. VCS
+packages retain their recorded commit. Archive subdirectories and relocated
+local archive paths are preserved. If a recorded checksum cannot be validated,
+recovery stops instead of silently dropping it; the old environment remains
+available. An inventory without a checksum cannot provide that verification.
+
+Inventory files are checked during preflight, before services stop. A malformed
+or symlinked inventory requires recovery from the retained environment; migration
+leaves it untouched instead of retiring the environment against an unusable list.
+New inventories are published atomically with private permissions and flushed
+before the environment is archived. A failed write, publication or flush leaves
+the environment in place for retry. This does not make the entire filesystem
+migration atomic across power loss.
+
 Python and the rebuilt HAL communicate through `/tmp/openhop_*.json`. Upgrades
 rebuild an older binary automatically. `install.sh --skip-build` is accepted
 only when the existing forwarder contains the new runtime filenames. Temporary

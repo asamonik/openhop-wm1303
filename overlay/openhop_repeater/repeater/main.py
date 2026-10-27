@@ -5,6 +5,7 @@ import os
 import signal
 import sys
 import socket
+import threading
 import time
 from concurrent.futures import Future
 
@@ -132,6 +133,7 @@ class RepeaterDaemon(RoomLifecycleMixin):
         self._service_tasks = []
         self._metrics_retention = None
         self._region_map = None
+        self._region_map_lock = threading.RLock()
         self._periodic_advert_last_sent = {}
         self._periodic_advert_retry_at = {}
         self._room_server_specs = None
@@ -856,8 +858,12 @@ class RepeaterDaemon(RoomLifecycleMixin):
                 finally:
                     await frame_server.stop()
             raise
-        self.companion_bridges[companion_hash] = bridge
-        self.companion_frame_servers.append(frame_server)
+        with self._region_map_lock:
+            # Startup awaited I/O after the initial map assignment. A refresh
+            # may have missed this bridge before it joined the registered set.
+            bridge.region_map = self._region_map
+            self.companion_bridges[companion_hash] = bridge
+            self.companion_frame_servers.append(frame_server)
 
         logger.info(
             f"Hot-reload: Loaded companion '{name}': hash=0x{companion_hash:02x}, "
@@ -2460,19 +2466,20 @@ class RepeaterDaemon(RoomLifecycleMixin):
         CRUD from the CLI, web API, or Glass sync) fire the storage change hook,
         which reruns ``refresh_region_map``.
         """
-        sqlite_handler = self._get_sqlite_handler()
-        self._region_map = build_region_map(self.config, sqlite_handler)
-        if self.dispatcher is not None:
-            self.dispatcher.region_map = self._region_map
-        self.refresh_default_flood_scope()
-        if sqlite_handler is not None and hasattr(
-            sqlite_handler, "set_transport_keys_changed_callback"
-        ):
-            sqlite_handler.set_transport_keys_changed_callback(self.refresh_region_map)
-        logger.info(
-            "Region map initialized with %d served region(s)",
-            len(self._region_map.regions),
-        )
+        with self._region_map_lock:
+            sqlite_handler = self._get_sqlite_handler()
+            self._region_map = build_region_map(self.config, sqlite_handler)
+            if self.dispatcher is not None:
+                self.dispatcher.region_map = self._region_map
+            self.refresh_default_flood_scope()
+            if sqlite_handler is not None and hasattr(
+                sqlite_handler, "set_transport_keys_changed_callback"
+            ):
+                sqlite_handler.set_transport_keys_changed_callback(self.refresh_region_map)
+            logger.info(
+                "Region map initialized with %d served region(s)",
+                len(self._region_map.regions),
+            )
 
     def refresh_default_flood_scope(self) -> None:
         """Re-resolve ``mesh.default_region`` onto the dispatcher's default scope.
@@ -2499,24 +2506,25 @@ class RepeaterDaemon(RoomLifecycleMixin):
         take the bridge's own companion scope, which its app owns over the frame
         protocol, as ``_prefs.default_scope_key`` does on a firmware companion.
         """
-        if self.dispatcher is None:
-            return
-        region_map = self._region_map
-        if region_map is None:
-            self.dispatcher.default_flood_transport_key = None
-            return
-        try:
-            key = resolve_default_scope_key(self.config, region_map)
-        except Exception:
-            # Never let a bad default-region value break TX: an unresolved default
-            # is a plain flood, which is firmware's null-default row.
-            logger.debug("Failed to resolve mesh.default_region", exc_info=True)
-            key = None
-        self.dispatcher.default_flood_transport_key = key
-        logger.info(
-            "Default flood scope %s",
-            "resolved from mesh.default_region" if key else "unset (replies flood un-scoped)",
-        )
+        with self._region_map_lock:
+            if self.dispatcher is None:
+                return
+            region_map = self._region_map
+            if region_map is None:
+                self.dispatcher.default_flood_transport_key = None
+                return
+            try:
+                key = resolve_default_scope_key(self.config, region_map)
+            except Exception:
+                # Never let a bad default-region value break TX: an unresolved default
+                # is a plain flood, which is firmware's null-default row.
+                logger.debug("Failed to resolve mesh.default_region", exc_info=True)
+                key = None
+            self.dispatcher.default_flood_transport_key = key
+            logger.info(
+                "Default flood scope %s",
+                "resolved from mesh.default_region" if key else "unset (replies flood un-scoped)",
+            )
 
     def refresh_region_map(self) -> None:
         """Rebuild the RegionMap and reassign it to the dispatcher and all bridges.
@@ -2527,22 +2535,26 @@ class RepeaterDaemon(RoomLifecycleMixin):
         cherrypy worker thread while ``find_match`` iterates the map on the RX
         hot path in the event-loop thread: an attribute rebind is atomic under
         the GIL, so an in-flight match keeps using the old, fully-built map.
-        New bridges pick up the current instance at creation time.
+        New bridges pick up the current instance when registered after startup.
+
+        Serialize builders and default-scope resolution so a slow older refresh
+        cannot publish stale settings after a newer storage/configuration change.
         """
-        new_map = build_region_map(self.config, self._get_sqlite_handler())
-        self._region_map = new_map
-        if self.dispatcher is not None:
-            self.dispatcher.region_map = new_map
-        for bridge in list(self.companion_bridges.values()):
-            try:
-                bridge.region_map = new_map
-            except Exception:
-                logger.debug("Failed to update region map on a companion bridge", exc_info=True)
-        # After the rebind, so the default resolves against the map that is now
-        # live: this hook is exactly where the default region gains, loses or
-        # re-keys its entry.
-        self.refresh_default_flood_scope()
-        logger.info("Region map refreshed with %d served region(s)", len(new_map.regions))
+        with self._region_map_lock:
+            new_map = build_region_map(self.config, self._get_sqlite_handler())
+            self._region_map = new_map
+            if self.dispatcher is not None:
+                self.dispatcher.region_map = new_map
+            for bridge in list(self.companion_bridges.values()):
+                try:
+                    bridge.region_map = new_map
+                except Exception:
+                    logger.debug("Failed to update region map on a companion bridge", exc_info=True)
+            # After the rebind, so the default resolves against the map that is now
+            # live: this hook is exactly where the default region gains, loses or
+            # re-keys its entry.
+            self.refresh_default_flood_scope()
+            logger.info("Region map refreshed with %d served region(s)", len(new_map.regions))
 
     @staticmethod
     def _coerce_interval_hours(raw_value, *, min_enabled: int = 1, max_enabled: int = 168) -> int:

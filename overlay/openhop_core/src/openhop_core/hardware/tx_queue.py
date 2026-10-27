@@ -179,6 +179,20 @@ def is_priority_payload(payload: bytes) -> bool:
     return meshcore_payload_type(payload) in PRIORITY_PAYLOAD_TYPES
 
 
+class _TXFIFO(asyncio.Queue):
+    """Bounded FIFO with constant-time, non-destructive head inspection."""
+
+    def _init(self, maxsize):
+        # Use Queue's storage hook, as its standard-library subclasses do;
+        # capacity, waiter notification and join accounting stay with Queue.
+        self._queue = deque()
+
+    def peek_nowait(self):
+        if self.empty():
+            raise asyncio.QueueEmpty
+        return self._queue[0]
+
+
 class ChannelTXQueue:
     """Simple FIFO TX queue for a single channel.
 
@@ -211,7 +225,7 @@ class ChannelTXQueue:
         self.tx_power = tx_power
         self.ttl_seconds = ttl_seconds
         self._queue_size = queue_size
-        self.queue: asyncio.Queue = asyncio.Queue(maxsize=queue_size)
+        self.queue = _TXFIFO(maxsize=queue_size)
         self._stopped = False
 
         # TODO #8: separate priority lane for time-critical payloads (ACKs).
@@ -342,7 +356,7 @@ class ChannelTXQueue:
                     "ChannelTXQueue[%s]: priority lane full (%d), dropped OLDEST "
                     "ACK (age=%.1fs) to make room",
                     self.channel_id, self._queue_size,
-                    time.time() - old_req.get("enqueue_time", 0))
+                    time.monotonic() - old_req.get("enqueue_time", 0))
             self._priority_queue.append(request)
             self.stats["pending_priority"] = len(self._priority_queue)
             self.stats["priority_enqueued"] += 1
@@ -350,13 +364,7 @@ class ChannelTXQueue:
                         "(type=ACK, pending_priority=%d, pending=%d)",
                         self.channel_id, len(payload),
                         len(self._priority_queue), self.queue.qsize())
-            try:
-                return await asyncio.wait_for(future, timeout=15.0)
-            except asyncio.TimeoutError:
-                logger.warning("ChannelTXQueue[%s]: TX wait timeout (priority)",
-                               self.channel_id)
-                self.stats["total_failed"] += 1
-                return {"ok": False, "error": "timeout"}
+            return await self._wait_for_result(request, timeout=15.0)
 
         try:
             self.queue.put_nowait(request)
@@ -396,17 +404,21 @@ class ChannelTXQueue:
                 self.stats["total_failed"] += 1
                 return {"ok": False, "error": "queue_full"}
 
+        return await self._wait_for_result(request, timeout=self.ttl_seconds + 15.0)
+
+    async def _wait_for_result(self, request: dict, timeout: float) -> dict:
+        """Bound queue waiting, then let the scheduler budget the active send."""
         try:
-            # Allow the configured queue lifetime plus a bounded send/ACK
-            # interval. A fixed 15s timeout discarded valid queued traffic.
-            result = await asyncio.wait_for(future, timeout=self.ttl_seconds + 15.0)
-            return result
+            async with asyncio.timeout(timeout) as deadline:
+                request['_wait_deadline'] = deadline
+                return await request['future']
         except asyncio.TimeoutError:
             logger.warning("ChannelTXQueue[%s]: TX wait timeout",
                           self.channel_id)
             self.stats["total_failed"] += 1
             return {"ok": False, "error": "timeout"}
         finally:
+            request.pop('_wait_deadline', None)
             # Cancellation must release admission capacity even while the
             # scheduler is busy transmitting on another channel.
             self._discard_completed_requests()
@@ -417,6 +429,14 @@ class ChannelTXQueue:
         This runs synchronously on the queue's event loop; no scheduler can
         interleave while the bounded queue is rotated through once.
         """
+        for _ in range(len(self._priority_queue)):
+            request = self._priority_queue.popleft()
+            future = request.get("future")
+            if future is not None and future.done():
+                self.stats["dropped_stale"] += 1
+            else:
+                self._priority_queue.append(request)
+        self.stats["pending_priority"] = len(self._priority_queue)
         for _ in range(self.queue.qsize()):
             request = self.queue.get_nowait()
             future = request.get("future")
@@ -426,6 +446,12 @@ class ChannelTXQueue:
                 self.queue.put_nowait(request)
             self.queue.task_done()
         self.stats["pending"] = self.queue.qsize()
+
+    def peek_nowait(self):
+        """Inspect the next request without releasing its admission slot."""
+        if self._priority_queue:
+            return self._priority_queue[0]
+        return self.queue.peek_nowait()
 
     def dequeue_nowait(self):
         """Non-blocking dequeue. Returns request dict or raises asyncio.QueueEmpty.
@@ -440,7 +466,6 @@ class ChannelTXQueue:
             request = self._priority_queue.popleft()
             request["priority"] = True
             self.stats["pending_priority"] = len(self._priority_queue)
-            self.stats["priority_sent"] += 1
             return request
         request = self.queue.get_nowait()  # raises QueueEmpty if empty
         self.queue.task_done()
@@ -819,6 +844,7 @@ class GlobalTXScheduler:
         self._duty_cycle_waits = 0
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._lifecycle_lock = asyncio.Lock()
         self._packets_scheduled = 0
         self._round_index = 0  # Rotating start index for fair round-robin
         if not math.isfinite(inter_packet_delay_ms) or inter_packet_delay_ms < 0:
@@ -833,37 +859,44 @@ class GlobalTXScheduler:
 
     async def start(self):
         """Start the scheduler loop."""
-        if self._running:
-            return
-        for channel_queue in self._queues.values():
-            channel_queue._stopped = False
-        self._running = True
-        self._task = asyncio.create_task(self._scheduler_loop())
-        logger.info("GlobalTXScheduler: started (queues=%s)",
-                   list(self._queues.keys()))
+        async with self._lifecycle_lock:
+            if self._running:
+                return
+            for channel_queue in self._queues.values():
+                channel_queue._stopped = False
+            self._running = True
+            self._task = asyncio.create_task(self._scheduler_loop())
+            logger.info("GlobalTXScheduler: started (queues=%s)",
+                       list(self._queues.keys()))
 
     async def stop(self):
         """Stop the scheduler loop."""
-        self._running = False
-        try:
-            if self._task:
-                self._task.cancel()
-                try:
-                    await self._task
-                except asyncio.CancelledError:
-                    pass
-        finally:
-            # A scheduler that already failed must still close its queues and
-            # resolve admitted callers before its exception is propagated.
-            self._task = None
-            for channel_queue in self._queues.values():
-                channel_queue.stop()
-        logger.info("GlobalTXScheduler: stopped (total_scheduled=%d)",
-                   self._packets_scheduled)
+        # Keep a concurrent start from replacing _task while its old worker
+        # is still releasing the radio/ACK wait and closing admission queues.
+        async with self._lifecycle_lock:
+            self._running = False
+            try:
+                if self._task:
+                    self._task.cancel()
+                    # Consume worker cancellation, but propagate cancellation
+                    # of this caller after the queues are closed below.
+                    await asyncio.gather(self._task, return_exceptions=True)
+                    if not self._task.cancelled():
+                        error = self._task.exception()
+                        if error is not None:
+                            raise error
+            finally:
+                # A scheduler that already failed must still close its queues and
+                # resolve admitted callers before its exception is propagated.
+                self._task = None
+                for channel_queue in self._queues.values():
+                    channel_queue.stop()
+            logger.info("GlobalTXScheduler: stopped (total_scheduled=%d)",
+                       self._packets_scheduled)
 
-    async def _do_send(self, channel_id: str, queue: ChannelTXQueue,
-                       request: dict, txpk: dict, queue_wait_ms: float) -> None:
-        """Execute the actual TX send and handle result/stats/future."""
+    def _ready_airtime_ms(self, channel_id: str, queue: ChannelTXQueue,
+                          request: dict) -> float | None:
+        """Return airtime when ready, leaving held requests in their queues."""
         # Airtime-proportional random TX delay (MeshCore/pymc style)
         airtime_est_ms = estimate_lora_airtime_ms(
             payload_size=len(request["payload"]),
@@ -873,7 +906,7 @@ class GlobalTXScheduler:
             preamble=queue.preamble,
         )
         tx_delay_factor = max(0.0, float(self._tx_delay_factor))
-        if tx_delay_factor > 0:
+        if tx_delay_factor > 0 and '_delay_until' not in request:
             base_delay_ms = (airtime_est_ms * 52.0 / 50.0) / 2.0
             delay_ms = random.uniform(0.0, 5.0) * base_delay_ms * tx_delay_factor
             if delay_ms > 1:
@@ -881,34 +914,37 @@ class GlobalTXScheduler:
                     "GlobalTXScheduler: airtime TX delay %.0fms on %s (factor=%.3f, airtime_est=%.1fms)",
                     delay_ms, channel_id, tx_delay_factor, airtime_est_ms,
                 )
-                await asyncio.sleep(delay_ms / 1000.0)
-
-        # TX Hold check: if RX batching window active, wait before TX
-        while self._tx_hold_getter:
-            _hold_until = self._tx_hold_getter()
-            _hold_remaining = _hold_until - time.monotonic()
-            if _hold_remaining > 0.01:
-                logger.info("GlobalTXScheduler: TX hold active on %s, "
-                           "waiting %.1fs (batch window)",
-                           channel_id, _hold_remaining)
-                await asyncio.sleep(_hold_remaining)
-                if self._discard_expired(queue, request):
-                    return
+                request['_delay_until'] = time.monotonic() + delay_ms / 1000.0
             else:
-                break
+                request['_delay_until'] = 0.0
 
-        delay = self._next_tx_at - time.monotonic()
-        if delay > 0:
-            await asyncio.sleep(delay)
-        if self._discard_expired(queue, request):
-            return
+        # Readiness and dequeue are synchronous: no other producer can change
+        # the selected head or admission capacity between these operations.
+        now = time.monotonic()
+        if max(request.get('_delay_until', 0.0), self._next_tx_at) > now:
+            return None
+        if self._tx_hold_getter and self._tx_hold_getter() - now > 0.01:
+            return None
         # The scheduler is the common path for bridge, room and dispatcher TX.
         # Its single worker keeps this check and accounting serialized across
         # all channels. Use the destination's modulation, not generic YAML radio
         # defaults (which can substantially underestimate narrow-band airtime).
-        if not await self._wait_for_airtime(queue, request, airtime_est_ms):
-            return
+        if not self._airtime_available(queue, request, airtime_est_ms):
+            return None
+        request.pop('_delay_until', None)
+        request.pop('_duty_wait_logged', None)
+        return airtime_est_ms
+
+    async def _do_send(self, channel_id: str, queue: ChannelTXQueue,
+                       request: dict, txpk: dict, airtime_est_ms: float) -> None:
+        """Send a ready request and account for its confirmed or unknown result."""
         queue_wait_ms = (time.monotonic() - request["enqueue_time"]) * 1000
+        # Queue lifetime and RF duration are different deadlines. Valid narrow-
+        # band packets/long preambles can exceed the old fixed ACK allowance.
+        # Extend only after dequeue, preserving the original queued wait limit.
+        deadline = request.get('_wait_deadline')
+        if deadline is not None:
+            deadline.reschedule(asyncio.get_running_loop().time() + airtime_est_ms / 1000.0 + 15.0)
 
         # Send via the backend's PULL_RESP sender
         try:
@@ -946,6 +982,8 @@ class GlobalTXScheduler:
 
         if result.get("ok"):
             queue.stats["total_sent"] += 1
+            if request.get('priority'):
+                queue.stats['priority_sent'] += 1
             queue.stats["last_tx_time"] = time.time()
             queue.record_tx_time(send_ms)
             queue.record_tx_timing(send_ms, airtime_ms, queue_wait_ms)
@@ -972,11 +1010,20 @@ class GlobalTXScheduler:
             _retry_count = request.get('_retry_count', 0)
             _max_retries = 2  # max 2 retries (3 total attempts)
             if _tx_result == 'dropped' and _retry_count < _max_retries:
-                # Re-enqueue the packet for retry
+                # Retain the request's lane: bulk backlog must not delay or
+                # reject an ACK retry. A full priority lane keeps its already
+                # admitted ACKs, just as a full bulk lane rejects a retry.
                 request['_retry_count'] = _retry_count + 1
                 try:
-                    queue.queue.put_nowait(request)
-                    queue.stats['pending'] = queue.queue.qsize()
+                    queue._discard_completed_requests()
+                    if request.get('priority'):
+                        if len(queue._priority_queue) >= queue._queue_size:
+                            raise asyncio.QueueFull
+                        queue._priority_queue.append(request)
+                        queue.stats['pending_priority'] = len(queue._priority_queue)
+                    else:
+                        queue.queue.put_nowait(request)
+                        queue.stats['pending'] = queue.queue.qsize()
                     queue.stats.setdefault('total_retried', 0)
                     queue.stats['total_retried'] += 1
                     logger.warning("GlobalTXScheduler: TX DROPPED on %s, "
@@ -1010,25 +1057,19 @@ class GlobalTXScheduler:
         self._packets_scheduled += 1
         # No sleep needed: backend _last_tx_end guard + _tx_lock serializes TX
 
-    async def _wait_for_airtime(self, queue: ChannelTXQueue, request: dict,
-                                airtime_ms: float) -> bool:
-        """Wait within the original TTL, observing live duty-setting changes."""
-        logged = False
-        while self.airtime_manager is not None:
-            if self._discard_expired(queue, request):
-                return False
-            allowed, wait_s = self.airtime_manager.can_transmit(airtime_ms)
+    def _airtime_available(self, queue: ChannelTXQueue, request: dict,
+                           airtime_ms: float) -> bool:
+        """Check the shared budget without blocking another channel's turn."""
+        if self.airtime_manager is not None:
+            allowed, _wait_s = self.airtime_manager.can_transmit(airtime_ms)
             if allowed:
                 return True
-            if not logged:
+            if not request.get('_duty_wait_logged'):
                 self._duty_cycle_waits += 1
                 logger.info("GlobalTXScheduler: duty-cycle hold on %s (airtime=%.1fms)",
                             queue.channel_id, airtime_ms)
-                logged = True
-            remaining = queue.ttl_seconds - (time.monotonic() - request["enqueue_time"])
-            # Poll at most once a second so live enable/limit edits take effect
-            # promptly, and never extend a packet's original expiry deadline.
-            await asyncio.sleep(min(max(float(wait_s), 0.01), 1.0, max(0.0, remaining)))
+                request['_duty_wait_logged'] = True
+            return False
         return True
 
     @staticmethod
@@ -1061,6 +1102,7 @@ class GlobalTXScheduler:
 
         while self._running:
             sent_any = False
+            deferred_any = False
             queue_list = list(self._queues.items())
             n_queues = len(queue_list)
             if not n_queues:
@@ -1077,22 +1119,27 @@ class GlobalTXScheduler:
                 # at the Python layer anymore — failures surface via the
                 # post-TX TX_ACK.
 
-                # --- No blocked request: try to dequeue a new packet ---
+                # Leave held work in place: it still occupies capacity and
+                # must not wake join() waiters or require reordering the FIFO.
                 try:
-                    request = queue.dequeue_nowait()
+                    request = queue.peek_nowait()
                 except asyncio.QueueEmpty:
                     continue
 
                 if self._discard_expired(queue, request):
+                    queue.dequeue_nowait()
                     continue
+
+                airtime_est_ms = self._ready_airtime_ms(channel_id, queue, request)
+                if airtime_est_ms is None:
+                    deferred_any = True
+                    continue
+                queue.dequeue_nowait()
 
                 # Build txpk using the queue's channel config
                 txpk = queue.build_txpk(
                     request["payload"],
                     request.get("tx_power", queue.tx_power))
-
-                # Measure queue wait BEFORE calling send_func
-                queue_wait_ms = (time.monotonic() - request["enqueue_time"]) * 1000
 
                 # --- Pre-TX check removed ---
                 # Custom LBT and its Python pre-filter have been replaced by
@@ -1103,7 +1150,7 @@ class GlobalTXScheduler:
                 # result="blocked".
                 # --- Send the packet ---
                 try:
-                    await self._do_send(channel_id, queue, request, txpk, queue_wait_ms)
+                    await self._do_send(channel_id, queue, request, txpk, airtime_est_ms)
                 except asyncio.CancelledError:
                     future = request.get("future")
                     if future is not None and not future.done():
@@ -1115,8 +1162,9 @@ class GlobalTXScheduler:
                 # Rotate start position for next round
                 self._round_index += 1
             else:
-                # No packets in any queue - brief sleep to avoid busy-wait
-                await asyncio.sleep(0.001)  # 1ms poll interval (was 10ms)
+                # Bounded polling observes new ACKs, cancellation, deadlines
+                # and live duty edits while all current requests are held.
+                await asyncio.sleep(0.01 if deferred_any else 0.001)
 
         logger.info("GlobalTXScheduler: loop exited")
 

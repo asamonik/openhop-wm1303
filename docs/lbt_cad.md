@@ -6,28 +6,33 @@
 
 The WM1303 system implements two channel-sensing mechanisms to reduce collisions before transmitting:
 
-- **CAD (Channel Activity Detection)** — **Mandatory** hardware-level LoRa preamble detection on the SX1261, executed before every TX
+- **CAD (Channel Activity Detection)** — LoRa preamble detection on the SX1261, attempted by both native TX paths for supported bandwidths
 - **LBT (Listen Before Talk)** — **Optional** per-channel RSSI-based check that runs after CAD when enabled
 
-Since v2.1.0, CAD is mandatory and always active. LBT is an additional layer that can be independently enabled or disabled per channel. Since v2.1.1, the Python pre-TX software check has been removed — the C-level CAD+LBT is the sole channel assessment mechanism.
+Pre-TX CAD has no user toggle. LBT can be enabled per channel. The Python pre-TX
+RSSI filter has been removed; the native HAL performs the RSSI decision.
 
 ## CAD — Channel Activity Detection
 
 ### Mandatory Hardware CAD
 
-Every transmission passes through a hardware-level LoRa CAD scan on the **SX1261** radio before the packet is sent via the SX1302. This is implemented in C code (`lora_pkt_fwd.c`) for minimal latency and direct hardware control.
-
-CAD replaces the previous software-based collision avoidance (random TX delays) with a deterministic, hardware-driven approach.
+Both the immediate and JIT paths in `lora_pkt_fwd.c` attempt CAD before sending
+LoRa packets with a supported bandwidth. Supported CAD settings are SF7–SF12
+with 62.5, 125, 250 or 500 kHz bandwidth. A scan error records `scan_error` and
+allows TX to continue; an unsupported bandwidth records `unsupported_bw` and
+skips the scan. A successful transmission therefore does not establish that a
+scan found the channel clear.
 
 ### How It Works
 
-1. **Stop RX** — the concentrator's RX is briefly paused
+1. **Inhibit SX1261 LoRa RX** — the auxiliary receiver is paused for the CAD scan
 2. **CAD Scan** — the SX1261 performs a LoRa preamble detection scan on the exact TX frequency, spreading factor, and bandwidth
 3. **Result** —
    - **Clear**: TX proceeds immediately (IMMEDIATE mode)
-   - **Detected**: retry with fixed delays (50 → 100 → 200 → 300 → 400 ms), up to 5 retries
-   - **After 5 retries**: force-send the packet (TX must not be blocked indefinitely)
-4. **Resume RX** — RX is restored after TX completes
+   - **Detected**: retry up to 15 times, choosing a random 1–10 ms wait each time
+   - **After 15 retries**: continue to TX with `forced_after_retries`; enabled HAL LBT still applies
+   - **Scan error**: continue to TX with `scan_error`
+4. **Resume RX** — SX1261 RX is restarted between busy-channel waits and after the TX guard
 
 ### SX1261 / SX1302 Interference Resolution
 
@@ -44,7 +49,9 @@ During development, a critical hardware interaction was discovered: configuring 
 
 ### CAD Timing Breakdown
 
-The full CAD cycle has been optimized from **~500+ ms** down to **~37–56 ms**:
+The following are historical hardware measurements recorded during earlier
+development. They have not been remeasured during the hardware-independent
+maintenance campaign and do not establish current per-packet latency:
 
 | Phase | Channel A (SF7 BW125) | Channel E (SF8 BW62.5) |
 |-------|----------------------|------------------------|
@@ -56,23 +63,16 @@ The full CAD cycle has been optimized from **~500+ ms** down to **~37–56 ms**:
 
 Channel E takes longer due to its narrower bandwidth (BW 62.5 kHz) requiring more symbols for preamble detection.
 
-### CAD Retry Delays (v2.1.1)
+### Current CAD Retry Delays
 
-When a CAD scan detects activity, the system retries with fixed delays (changed from exponential backoff in v2.1.1):
-
-| Retry | v2.1.0 (exponential) | v2.1.1 (fixed) |
-|-------|---------------------|----------------|
-| 1 | 100 ms | 50 ms |
-| 2 | 200 ms | 100 ms |
-| 3 | 400 ms | 200 ms |
-| 4 | 800 ms | 300 ms |
-| 5 | 1600 ms | 400 ms |
-| **Worst-case total** | **3100 ms** | **1050 ms** |
-
-This is a **66% reduction** in worst-case TX delay while maintaining 5 retry attempts for collision avoidance. After 5 retries, the packet is force-sent regardless.
+Both native TX paths allow an initial scan plus 15 retries. Each retry wait is
+`1 + rand() % 10` milliseconds, so exhausting all retries adds 15–150 ms of
+requested sleep. That excludes scan duration, mutex contention and scheduling
+overhead. Earlier fixed 50/100/200/300/400 ms retry tables no longer describe
+the code. CAD force-through does not bypass an enabled HAL LBT decision.
 
 
-### CAD Timing Optimizations Applied
+### Historical CAD Timing Optimizations
 
 | Optimization | Before | After | Savings |
 |-------------|--------|-------|---------|
@@ -90,28 +90,33 @@ This is a **66% reduction** in worst-case TX delay while maintaining 5 retry att
 CAD events are recorded per channel with two outcomes:
 
 - **Clear** — no LoRa preamble detected, TX proceeds
-- **Detected** — LoRa activity found, TX was force-sent after all retries were exhausted
+- **Detected** — LoRa activity remained after CAD retries; the CAD gate allowed TX to proceed
 
 Events are stored in `repeater.db` (`cad_events` table) and displayed in the Spectrum tab's **CAD Activity** chart. The chart shows Clear (green) and Detected (red) counts per channel.
 
-> **Note:** "Detected" in the chart means the CAD scan found activity on all 5 retry attempts, and the packet was ultimately force-sent. This is expected to be rare in normal operation.
+Use the final TX result and CAD reason in packet traces alongside these counts.
+CAD detection alone does not confirm RF transmission, and `scan_error` does not
+mean a clear channel was observed.
 
 ## LBT — Listen Before Talk
 
-### Custom Per-Channel RSSI Check
+### HAL Per-Channel RSSI Check
 
-LBT provides an additional RSSI-based channel assessment that runs **after** the mandatory CAD scan. When enabled for a channel, it measures the actual signal strength in continuous RX mode and compares it against a configurable threshold.
-
-> ⚠️ **LBT is work-in-progress.** It is currently recommended to keep LBT **disabled** until further testing validates its effectiveness in production environments.
+The RSSI gate runs inside `lgw_send()` through the HAL's SX1261 LBT functions.
+The former custom software RSSI check is disabled. Hardware effectiveness and
+timing still require measurements on the target radio.
 
 ### How It Works
 
-1. After a successful CAD scan (or after CAD retries), LBT is checked if enabled for the TX channel
-2. The SX1261 switches to continuous RX mode on the TX frequency
-3. A real RSSI measurement is taken after a settle time
-4. The measured RSSI is compared to the per-channel LBT threshold
-5. If RSSI > threshold → channel is busy → TX is delayed
-6. If RSSI ≤ threshold → channel is clear → TX proceeds
+1. HAL LBT is globally enabled when at least one active TX channel requests it.
+2. Channel selection prefers matching bandwidth within the HAL's ±10 kHz frequency tolerance; 62.5 kHz TX can fall back to a 125 kHz scan entry.
+3. The selected channel's RSSI threshold is supplied to the SX1261 LBT scan and AGC handshake.
+4. A busy result rejects that send and produces a blocked TX acknowledgement.
+5. If another channel has LBT disabled while global LBT is enabled, its handshake uses a permit-all threshold. When no channel enables LBT, HAL LBT is skipped globally.
+
+The generated configuration uses a 128 µs scan setting and a 4,000 ms transmit
+time limit. These settings are not measurements of total LBT latency. Enabling
+LBT alongside an active 500 kHz TX channel is rejected by configuration validation.
 
 ### Configuration (per channel)
 
@@ -124,12 +129,9 @@ Both parameters are configurable per channel via the **Channels** tab in the WM1
 
 ### Timing Impact
 
-LBT adds approximately **47 ms** when enabled. When disabled, it is completely skipped with zero overhead:
-
-| Scenario | Channel A (SF7 BW125) | Channel E (SF8 BW62.5) |
-|----------|----------------------|------------------------|
-| CAD only (LBT off) | ~37–43 ms | ~47–56 ms |
-| CAD + LBT (LBT on) | ~84–90 ms | ~95–104 ms |
+Measure end-to-end latency on hardware. The previous custom-check estimate of
+47 ms does not describe the current HAL path; a disabled logical channel can
+still participate in the handshake when another channel enables global LBT.
 
 ### LBT Event Tracking
 
@@ -137,7 +139,8 @@ LBT events are recorded per channel with frequency and RSSI values, stored in `r
 
 ## TX Delay Elimination
 
-With mandatory CAD handling collision avoidance, **all random TX delays have been set to zero** in v2.1.0:
+The default Python and per-rule TX delays were set to zero in v2.1.0. Users can
+configure Python jitter; native CAD retries also have their own random waits:
 
 | Parameter | Before | After |
 |-----------|--------|-------|
@@ -150,12 +153,11 @@ With mandatory CAD handling collision avoidance, **all random TX delays have bee
 
 | Hold Type | Status | Duration | Purpose |
 |-----------|--------|----------|---------|
-| **CAD scan** | ✅ Mandatory | 37–56 ms | Hardware preamble detection before every TX |
-| **CAD retry backoff** | ✅ Active (on detection) | 50–400 ms (fixed) | Wait for channel to clear (worst-case 1050 ms total) |
-| **LBT check** | ⚙️ Optional (per channel) | ~47 ms when enabled | RSSI-based channel assessment |
+| CAD scan | Attempted for supported LoRa settings | Hardware-dependent | Preamble detection before sending |
+| CAD retry wait | Active on detection | 1–10 ms per retry, at most 15 retries | Wait for channel to clear |
+| HAL LBT check | Optional per channel | Hardware-dependent | RSSI-based channel assessment |
 | **Python pre-TX check** | ❌ Removed (v2.1.1) | — | Was: software LBT/CAD check before PULL_RESP (redundant with C-level CAD) |
-| TX batch window | ✅ Active | 2 seconds | Group concurrent bridge sends |
-| Queue depth hold | ✅ Active | 100 ms (1 pkt) to 2 s (batch) | Brief dedup window |
+| Queue depth hold after RX | Active | 50 ms with one pending bulk packet; otherwise zero | Brief dedup window |
 | Noise floor hold | ❌ Removed | — | Was: pause TX for noise measurement |
 
 ### Design Principles
@@ -163,7 +165,7 @@ With mandatory CAD handling collision avoidance, **all random TX delays have bee
 The TX pipeline follows the project's core design principles:
 
 - **RX availability is the #1 priority** — CAD + TX duration is minimized to restore RX as quickly as possible
-- **TX must be sent ASAP** — zero random delays, CAD overhead is deterministic and minimal
+- **TX should proceed promptly** — default Python random delays are zero; native CAD retries have bounded random waits
 - **TX duration must be as short as possible** — IMMEDIATE TX mode, optimized CAD cycle
 
 ## SPI Considerations
@@ -184,11 +186,11 @@ CAD is always active and has no user toggle. The **Spectrum** tab shows:
 
 ### LBT Controls
 
-Available on all channels (A–E) in the **Channels** tab:
+Available on all channels (A–F) in the **Channels** tab:
 
 - Toggle to enable/disable LBT per channel
 - RSSI threshold slider (when enabled)
-- Changes apply within 5 seconds (cache TTL auto-reload)
+- Save the settings and restart the repeater to apply the native HAL configuration
 
 ### Charts
 
@@ -231,13 +233,13 @@ All values are persisted to `repeater.db` and exposed through API and WebSocket.
 - This may indicate persistent LoRa activity on the channel
 - Check the Noise Floor chart for elevated signal levels
 - Verify there are no nearby transmitters on the same frequency
-- After 5 retries, packets are force-sent regardless — check if this is causing issues
+- Inspect the CAD reason and final TX result: after 15 retries CAD permits sending, but HAL LBT or another send failure can still prevent it
 
 ### LBT blocking all TX
 - Check noise floor values — if stuck at `-120 dBm`, scan data may not be updating
 - Verify SX1261 is operational (check system logs for SPI errors)
 - LBT threshold may be set too low — raise it above the noise floor
-- Consider disabling LBT (it is still work-in-progress)
+- Inspect the HAL LBT result and threshold in packet traces; an unavailable RSSI sample is not a measured clear channel
 
 ### High CAD retry rate
 - Channel may be genuinely busy with LoRa traffic
@@ -245,8 +247,8 @@ All values are persisted to `repeater.db` and exposed through API and WebSocket.
 - Monitor the CAD Activity chart for patterns
 
 ### TX latency seems high
-- Verify LBT is disabled if not needed (saves ~47 ms per TX)
-- Check CAD retry counts — frequent retries add exponential backoff delays
+- Check whether HAL LBT reports blocked sends or missing observations
+- Check CAD retry counts — retries add scan time plus random 1–10 ms waits
 - Review the packet forwarder logs for timing details
 
 ## Related Documents

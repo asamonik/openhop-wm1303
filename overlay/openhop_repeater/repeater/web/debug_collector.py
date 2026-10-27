@@ -346,11 +346,13 @@ class DebugCollector:
     def _sanitize_config(self, data: Any, depth: int = 0) -> Any:
         """Recursively redact sensitive keys in a config dict."""
         if depth > 20:
-            return data
+            # Limit recursion without placing an uninspected subtree (and
+            # any secrets below it) into the downloadable diagnostic bundle.
+            return "[REDACTED]"
         if isinstance(data, dict):
             result = {}
             for k, v in data.items():
-                if any(secret in k.lower() for secret in _REDACT_KEYS):
+                if any(secret in str(k).lower() for secret in _REDACT_KEYS):
                     result[k] = "[REDACTED]"
                 else:
                     result[k] = self._sanitize_config(v, depth + 1)

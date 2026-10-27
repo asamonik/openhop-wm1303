@@ -49,6 +49,7 @@ License: Revised BSD License, see LICENSE.TXT file include in the project
 #include <stdbool.h>        /* bool type */
 #include <stdio.h>          /* printf, fprintf, snprintf, fopen, fputs */
 #include <inttypes.h>       /* PRIx64, PRIu64... */
+#include <limits.h>         /* CHAR_BIT */
 
 #include <string.h>         /* memset */
 #include <signal.h>         /* sigaction */
@@ -163,7 +164,7 @@ typedef struct spectral_scan_s {
 typedef struct cad_channel_s {
     uint32_t freq_hz;       /* channel center frequency in Hz */
     uint8_t  sf;            /* spreading factor (7-12) */
-    uint8_t  bw;            /* bandwidth: 0=125kHz, 1=250kHz, 2=500kHz */
+    uint8_t  bw;            /* bandwidth: 0=125kHz, 1=250kHz, 2=500kHz, 3=62.5kHz */
     char     id[32];        /* channel identifier string */
 } cad_channel_t;
 
@@ -224,9 +225,14 @@ static int cad_read_config(void) {
         double sf_val = json_object_get_number(ch_obj, "sf");
         double bw_val = json_object_get_number(ch_obj, "bw");
 
-        if (freq < 800e6 || freq > 930e6 || sf_val < 7 || sf_val > 12) {
-            printf("WARNING: CAD config: skipping invalid channel %s (freq=%.0f, sf=%.0f)\n",
-                   id ? id : "?", freq, sf_val);
+        if (json_value_get_type(json_object_get_value(ch_obj, "freq_hz")) != JSONNumber ||
+            json_value_get_type(json_object_get_value(ch_obj, "sf")) != JSONNumber ||
+            json_value_get_type(json_object_get_value(ch_obj, "bw")) != JSONNumber ||
+            !isfinite(freq) || freq < 800e6 || freq > 930e6 || floor(freq) != freq ||
+            !isfinite(sf_val) || sf_val < 7 || sf_val > 12 || floor(sf_val) != sf_val ||
+            !isfinite(bw_val) || bw_val < 0 || bw_val > 3 || floor(bw_val) != bw_val) {
+            printf("WARNING: CAD config: skipping invalid channel %s (freq=%.0f, sf=%.0f, bw=%.0f)\n",
+                   id ? id : "?", freq, sf_val, bw_val);
             continue;
         }
 
@@ -294,6 +300,12 @@ static struct timeval pull_timeout = {0, (PULL_TIMEOUT_MS * 1000)}; /* non criti
 
 /* hardware access control and correction */
 pthread_mutex_t mx_concent = PTHREAD_MUTEX_INITIALIZER; /* control access to the concentrator */
+/* Serialize native TX paths through CAD retries and RX restoration. Keep this
+   held when mx_concent is released for RX during waits; acquire it first. */
+static pthread_mutex_t mx_tx = PTHREAD_MUTEX_INITIALIZER;
+/* Protect compound queue operations and matching ACK-token publication. This
+   is released before CAD/TX waits so producers can keep admitting work. */
+static pthread_mutex_t mx_jit_access = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t mx_xcorr = PTHREAD_MUTEX_INITIALIZER; /* control access to the XTAL correction */
 static bool xtal_correct_ok = false; /* set true when XTAL correction is stable enough */
 static double xtal_correct = 1.0;
@@ -474,13 +486,13 @@ typedef struct {
     bool         lbt_pass;          /* valid only when lbt_checked is true */
     uint8_t      lbt_retries;
     uint32_t     cad_duration_ms;    /* total CAD scan time including retries (ms) */
-    const char * tx_result;         /* "sent", "blocked", "send_failed" */
+    const char * tx_result;         /* "sent", "blocked", "send_failed", "rejected", "tx_unconfirmed" */
 } tx_ack_extra_t;
 
-#define TX_ACK_TOKEN_SLOTS 32
+#define TX_ACK_TOKEN_SLOTS JIT_QUEUE_MAX
 typedef struct {
     bool     used;
-    uint32_t count_us;     /* txpkt.count_us (0 for IMMEDIATE) */
+    uint32_t count_us;     /* JIT timestamp, including zero at counter wrap */
     uint32_t freq_hz;
     uint16_t size;
     uint8_t  datarate;
@@ -557,8 +569,8 @@ static int custom_lbt_hal_bw_to_cad(uint8_t hal_bw) {
 /* HAL LBT: look up per-channel rssi_target_dbm by frequency and bandwidth.
    Populates *enabled and *threshold_dbm based on the snapshot of the HAL
    LBT config taken at startup. If the global LBT is disabled, returns
-   enabled=false. Mirror loragw_lbt.c's first compatible match: ±10 kHz,
-   exact BW or its existing 62.5 kHz TX / 125 kHz scan fallback. */
+   enabled=false. Mirror loragw_lbt.c: ±10 kHz, prefer exact BW, and only
+   use the 62.5 kHz TX / 125 kHz scan fallback if no exact BW exists. */
 static void hal_lbt_lookup(uint32_t freq_hz, uint8_t bandwidth,
                            bool *enabled, int8_t *threshold_dbm) {
     if (enabled == NULL || threshold_dbm == NULL) return;
@@ -568,6 +580,7 @@ static void hal_lbt_lookup(uint32_t freq_hz, uint8_t bandwidth,
         return;
     }
     int i;
+    int match = -1;
     for (i = 0; i < hal_lbt_nb_channels; i++) {
         uint32_t diff = (freq_hz > hal_lbt_channels[i].freq_hz)
                       ? (freq_hz - hal_lbt_channels[i].freq_hz)
@@ -575,10 +588,17 @@ static void hal_lbt_lookup(uint32_t freq_hz, uint8_t bandwidth,
         bool bw_matches = (bandwidth == hal_lbt_channels[i].bandwidth) ||
                           (bandwidth == BW_62K5HZ && hal_lbt_channels[i].bandwidth == BW_125KHZ);
         if (diff <= 10000 && bw_matches) {
-            *enabled = hal_lbt_channels[i].enable;  /* Use per-channel setting */
-            *threshold_dbm = hal_lbt_channels[i].rssi_target_dbm;
-            return;
+            if (bandwidth == hal_lbt_channels[i].bandwidth) {
+                match = i;
+                break;
+            }
+            if (match == -1) match = i;
         }
+    }
+    if (match >= 0) {
+        *enabled = hal_lbt_channels[match].enable;
+        *threshold_dbm = hal_lbt_channels[match].rssi_target_dbm;
+        return;
     }
     /* No per-channel entry — channel not configured for HAL LBT */
     *enabled = false;
@@ -602,38 +622,49 @@ static void hal_lbt_capture_result(tx_ack_extra_t *extra, int send_result) {
 
 /* --- WM1303: Pending TX-ack token table helpers ---
    Called from the downlink thread at enqueue time, and from the JIT thread at
-   TX time. Lookup matches by (count_us, freq_hz, size) which uniquely
-   identifies a packet within the short window between enqueue and TX. For
-   IMMEDIATE packets (count_us=0) we additionally require freq+size+datarate
-   to match, and fall back to oldest-first if multiple hits. */
+   TX time. Enqueue/publication and dequeue/claim are protected by mx_jit_access.
+   JIT converts immediate requests to scheduled timestamps before registration;
+   count_us=0 is therefore a real timestamp, never a wildcard. */
+static bool tx_ack_token_matches_packet(const pending_tx_ack_t *slot, const struct lgw_pkt_tx_s *pkt) {
+    return slot->count_us == pkt->count_us && slot->freq_hz == pkt->freq_hz &&
+           slot->size == pkt->size && slot->datarate == pkt->datarate &&
+           slot->bandwidth == pkt->bandwidth;
+}
+
+/* Caller holds mx_jit_access, excluding all queue mutations. */
+static bool tx_ack_token_is_queued(uint8_t rf_chain, const pending_tx_ack_t *slot) {
+    for (int n = 0; n < jit_queue[rf_chain].num_pkt; n++) {
+        if (jit_queue[rf_chain].nodes[n].pkt_type != JIT_PKT_TYPE_BEACON &&
+            tx_ack_token_matches_packet(slot, &jit_queue[rf_chain].nodes[n].pkt)) return true;
+    }
+    return false;
+}
+
+/* Caller holds mx_jit_access through enqueue and this publication. */
 static void tx_ack_token_store(uint8_t rf_chain, uint8_t token_h, uint8_t token_l,
                                const struct lgw_pkt_tx_s *pkt) {
     if (rf_chain >= LGW_RF_CHAIN_NB || pkt == NULL) return;
     pthread_mutex_lock(&mx_tx_ack_tokens);
-    /* Garbage-collect stale slots (>10s old) before inserting */
     struct timespec now_ts;
     clock_gettime(CLOCK_MONOTONIC, &now_ts);
     int free_slot = -1;
     for (int s = 0; s < TX_ACK_TOKEN_SLOTS; s++) {
-        if (tx_ack_tokens[rf_chain][s].used) {
-            double age = difftimespec(now_ts, tx_ack_tokens[rf_chain][s].enq_ts);
-            if (age > 10.0) {
-                tx_ack_tokens[rf_chain][s].used = false;
-            }
+        if (!tx_ack_tokens[rf_chain][s].used) {
+            free_slot = s;
+            break;
         }
-        if (!tx_ack_tokens[rf_chain][s].used && free_slot < 0) {
+        /* Future scheduled packets can legitimately wait hundreds of seconds.
+           Reclaim only records for packets already removed from the queue. */
+        if (free_slot < 0 && !tx_ack_token_is_queued(rf_chain, &tx_ack_tokens[rf_chain][s])) {
             free_slot = s;
         }
     }
     if (free_slot < 0) {
-        /* No free slot — overwrite oldest to avoid permanent leak */
-        double oldest = -1.0;
-        int oldest_idx = 0;
-        for (int s = 0; s < TX_ACK_TOKEN_SLOTS; s++) {
-            double age = difftimespec(now_ts, tx_ack_tokens[rf_chain][s].enq_ts);
-            if (age > oldest) { oldest = age; oldest_idx = s; }
-        }
-        free_slot = oldest_idx;
+        /* Queue and token capacities are equal; every admitted new packet
+           must have a free or orphaned slot. Preserve live tokens if violated. */
+        MSG("ERROR: [tx-ack] no free token slot for admitted packet\n");
+        pthread_mutex_unlock(&mx_tx_ack_tokens);
+        return;
     }
     tx_ack_tokens[rf_chain][free_slot].used = true;
     tx_ack_tokens[rf_chain][free_slot].count_us = pkt->count_us;
@@ -658,13 +689,7 @@ static bool tx_ack_token_claim(uint8_t rf_chain, const struct lgw_pkt_tx_s *pkt,
     struct timespec best_ts = {0, 0};
     for (int s = 0; s < TX_ACK_TOKEN_SLOTS; s++) {
         if (!tx_ack_tokens[rf_chain][s].used) continue;
-        if (tx_ack_tokens[rf_chain][s].freq_hz != pkt->freq_hz) continue;
-        if (tx_ack_tokens[rf_chain][s].size != pkt->size) continue;
-        if (tx_ack_tokens[rf_chain][s].datarate != pkt->datarate) continue;
-        if (tx_ack_tokens[rf_chain][s].bandwidth != pkt->bandwidth) continue;
-        if (pkt->count_us != 0 &&
-            tx_ack_tokens[rf_chain][s].count_us != pkt->count_us &&
-            tx_ack_tokens[rf_chain][s].count_us != 0) continue;
+        if (!tx_ack_token_matches_packet(&tx_ack_tokens[rf_chain][s], pkt)) continue;
         /* Pick the oldest matching entry (FIFO) */
         if (best < 0 || difftimespec(tx_ack_tokens[rf_chain][s].enq_ts, best_ts) < 0) {
             best = s;
@@ -684,33 +709,33 @@ static bool tx_ack_token_claim(uint8_t rf_chain, const struct lgw_pkt_tx_s *pkt,
 /* Forward declaration (defined later in file) */
 static int send_tx_ack(uint8_t token_h, uint8_t token_l, enum jit_error_e error, int32_t error_value, const tx_ack_extra_t *extra);
 
-/* WM1303: Periodically sweep stale token slots and send TOO_LATE ACKs
-   for packets that were enqueued but never transmitted (e.g. JIT drops).
-   This prevents Python-side ACK timeouts (3+ seconds) by proactively
-   notifying the caller within ~3 seconds of enqueue. */
+/* Report tokens whose packets were removed by JIT expiration. Queue membership,
+   not wall-clock age, distinguishes these from valid future scheduled packets.
+   In-flight tokens have already been claimed by the worker under the same guard. */
 static void tx_ack_token_sweep_stale(void) {
-    struct timespec now_ts;
-    clock_gettime(CLOCK_MONOTONIC, &now_ts);
+    pthread_mutex_lock(&mx_jit_access);
     pthread_mutex_lock(&mx_tx_ack_tokens);
     for (int rf = 0; rf < LGW_RF_CHAIN_NB; rf++) {
         for (int s = 0; s < TX_ACK_TOKEN_SLOTS; s++) {
             if (!tx_ack_tokens[rf][s].used) continue;
-            double age = difftimespec(now_ts, tx_ack_tokens[rf][s].enq_ts);
-            if (age > 2.0) {
+            if (!tx_ack_token_is_queued((uint8_t)rf, &tx_ack_tokens[rf][s])) {
                 uint8_t th = tx_ack_tokens[rf][s].token_h;
                 uint8_t tl = tx_ack_tokens[rf][s].token_l;
                 tx_ack_tokens[rf][s].used = false;
-                /* Release mutex briefly to send ACK (uses UDP socket) */
+                /* Do not hold queue/token locks during network I/O. */
                 pthread_mutex_unlock(&mx_tx_ack_tokens);
-                MSG("WARNING: [stale-ack] token 0x%02x%02x aged %.1fs — sending TOO_LATE ACK\n", th, tl, age);
+                pthread_mutex_unlock(&mx_jit_access);
+                MSG("WARNING: [stale-ack] token 0x%02x%02x removed from JIT — sending TOO_LATE ACK\n", th, tl);
                 send_tx_ack(th, tl, JIT_ERROR_TOO_LATE, 0, NULL);
                 /* Re-acquire and restart the inner loop for this rf chain */
+                pthread_mutex_lock(&mx_jit_access);
                 pthread_mutex_lock(&mx_tx_ack_tokens);
                 s = -1; /* will be incremented to 0 by for loop */
             }
         }
     }
     pthread_mutex_unlock(&mx_tx_ack_tokens);
+    pthread_mutex_unlock(&mx_jit_access);
 }
 
 
@@ -1700,17 +1725,39 @@ static int parse_gateway_configuration(const char * conf_file) {
     /* get reference coordinates */
     val = json_object_get_value(conf_obj, "ref_latitude");
     if (val != NULL) {
-        reference_coord.lat = (double)json_value_get_number(val);
+        double latitude = json_value_get_number(val);
+        if (json_value_get_type(val) != JSONNumber || !isfinite(latitude) ||
+            latitude < -90.0 || latitude > 90.0) {
+            MSG("ERROR: ref_latitude must be a finite number between -90 and 90\n");
+            json_value_free(root_val);
+            return -1;
+        }
+        reference_coord.lat = latitude;
         MSG("INFO: Reference latitude is configured to %f deg\n", reference_coord.lat);
     }
     val = json_object_get_value(conf_obj, "ref_longitude");
     if (val != NULL) {
-        reference_coord.lon = (double)json_value_get_number(val);
+        double longitude = json_value_get_number(val);
+        if (json_value_get_type(val) != JSONNumber || !isfinite(longitude) ||
+            longitude < -180.0 || longitude > 180.0) {
+            MSG("ERROR: ref_longitude must be a finite number between -180 and 180\n");
+            json_value_free(root_val);
+            return -1;
+        }
+        reference_coord.lon = longitude;
         MSG("INFO: Reference longitude is configured to %f deg\n", reference_coord.lon);
     }
     val = json_object_get_value(conf_obj, "ref_altitude");
     if (val != NULL) {
-        reference_coord.alt = (short)json_value_get_number(val);
+        double altitude = json_value_get_number(val);
+        if (json_value_get_type(val) != JSONNumber || !isfinite(altitude) ||
+            altitude < SHRT_MIN || altitude > SHRT_MAX) {
+            MSG("ERROR: ref_altitude must be a finite number between %d and %d meters\n", SHRT_MIN, SHRT_MAX);
+            json_value_free(root_val);
+            return -1;
+        }
+        /* Preserve the existing truncation to whole meters after validation. */
+        reference_coord.alt = (short)altitude;
         MSG("INFO: Reference altitude is configured to %i meters\n", reference_coord.alt);
     }
 
@@ -1725,12 +1772,43 @@ static int parse_gateway_configuration(const char * conf_file) {
         }
     }
 
+    /* Validate beacon numeric configuration before narrowing conversions. */
+    const struct {
+        const char *name;
+        double minimum;
+        double maximum;
+    } beacon_fields[] = {
+        {"beacon_period", 0, UINT32_MAX},
+        {"beacon_freq_hz", 0, UINT32_MAX},
+        {"beacon_freq_nb", 0, UINT8_MAX},
+        {"beacon_freq_step", 0, UINT32_MAX},
+        {"beacon_datarate", 8, 12},
+        {"beacon_bw_hz", 125000, 500000},
+        {"beacon_power", INT8_MIN, INT8_MAX},
+        {"beacon_infodesc", 0, UINT8_MAX},
+    };
+    for (size_t field = 0; field < sizeof beacon_fields / sizeof beacon_fields[0]; field++) {
+        val = json_object_get_value(conf_obj, beacon_fields[field].name);
+        if (val == NULL) continue;
+        double number = json_value_get_number(val);
+        if (json_value_get_type(val) != JSONNumber || !isfinite(number) ||
+            number < beacon_fields[field].minimum || number > beacon_fields[field].maximum ||
+            number != floor(number) ||
+            (strcmp(beacon_fields[field].name, "beacon_datarate") == 0 && number == 11) ||
+            (strcmp(beacon_fields[field].name, "beacon_bw_hz") == 0 && number != 125000 && number != 500000)) {
+            MSG("ERROR: invalid numeric configuration for %s\n", beacon_fields[field].name);
+            json_value_free(root_val);
+            return -1;
+        }
+    }
+
     /* Beacon signal period (optional) */
     val = json_object_get_value(conf_obj, "beacon_period");
     if (val != NULL) {
         beacon_period = (uint32_t)json_value_get_number(val);
         if ((beacon_period > 0) && (beacon_period < 6)) {
             MSG("ERROR: invalid configuration for Beacon period, must be >= 6s\n");
+            json_value_free(root_val);
             return -1;
         } else {
             MSG("INFO: Beaconing period is configured to %u seconds\n", beacon_period);
@@ -1784,6 +1862,15 @@ static int parse_gateway_configuration(const char * conf_file) {
     if (val != NULL) {
         beacon_infodesc = (uint8_t)json_value_get_number(val);
         MSG("INFO: Beaconing information descriptor is set to %u\n", beacon_infodesc);
+    }
+
+    /* Every configured channel must fit the native frequency representation.
+       A zero/one channel count retains the legacy single-frequency behavior. */
+    if (beacon_freq_nb > 1 &&
+        (uint64_t)beacon_freq_hz + (uint64_t)(beacon_freq_nb - 1) * beacon_freq_step > UINT32_MAX) {
+        MSG("ERROR: beacon channel frequency plan exceeds uint32 range\n");
+        json_value_free(root_val);
+        return -1;
     }
 
     /* Auto-quit threshold (optional) */
@@ -3267,8 +3354,6 @@ void thread_down(void) {
     JSON_Value *val = NULL; /* needed to detect the absence of some fields */
     const char *str; /* pointer to sub-strings in the JSON data */
     short x0, x1;
-    uint64_t x2;
-    double x3, x4;
 
     /* variables to send on GPS timestamp */
     struct tref local_ref; /* time reference used for GPS <-> timestamp conversion */
@@ -3281,7 +3366,6 @@ void thread_down(void) {
     size_t beacon_RFU1_size = 0;
     size_t beacon_RFU2_size = 0;
     uint8_t beacon_pyld_idx = 0;
-    time_t diff_beacon_time;
     struct timespec next_beacon_gps_time; /* gps time of next beacon packet */
     struct timespec last_beacon_gps_time; /* gps time of last enqueued beacon packet */
     int retry;
@@ -3449,27 +3533,54 @@ void thread_down(void) {
             clock_gettime(CLOCK_MONOTONIC, &recv_time);
 
             /* Pre-allocate beacon slots in JiT queue, to check downlink collisions */
-            beacon_loop = JIT_NUM_BEACON_IN_QUEUE - jit_queue[0].num_beacon;
+            pthread_mutex_lock(&mx_jit_access);
+            beacon_loop = jit_queue[0].num_beacon < JIT_NUM_BEACON_IN_QUEUE ?
+                JIT_NUM_BEACON_IN_QUEUE - jit_queue[0].num_beacon : 0;
+            pthread_mutex_unlock(&mx_jit_access);
             retry = 0;
-            while (beacon_loop && (beacon_period != 0)) {
+            /* Yield to socket handling even when every candidate collides.
+               Later receive iterations can retry after the queue changes. */
+            unsigned beacon_attempts = 0;
+            while (beacon_loop && (beacon_period != 0) && !exit_sig && !quit_sig &&
+                   beacon_attempts++ < JIT_QUEUE_MAX) {
+                pthread_mutex_lock(&mx_xcorr);
+                bool beacon_xtal_valid = xtal_correct_ok;
+                pthread_mutex_unlock(&mx_xcorr);
                 pthread_mutex_lock(&mx_timeref);
                 /* Wait for GPS to be ready before inserting beacons in JiT queue */
-                if ((gps_ref_valid == true) && (xtal_correct_ok == true)) {
+                if ((gps_ref_valid == true) && beacon_xtal_valid) {
 
                     /* compute GPS time for next beacon to come      */
                     /*   LoRaWAN: T = k*beacon_period + TBeaconDelay */
                     /*            with TBeaconDelay = [1.5ms +/- 1µs]*/
-                    if (last_beacon_gps_time.tv_sec == 0) {
-                        /* if no beacon has been queued, get next slot from current GPS time */
-                        diff_beacon_time = time_reference_gps.gps.tv_sec % ((time_t)beacon_period);
-                        next_beacon_gps_time.tv_sec = time_reference_gps.gps.tv_sec +
-                                                        ((time_t)beacon_period - diff_beacon_time);
+                    if (time_reference_gps.gps.tv_sec < 0 ||
+                        time_reference_gps.gps.tv_nsec < 0 || time_reference_gps.gps.tv_nsec >= 1000000000L) {
+                        pthread_mutex_unlock(&mx_timeref);
+                        break;
+                    }
+                    uint64_t reference_s = (uint64_t)time_reference_gps.gps.tv_sec;
+                    uint64_t beacon_base_s;
+                    if (last_beacon_gps_time.tv_sec <= time_reference_gps.gps.tv_sec) {
+                        /* Start from the current reference after GPS recovery,
+                           without retrying every missed historical slot. */
+                        beacon_base_s = reference_s - reference_s % beacon_period;
                     } else {
                         /* if there is already a beacon, take it as reference */
-                        next_beacon_gps_time.tv_sec = last_beacon_gps_time.tv_sec + beacon_period;
+                        beacon_base_s = (uint64_t)last_beacon_gps_time.tv_sec;
                     }
-                    /* now we can add a beacon_period to the reference to get next beacon GPS time */
-                    next_beacon_gps_time.tv_sec += (retry * beacon_period);
+                    /* Widen before adding periods. Linux time_t is signed;
+                       even the 32-bit boundary must reject before conversion. */
+                    uint64_t next_beacon_s = beacon_base_s + ((uint64_t)retry + 1) * beacon_period;
+                    uint64_t max_time_s = (UINT64_C(1) << (sizeof(time_t) * CHAR_BIT - 1)) - 1;
+                    double beacon_delta_us = ((double)(next_beacon_s - reference_s) -
+                        1E-9 * (double)time_reference_gps.gps.tv_nsec) * 1E6 * time_reference_gps.xtal_err;
+                    if (next_beacon_s > max_time_s || next_beacon_s < reference_s ||
+                        !isfinite(beacon_delta_us) || beacon_delta_us < 0 || beacon_delta_us > UINT32_MAX) {
+                        pthread_mutex_unlock(&mx_timeref);
+                        MSG("WARNING: [down] beacon time outside reference counter range\n");
+                        break;
+                    }
+                    next_beacon_gps_time.tv_sec = (time_t)next_beacon_s;
                     next_beacon_gps_time.tv_nsec = 0;
 
 #if DEBUG_BEACON
@@ -3486,8 +3597,13 @@ void thread_down(void) {
 #endif
 
                     /* convert GPS time to concentrator time, and set packet counter for JiT trigger */
-                    lgw_gps2cnt(time_reference_gps, next_beacon_gps_time, &(beacon_pkt.count_us));
+                    i = lgw_gps2cnt(time_reference_gps, next_beacon_gps_time, &(beacon_pkt.count_us));
                     pthread_mutex_unlock(&mx_timeref);
+                    if (i != LGW_GPS_SUCCESS) {
+                        MSG("WARNING: [down] cannot convert beacon GPS time\n");
+                        break;
+                    }
+                    if (exit_sig || quit_sig) break;
 
                     /* apply frequency correction to beacon TX frequency */
                     if (beacon_freq_nb > 1) {
@@ -3512,9 +3628,15 @@ void thread_down(void) {
 
                     /* Insert beacon packet in JiT queue */
                     pthread_mutex_lock(&mx_concent);
-                    lgw_get_instcnt(&current_concentrator_time);
+                    i = lgw_get_instcnt(&current_concentrator_time);
                     pthread_mutex_unlock(&mx_concent);
+                    if (i != LGW_HAL_SUCCESS) {
+                        MSG("WARNING: [down] cannot read concentrator time for beacon\n");
+                        break;
+                    }
+                    pthread_mutex_lock(&mx_jit_access);
                     jit_result = jit_enqueue(&jit_queue[0], current_concentrator_time, &beacon_pkt, JIT_PKT_TYPE_BEACON);
+                    pthread_mutex_unlock(&mx_jit_access);
                     if (jit_result == JIT_ERROR_OK) {
                         /* update stats */
                         pthread_mutex_lock(&mx_meas_dw);
@@ -3541,9 +3663,13 @@ void thread_down(void) {
                             meas_nb_beacon_rejected += 1;
                         }
                         pthread_mutex_unlock(&mx_meas_dw);
-                        /* In case previous enqueue failed, we retry one period later until it succeeds */
-                        /* Note: In case the GPS has been unlocked for a while, there can be lots of retries */
-                        /*       to be done from last beacon time to a new valid one */
+                        /* A later slot can recover collisions or lateness.
+                           A full/invalid queue cannot recover by spinning. */
+                        if (jit_result != JIT_ERROR_TOO_LATE &&
+                            jit_result != JIT_ERROR_COLLISION_PACKET &&
+                            jit_result != JIT_ERROR_COLLISION_BEACON) {
+                            break;
+                        }
                         retry++;
                         MSG_DEBUG(DEBUG_BEACON, "--> beacon queuing retry=%d\n", retry);
                     }
@@ -3618,7 +3744,15 @@ void thread_down(void) {
                 val = json_object_get_value(txpk_obj,"tmst");
                 if (val != NULL) {
                     /* TX procedure: send on timestamp value */
-                    txpkt.count_us = (uint32_t)json_value_get_number(val);
+                    double requested_timestamp = json_value_get_number(val);
+                    if (json_value_get_type(val) != JSONNumber || !isfinite(requested_timestamp) ||
+                        requested_timestamp < 0 || requested_timestamp > UINT32_MAX ||
+                        requested_timestamp != floor(requested_timestamp)) {
+                        MSG("WARNING: [down] invalid timestamp in \"txpk.tmst\", TX aborted\n");
+                        json_value_free(root_val);
+                        continue;
+                    }
+                    txpkt.count_us = (uint32_t)requested_timestamp;
 
                     /* Concentrator timestamp is given, we consider it is a Class A downlink */
                     downlink_type = JIT_PKT_TYPE_DOWNLINK_CLASS_A;
@@ -3654,12 +3788,42 @@ void thread_down(void) {
                     }
 
                     /* Get GPS time from JSON */
-                    x2 = (uint64_t)json_value_get_number(val);
+                    double requested_gps_ms = json_value_get_number(val);
+                    if (json_value_get_type(val) != JSONNumber || !isfinite(requested_gps_ms) ||
+                        requested_gps_ms < 0 || requested_gps_ms > 9007199254740991.0 ||
+                        requested_gps_ms != floor(requested_gps_ms)) {
+                        MSG("WARNING: [down] invalid GPS milliseconds in \"txpk.tmms\", TX aborted\n");
+                        json_value_free(root_val);
+                        continue;
+                    }
+                    uint64_t gps_ms = (uint64_t)requested_gps_ms;
 
-                    /* Convert GPS time from milliseconds to timespec */
-                    x3 = modf((double)x2/1E3, &x4);
-                    gps_tx.tv_sec = (time_t)x4; /* get seconds from integer part */
-                    gps_tx.tv_nsec = (long)(x3 * 1E9); /* get nanoseconds from fractional part */
+                    /* Linux time_t is signed, including on 32-bit Pi builds.
+                       Check its exclusive upper bound before casting. Integer
+                       division preserves exact milliseconds at modern epochs. */
+                    if ((double)(gps_ms / 1000) >= ldexp(1.0, sizeof(time_t) * CHAR_BIT - 1)) {
+                        MSG("WARNING: [down] GPS timestamp exceeds time_t range, TX aborted\n");
+                        json_value_free(root_val);
+                        continue;
+                    }
+                    gps_tx.tv_sec = (time_t)(gps_ms / 1000);
+                    gps_tx.tv_nsec = (long)(gps_ms % 1000) * 1000000L;
+
+                    /* The pinned HAL casts its relative tick delta to uint32.
+                       Reject pre-reference targets and a whole counter cycle
+                       before that cast; otherwise distant times can alias a
+                       near-future transmission. JIT still checks its own horizon.
+                       difftime avoids overflowing time_t while checking range. */
+                    double gps_delta_s = difftime(gps_tx.tv_sec, local_ref.gps.tv_sec) +
+                                         1E-9 * ((double)gps_tx.tv_nsec - (double)local_ref.gps.tv_nsec);
+                    double gps_delta_us = gps_delta_s * 1E6 * local_ref.xtal_err;
+                    if (local_ref.gps.tv_nsec < 0 || local_ref.gps.tv_nsec >= 1000000000L ||
+                        !isfinite(gps_delta_us) || gps_delta_s < 0 ||
+                        gps_delta_us < 0 || gps_delta_us > UINT32_MAX) {
+                        MSG("WARNING: [down] GPS timestamp outside reference counter range, TX aborted\n");
+                        json_value_free(root_val);
+                        continue;
+                    }
 
                     /* transform GPS time to timestamp */
                     i = lgw_gps2cnt(local_ref, gps_tx, &(txpkt.count_us));
@@ -3695,7 +3859,15 @@ void thread_down(void) {
                 json_value_free(root_val);
                 continue;
             }
-            txpkt.freq_hz = (uint32_t)((double)(1.0e6) * json_value_get_number(val));
+            /* Avoid losing a Hz to floating-point MHz representation. */
+            double requested_freq_hz = round(1.0e6 * json_value_get_number(val));
+            if (json_value_get_type(val) != JSONNumber || !isfinite(requested_freq_hz) ||
+                requested_freq_hz < 1 || requested_freq_hz > UINT32_MAX) {
+                MSG("WARNING: [down] invalid frequency in \"txpk.freq\", TX aborted\n");
+                json_value_free(root_val);
+                continue;
+            }
+            txpkt.freq_hz = (uint32_t)requested_freq_hz;
 
             /* parse RF chain used for TX (mandatory) */
             val = json_object_get_value(txpk_obj,"rfch");
@@ -3704,7 +3876,15 @@ void thread_down(void) {
                 json_value_free(root_val);
                 continue;
             }
-            txpkt.rf_chain = (uint8_t)json_value_get_number(val);
+            double requested_rf_chain = json_value_get_number(val);
+            if (json_value_get_type(val) != JSONNumber || !isfinite(requested_rf_chain) ||
+                requested_rf_chain < 0 || requested_rf_chain >= LGW_RF_CHAIN_NB ||
+                requested_rf_chain != floor(requested_rf_chain)) {
+                MSG("WARNING: [down] invalid RF chain in \"txpk.rfch\", TX aborted\n");
+                json_value_free(root_val);
+                continue;
+            }
+            txpkt.rf_chain = (uint8_t)requested_rf_chain;
             if (tx_enable[txpkt.rf_chain] == false) {
                 MSG("WARNING: [down] TX is not enabled on RF chain %u, TX aborted\n", txpkt.rf_chain);
                 json_value_free(root_val);
@@ -3714,7 +3894,17 @@ void thread_down(void) {
             /* parse TX power (optional field) */
             val = json_object_get_value(txpk_obj,"powe");
             if (val != NULL) {
-                txpkt.rf_power = (int8_t)json_value_get_number(val) - antenna_gain;
+                double requested_power = json_value_get_number(val);
+                double conducted_power = requested_power - antenna_gain;
+                if (json_value_get_type(val) != JSONNumber || !isfinite(requested_power) ||
+                    requested_power < INT8_MIN || requested_power > INT8_MAX ||
+                    requested_power != floor(requested_power) ||
+                    conducted_power < INT8_MIN || conducted_power > INT8_MAX) {
+                    MSG("WARNING: [down] invalid power in \"txpk.powe\", TX aborted\n");
+                    json_value_free(root_val);
+                    continue;
+                }
+                txpkt.rf_power = (int8_t)conducted_power;
             }
 
             /* Parse modulation (mandatory) */
@@ -3794,7 +3984,15 @@ void thread_down(void) {
                 /* parse Lora preamble length (optional field, optimum min value enforced) */
                 val = json_object_get_value(txpk_obj,"prea");
                 if (val != NULL) {
-                    i = (int)json_value_get_number(val);
+                    double requested_preamble = json_value_get_number(val);
+                    if (json_value_get_type(val) != JSONNumber || !isfinite(requested_preamble) ||
+                        requested_preamble < 0 || requested_preamble > UINT16_MAX ||
+                        requested_preamble != floor(requested_preamble)) {
+                        MSG("WARNING: [down] invalid preamble in \"txpk.prea\", TX aborted\n");
+                        json_value_free(root_val);
+                        continue;
+                    }
+                    i = (int)requested_preamble;
                     if (i >= MIN_LORA_PREAMB) {
                         txpkt.preamble = (uint16_t)i;
                     } else {
@@ -3815,7 +4013,15 @@ void thread_down(void) {
                     json_value_free(root_val);
                     continue;
                 }
-                txpkt.datarate = (uint32_t)(json_value_get_number(val));
+                double requested_bitrate = json_value_get_number(val);
+                if (json_value_get_type(val) != JSONNumber || !isfinite(requested_bitrate) ||
+                    requested_bitrate < DR_FSK_MIN || requested_bitrate > DR_FSK_MAX ||
+                    requested_bitrate != floor(requested_bitrate)) {
+                    MSG("WARNING: [down] invalid FSK bitrate in \"txpk.datr\", TX aborted\n");
+                    json_value_free(root_val);
+                    continue;
+                }
+                txpkt.datarate = (uint32_t)requested_bitrate;
 
                 /* parse frequency deviation (mandatory) */
                 val = json_object_get_value(txpk_obj,"fdev");
@@ -3824,12 +4030,28 @@ void thread_down(void) {
                     json_value_free(root_val);
                     continue;
                 }
-                txpkt.f_dev = (uint8_t)(json_value_get_number(val) / 1000.0); /* JSON value in Hz, txpkt.f_dev in kHz */
+                double requested_deviation = json_value_get_number(val);
+                if (json_value_get_type(val) != JSONNumber || !isfinite(requested_deviation) ||
+                    requested_deviation < 1000 || requested_deviation > 200000 ||
+                    requested_deviation != floor(requested_deviation)) {
+                    MSG("WARNING: [down] invalid FSK deviation in \"txpk.fdev\", TX aborted\n");
+                    json_value_free(root_val);
+                    continue;
+                }
+                txpkt.f_dev = (uint8_t)(requested_deviation / 1000.0); /* JSON Hz; HAL kHz */
 
                 /* parse FSK preamble length (optional field, optimum min value enforced) */
                 val = json_object_get_value(txpk_obj,"prea");
                 if (val != NULL) {
-                    i = (int)json_value_get_number(val);
+                    double requested_preamble = json_value_get_number(val);
+                    if (json_value_get_type(val) != JSONNumber || !isfinite(requested_preamble) ||
+                        requested_preamble < 0 || requested_preamble > UINT16_MAX ||
+                        requested_preamble != floor(requested_preamble)) {
+                        MSG("WARNING: [down] invalid preamble in \"txpk.prea\", TX aborted\n");
+                        json_value_free(root_val);
+                        continue;
+                    }
+                    i = (int)requested_preamble;
                     if (i >= MIN_FSK_PREAMB) {
                         txpkt.preamble = (uint16_t)i;
                     } else {
@@ -3852,7 +4074,15 @@ void thread_down(void) {
                 json_value_free(root_val);
                 continue;
             }
-            txpkt.size = (uint16_t)json_value_get_number(val);
+            double requested_size = json_value_get_number(val);
+            if (json_value_get_type(val) != JSONNumber || !isfinite(requested_size) ||
+                requested_size < 0 || requested_size > 255 ||
+                requested_size != floor(requested_size)) {
+                MSG("WARNING: [down] invalid payload length in \"txpk.size\", TX aborted\n");
+                json_value_free(root_val);
+                continue;
+            }
+            txpkt.size = (uint16_t)requested_size;
 
             /* Parse payload data (mandatory) */
             str = json_object_get_string(txpk_obj, "data");
@@ -3863,7 +4093,9 @@ void thread_down(void) {
             }
             i = b64_to_bin(str, strlen(str), txpkt.payload, sizeof txpkt.payload);
             if (i != txpkt.size) {
-                MSG("WARNING: [down] mismatch between .size and .data size once converter to binary\n");
+                MSG("WARNING: [down] invalid base64 or mismatch between .size and decoded .data, TX aborted\n");
+                json_value_free(root_val);
+                continue;
             }
 
             /* free the JSON parse tree from memory */
@@ -3896,7 +4128,18 @@ void thread_down(void) {
             /* check TX power before trying to queue packet, send a warning if not supported */
             if (jit_result == JIT_ERROR_OK) {
                 i = get_tx_gain_lut_index(txpkt.rf_chain, txpkt.rf_power, &tx_lut_idx);
-                if ((i < 0) || (txlut[txpkt.rf_chain].lut[tx_lut_idx].rf_power != txpkt.rf_power)) {
+                if (i < 0) {
+                    /* No calibrated setting at or below the requested power.
+                       Entry zero may be HIGHER: never raise the requested power.
+                       Use the final-result ACK because the legacy TX_POWER ACK
+                       denotes a warning for a packet that is still queued. */
+                    tx_ack_extra_t rejected = {0};
+                    rejected.tx_result = "rejected";
+                    MSG("ERROR: Packet REJECTED, no supported TX power at or below %ddBm\n", txpkt.rf_power);
+                    send_tx_ack(buff_down[1], buff_down[2], JIT_ERROR_TX_POWER, 0, &rejected);
+                    continue;
+                }
+                if (txlut[txpkt.rf_chain].lut[tx_lut_idx].rf_power != txpkt.rf_power) {
                     /* this RF power is not supported, throw a warning, and use the closest lower power supported */
                     warning_result = JIT_ERROR_TX_POWER;
                     warning_value = (int32_t)txlut[txpkt.rf_chain].lut[tx_lut_idx].rf_power;
@@ -3914,6 +4157,7 @@ void thread_down(void) {
                 int wait_loops = 0;
                 const int max_wait = 50; /* 50 * 10ms = 500ms max wait */
 
+                pthread_mutex_lock(&mx_tx);
                 /* Wait for TX_FREE with timeout */
                 pthread_mutex_lock(&mx_concent);
                 do {
@@ -4073,6 +4317,7 @@ void thread_down(void) {
                         send_tx_ack(buff_down[1], buff_down[2], JIT_ERROR_OK, warning_value, &imme_extra);
 
                         jit_result = JIT_ERROR_TOO_LATE; /* prevent JIT fallback */
+                        pthread_mutex_unlock(&mx_tx);
                         continue;
                     }
 
@@ -4087,35 +4332,7 @@ void thread_down(void) {
                         MSG("INFO: [imme] direct TX sent (freq=%u, SF%u, %u bytes)\n",
                             txpkt.freq_hz, txpkt.datarate, txpkt.size);
                         /* Estimate airtime for guard and RX restart scheduling */
-                        uint32_t imme_airtime_ms = 500; /* default fallback */
-                        if (txpkt.bandwidth == BW_125KHZ) {
-                            switch (txpkt.datarate) {
-                                case DR_LORA_SF7:  imme_airtime_ms = 50 + txpkt.size * 2;   break;
-                                case DR_LORA_SF8:  imme_airtime_ms = 100 + txpkt.size * 3;  break;
-                                case DR_LORA_SF9:  imme_airtime_ms = 200 + txpkt.size * 5;  break;
-                                case DR_LORA_SF10: imme_airtime_ms = 400 + txpkt.size * 9;  break;
-                                case DR_LORA_SF11: imme_airtime_ms = 800 + txpkt.size * 17; break;
-                                case DR_LORA_SF12: imme_airtime_ms = 1600 + txpkt.size * 33; break;
-                                default: imme_airtime_ms = 500; break;
-                            }
-                        } else if (txpkt.bandwidth == BW_250KHZ) {
-                            switch (txpkt.datarate) {
-                                case DR_LORA_SF7:  imme_airtime_ms = 30 + txpkt.size * 1;   break;
-                                case DR_LORA_SF8:  imme_airtime_ms = 50 + txpkt.size * 2;   break;
-                                default: imme_airtime_ms = 250; break;
-                            }
-                        } else if (txpkt.bandwidth == BW_500KHZ) {
-                            imme_airtime_ms = 25 + txpkt.size * 1;
-                        } else {
-                            /* BW_62K5HZ (Channel E) */
-                            switch (txpkt.datarate) {
-                                case DR_LORA_SF7:  imme_airtime_ms = 100 + txpkt.size * 4;  break;
-                                case DR_LORA_SF8:  imme_airtime_ms = 200 + txpkt.size * 7;  break;
-                                case DR_LORA_SF9:  imme_airtime_ms = 400 + txpkt.size * 13; break;
-                                default: imme_airtime_ms = 1000; break;
-                            }
-                        }
-
+                        uint32_t imme_airtime_ms = lgw_time_on_air(&txpkt);
 
                         /* Event-driven SX1261 RX restart (Option D):
                            Poll lgw_status(TX_STATUS) until the SX1302 reports
@@ -4129,12 +4346,12 @@ void thread_down(void) {
                             uint32_t _poll_count = 0;
                             uint32_t _max_wait_ms = imme_airtime_ms + 100;
                             uint32_t _poll_interval_us = 2000; /* 2ms */
-                            uint32_t _max_polls = (_max_wait_ms * 1000) / _poll_interval_us;
+                            uint32_t _max_polls = (uint32_t)(((uint64_t)_max_wait_ms * 1000) / _poll_interval_us);
                             int _poll_err = 0;
                             bool _tx_done = false;
                             /* Short initial delay so we don't poll the very first ms */
                             usleep(5000);
-                            while (_poll_count < _max_polls) {
+                            while (_poll_count < _max_polls && !exit_sig && !quit_sig) {
                                 pthread_mutex_lock(&mx_concent);
                                 _poll_err = lgw_status(txpkt.rf_chain, TX_STATUS, &_tx_stat);
                                 pthread_mutex_unlock(&mx_concent);
@@ -4148,9 +4365,10 @@ void thread_down(void) {
                                 _poll_count++;
                             }
                             if (!_tx_done) {
-                                MSG("WARNING: [imme] TX_DONE polling timed out after %u ms (airtime estimate was %u)\n",
-                                    _max_wait_ms, imme_airtime_ms);
+                                MSG("WARNING: [imme] TX completion unconfirmed after %u polls (%s, airtime=%u ms)\n",
+                                    _poll_count, (exit_sig || quit_sig) ? "shutdown" : "timeout", imme_airtime_ms);
                             }
+                            imme_extra.tx_result = _tx_done ? "sent" : "tx_unconfirmed";
                             pthread_mutex_lock(&mx_concent);
                             sx1261_set_tx_inhibit_rx(false);
                             sx1261_lora_rx_restart_light();
@@ -4161,22 +4379,25 @@ void thread_down(void) {
                         }
 
                         /* Emit post-TX ACK with CAD/LBT results */
-                        imme_extra.tx_result = "sent";
                         send_tx_ack(buff_down[1], buff_down[2], JIT_ERROR_OK, warning_value, &imme_extra);
 
                         pthread_mutex_lock(&mx_meas_dw);
                         meas_nb_tx_requested += 1;
-                        meas_nb_tx_ok += 1;
+                        if (strcmp(imme_extra.tx_result, "sent") == 0) meas_nb_tx_ok += 1;
+                        else meas_nb_tx_fail += 1;
                         pthread_mutex_unlock(&mx_meas_dw);
 
                         /* Skip the normal JIT enqueue + ACK path */
+                        pthread_mutex_unlock(&mx_tx);
                         continue;
                     } else {
                         /* TX failed — HAL LBT may have blocked, or other HAL error.
                            Release SX1261 inhibit, restart RX, emit a post-TX TX_ACK
                            with the failure so the Python future resolves immediately. */
+                        pthread_mutex_lock(&mx_concent);
                         sx1261_set_tx_inhibit_rx(false);
                         sx1261_lora_rx_restart_light();
+                        pthread_mutex_unlock(&mx_concent);
                         jit_result = JIT_ERROR_TOO_LATE; /* prevent JIT fallback */
                         if (send_err == LGW_LBT_NOT_ALLOWED) {
                             imme_extra.tx_result = "blocked";
@@ -4190,25 +4411,34 @@ void thread_down(void) {
                         pthread_mutex_lock(&mx_meas_dw);
                         meas_nb_tx_fail += 1;
                         pthread_mutex_unlock(&mx_meas_dw);
+                        pthread_mutex_unlock(&mx_tx);
                         continue;
                     }
                 }
+                pthread_mutex_unlock(&mx_tx);
             }
 
             /* Fallback: use JIT queue for timestamped packets or if direct send failed */
             if (jit_result == JIT_ERROR_OK) {
                 pthread_mutex_lock(&mx_concent);
-                lgw_get_instcnt(&current_concentrator_time);
+                int counter_status = lgw_get_instcnt(&current_concentrator_time);
                 pthread_mutex_unlock(&mx_concent);
-                jit_result = jit_enqueue(&jit_queue[txpkt.rf_chain], current_concentrator_time, &txpkt, downlink_type);
-                if (jit_result != JIT_ERROR_OK) {
-                    printf("ERROR: Packet REJECTED (jit error=%d)\n", jit_result);
+                if (counter_status != LGW_HAL_SUCCESS) {
+                    MSG("WARNING: [down] cannot read concentrator time, queue admission rejected\n");
+                    jit_result = JIT_ERROR_INVALID;
                 } else {
-                    /* WM1303: remember the TX_ACK token for this packet so the
-                       JIT thread can emit a post-TX ACK with CAD/LBT results. */
-                    tx_ack_token_store(txpkt.rf_chain, buff_down[1], buff_down[2], &txpkt);
-                    /* In case of a warning having been raised before, we notify it */
-                    jit_result = warning_result;
+                    pthread_mutex_lock(&mx_jit_access);
+                    jit_result = jit_enqueue(&jit_queue[txpkt.rf_chain], current_concentrator_time, &txpkt, downlink_type);
+                    if (jit_result != JIT_ERROR_OK) {
+                        printf("ERROR: Packet REJECTED (jit error=%d)\n", jit_result);
+                    } else {
+                        /* WM1303: remember the TX_ACK token for this packet so the
+                           JIT thread can emit a post-TX ACK with CAD/LBT results. */
+                        tx_ack_token_store(txpkt.rf_chain, buff_down[1], buff_down[2], &txpkt);
+                        /* In case of a warning having been raised before, we notify it */
+                        jit_result = warning_result;
+                    }
+                    pthread_mutex_unlock(&mx_jit_access);
                 }
                 pthread_mutex_lock(&mx_meas_dw);
                 meas_nb_tx_requested += 1;
@@ -4279,58 +4509,83 @@ void thread_jit(void) {
 
         for (i = 0; i < LGW_RF_CHAIN_NB; i++) {
             /* transfer data and metadata to the concentrator, and schedule TX */
+            pthread_mutex_lock(&mx_tx);
             pthread_mutex_lock(&mx_concent);
-            lgw_get_instcnt(&current_concentrator_time);
+            result = lgw_get_instcnt(&current_concentrator_time);
             pthread_mutex_unlock(&mx_concent);
+            if (result != LGW_HAL_SUCCESS) {
+                /* Keep packets and their ACK tokens queued until a valid
+                   counter is available; never expire or transmit using garbage. */
+                pthread_mutex_unlock(&mx_tx);
+                continue;
+            }
+            pthread_mutex_lock(&mx_jit_access);
             jit_result = jit_peek(&jit_queue[i], current_concentrator_time, &pkt_index);
             if (jit_result == JIT_ERROR_OK) {
                 if (pkt_index > -1) {
                     jit_result = jit_dequeue(&jit_queue[i], pkt_index, &pkt, &pkt_type);
                     if (jit_result == JIT_ERROR_OK) {
-                        /* update beacon stats */
+                        /* The worker owns this token while CAD/TX is in flight.
+                           Leaving it in the pending table lets the downstream
+                           stale sweep falsely report TOO_LATE during long TX. */
+                        uint8_t ack_token_h = 0, ack_token_l = 0;
+                        bool have_tx_ack = pkt_type != JIT_PKT_TYPE_BEACON &&
+                            tx_ack_token_claim((uint8_t)i, &pkt, &ack_token_h, &ack_token_l);
+                        pthread_mutex_unlock(&mx_jit_access);
+                        /* Check the beacon's corrected frequency before radio access. */
                         if (pkt_type == JIT_PKT_TYPE_BEACON) {
-                            /* Compensate breacon frequency with xtal error */
+                            /* Compensate beacon frequency with xtal error. */
                             pthread_mutex_lock(&mx_xcorr);
-                            pkt.freq_hz = (uint32_t)(xtal_correct * (double)pkt.freq_hz);
-                            MSG_DEBUG(DEBUG_BEACON, "beacon_pkt.freq_hz=%u (xtal_correct=%.15lf)\n", pkt.freq_hz, xtal_correct);
+                            double corrected_frequency = xtal_correct * (double)pkt.freq_hz;
                             pthread_mutex_unlock(&mx_xcorr);
+                            if (!isfinite(corrected_frequency) || corrected_frequency < 1 || corrected_frequency > UINT32_MAX) {
+                                MSG("WARNING: [jit] invalid corrected beacon frequency, TX aborted\n");
+                                pthread_mutex_lock(&mx_meas_dw);
+                                meas_nb_tx_fail++;
+                                pthread_mutex_unlock(&mx_meas_dw);
+                                pthread_mutex_unlock(&mx_tx);
+                                continue;
+                            }
+                            pkt.freq_hz = (uint32_t)corrected_frequency;
+                            MSG_DEBUG(DEBUG_BEACON, "beacon_pkt.freq_hz=%u\n", pkt.freq_hz);
 
-                            /* Update statistics */
-                            pthread_mutex_lock(&mx_meas_dw);
-                            meas_nb_beacon_sent += 1;
-                            pthread_mutex_unlock(&mx_meas_dw);
                             MSG("INFO: Beacon dequeued (count_us=%u)\n", pkt.count_us);
                         }
 
-                        /* WM1303: Single mutex lock for status check + pre-TX block
-                           to eliminate one lock/unlock cycle (~5-10ms saving) */
+                        tx_ack_extra_t extra = {0};
+                        extra.cad_reason = "not_run";
+                        extra.tx_result = "unknown";
+
+                        /* Only a confirmed free transmitter may enter CAD/TX.
+                           lgw_status can return SUCCESS with STATUS_UNKNOWN
+                           after a failed register read. */
                         pthread_mutex_lock(&mx_concent);
+                        tx_status = TX_STATUS_UNKNOWN;
                         result = lgw_status(pkt.rf_chain, TX_STATUS, &tx_status);
-                        if (result == LGW_HAL_ERROR) {
-                            pthread_mutex_unlock(&mx_concent);
-                            MSG("WARNING: [jit%d] lgw_status failed\n", i);
-                            continue; /* cannot proceed without valid status */
-                        } else if (tx_status == TX_EMITTING) {
-                            pthread_mutex_unlock(&mx_concent);
-                            MSG("ERROR: concentrator is currently emitting on rf_chain %d\n", i);
-                            print_tx_status(tx_status);
-                            continue;
-                        }
-                        /* tx_status is TX_FREE, TX_OFF or TX_SCHEDULED — mutex stays locked */
-                        if (tx_status == TX_SCHEDULED) {
+                        if (result == LGW_HAL_SUCCESS && tx_status == TX_SCHEDULED) {
                             MSG("WARNING: [jit] TX stuck in TX_SCHEDULED on rf_chain %d — aborting before CAD\n", i);
                             print_tx_status(tx_status);
-                            /* WM1303: Clear stuck TX_SCHEDULED state.
-                               After a CAD scan, the SX1302 TX FSM can get stuck in
-                               TX_SCHEDULED (0x91) and never transition to TX_EMITTING.
-                               lgw_abort_tx() clears all TX triggers and waits for TX_FREE,
-                               ensuring a clean state before the next CAD + lgw_send(). */
-                            int abort_err = lgw_abort_tx(pkt.rf_chain);
-                            if (abort_err != LGW_HAL_SUCCESS) {
-                                MSG("WARNING: [jit] lgw_abort_tx failed on rf_chain %d\n", i);
-                            } else {
-                                MSG("INFO: [jit] TX abort successful, TX FSM cleared on rf_chain %d\n", i);
+                            /* An abort can time out without returning an error.
+                               Read back the state before using the transmitter. */
+                            result = lgw_abort_tx(pkt.rf_chain);
+                            if (result == LGW_HAL_SUCCESS) {
+                                tx_status = TX_STATUS_UNKNOWN;
+                                result = lgw_status(pkt.rf_chain, TX_STATUS, &tx_status);
                             }
+                        }
+                        if (result != LGW_HAL_SUCCESS || tx_status != TX_FREE) {
+                            pthread_mutex_unlock(&mx_concent);
+                            MSG("WARNING: [jit] TX unavailable on rf_chain %d (status=%u, result=%d)\n",
+                                i, tx_status, result);
+                            extra.tx_result = "send_failed";
+                            if (have_tx_ack) {
+                                send_tx_ack(ack_token_h, ack_token_l, JIT_ERROR_OK, 0, &extra);
+                            }
+                            pthread_mutex_lock(&mx_meas_dw);
+                            meas_nb_tx_fail += 1;
+                            pthread_mutex_unlock(&mx_meas_dw);
+                            pthread_mutex_unlock(&mx_tx);
+                            continue;
                         }
                         if (spectral_scan_params.enable == true) {
                             result = lgw_spectral_scan_abort();
@@ -4349,9 +4604,6 @@ void thread_jit(void) {
                         /* WM1303: CAD/HAL-LBT result capture for post-TX TX_ACK.
                            Populated throughout the CAD retry loop and finalized
                            after lgw_send() returns (HAL LBT pass/fail). */
-                        tx_ack_extra_t extra = {0};
-                        extra.cad_reason = "not_run";
-                        extra.tx_result = "unknown";
                         bool clbt_blocked = false;
                         {
 
@@ -4517,59 +4769,17 @@ void thread_jit(void) {
                             } else {
                                 extra.tx_result = "send_failed";
                             }
-                            {
-                                uint8_t _tk_h = 0, _tk_l = 0;
-                                if (tx_ack_token_claim((uint8_t)i, &pkt, &_tk_h, &_tk_l)) {
-                                    send_tx_ack(_tk_h, _tk_l, JIT_ERROR_OK, 0, &extra);
-                                }
+                            if (have_tx_ack) {
+                                send_tx_ack(ack_token_h, ack_token_l, JIT_ERROR_OK, 0, &extra);
                             }
+                            pthread_mutex_unlock(&mx_tx);
                             continue;
                         } else {
-                            pthread_mutex_lock(&mx_meas_dw);
-                            meas_nb_tx_ok += 1;
-                            pthread_mutex_unlock(&mx_meas_dw);
                             /* Note: TX timestamp tracking removed — was used for L0 burst detection
                                (AGC-reload bursts), no longer needed after AGC reload removal. */
                             MSG_DEBUG(DEBUG_PKT_FWD, "lgw_send done on rf_chain %d: count_us=%u\n", i, pkt.count_us);
-                            /* WM1303: emit post-TX TX_ACK with CAD/LBT results */
-                            extra.tx_result = "sent";
-                            {
-                                uint8_t _tk_h = 0, _tk_l = 0;
-                                if (tx_ack_token_claim((uint8_t)i, &pkt, &_tk_h, &_tk_l)) {
-                                    send_tx_ack(_tk_h, _tk_l, JIT_ERROR_OK, 0, &extra);
-                                }
-                            }
-
                             /* Compute estimated airtime for this packet */
-                            uint32_t est_airtime_ms = 500; /* default fallback */
-                            if (pkt.bandwidth == BW_125KHZ) {
-                                switch (pkt.datarate) {
-                                    case DR_LORA_SF7:  est_airtime_ms = 50 + pkt.size * 2;   break;
-                                    case DR_LORA_SF8:  est_airtime_ms = 100 + pkt.size * 3;  break;
-                                    case DR_LORA_SF9:  est_airtime_ms = 200 + pkt.size * 5;  break;
-                                    case DR_LORA_SF10: est_airtime_ms = 400 + pkt.size * 9;  break;
-                                    case DR_LORA_SF11: est_airtime_ms = 800 + pkt.size * 17; break;
-                                    case DR_LORA_SF12: est_airtime_ms = 1600 + pkt.size * 33; break;
-                                    default: est_airtime_ms = 500; break;
-                                }
-                            } else if (pkt.bandwidth == BW_250KHZ) {
-                                switch (pkt.datarate) {
-                                    case DR_LORA_SF7:  est_airtime_ms = 30 + pkt.size * 1;   break;
-                                    case DR_LORA_SF8:  est_airtime_ms = 50 + pkt.size * 2;   break;
-                                    default: est_airtime_ms = 250; break;
-                                }
-                            } else if (pkt.bandwidth == BW_500KHZ) {
-                                est_airtime_ms = 25 + pkt.size * 1;
-                            } else {
-                                /* BW_62K5HZ (Channel E) */
-                                switch (pkt.datarate) {
-                                    case DR_LORA_SF7:  est_airtime_ms = 100 + pkt.size * 4;  break;
-                                    case DR_LORA_SF8:  est_airtime_ms = 200 + pkt.size * 7;  break;
-                                    case DR_LORA_SF9:  est_airtime_ms = 400 + pkt.size * 13; break;
-                                    default: est_airtime_ms = 1000; break;
-                                }
-                            }
-
+                            uint32_t est_airtime_ms = lgw_time_on_air(&pkt);
 
                             /* Event-driven SX1261 RX restart (Option D):
                                Poll lgw_status(TX_STATUS) until TX_FREE rather
@@ -4580,11 +4790,11 @@ void thread_jit(void) {
                                 uint32_t _poll_count = 0;
                                 uint32_t _max_wait_ms = est_airtime_ms + 100;
                                 uint32_t _poll_interval_us = 2000; /* 2ms */
-                                uint32_t _max_polls = (_max_wait_ms * 1000) / _poll_interval_us;
+                                uint32_t _max_polls = (uint32_t)(((uint64_t)_max_wait_ms * 1000) / _poll_interval_us);
                                 int _poll_err = 0;
                                 bool _tx_done = false;
                                 usleep(5000);
-                                while (_poll_count < _max_polls) {
+                                while (_poll_count < _max_polls && !exit_sig && !quit_sig) {
                                     pthread_mutex_lock(&mx_concent);
                                     _poll_err = lgw_status((uint8_t)i, TX_STATUS, &_tx_stat);
                                     pthread_mutex_unlock(&mx_concent);
@@ -4597,9 +4807,10 @@ void thread_jit(void) {
                                     _poll_count++;
                                 }
                                 if (!_tx_done) {
-                                    MSG("WARNING: [jit] TX_DONE polling timed out after %u ms on rf_chain %d (airtime estimate was %u)\n",
-                                        _max_wait_ms, i, est_airtime_ms);
+                                    MSG("WARNING: [jit] TX completion unconfirmed after %u polls on rf_chain %d (%s, airtime=%u ms)\n",
+                                        _poll_count, i, (exit_sig || quit_sig) ? "shutdown" : "timeout", est_airtime_ms);
                                 }
+                                extra.tx_result = _tx_done ? "sent" : "tx_unconfirmed";
                                 pthread_mutex_lock(&mx_concent);
                                 sx1261_set_tx_inhibit_rx(false);
                                 sx1261_lora_rx_restart_light();
@@ -4608,16 +4819,35 @@ void thread_jit(void) {
                                 MSG("INFO: [jit] SX1261 LoRa RX restarted (TX_DONE polled, rf_chain %d, %u polls, airtime_est=%u ms)\n",
                                     i, _poll_count, est_airtime_ms);
                             }
+                            /* Report completion only after TX_DONE polling and
+                               RX restoration, as in the immediate path. */
+                            if (have_tx_ack) {
+                                send_tx_ack(ack_token_h, ack_token_l, JIT_ERROR_OK, 0, &extra);
+                            }
+                            pthread_mutex_lock(&mx_meas_dw);
+                            if (strcmp(extra.tx_result, "sent") == 0) {
+                                meas_nb_tx_ok += 1;
+                                if (pkt_type == JIT_PKT_TYPE_BEACON) meas_nb_beacon_sent += 1;
+                            } else {
+                                meas_nb_tx_fail += 1;
+                            }
+                            pthread_mutex_unlock(&mx_meas_dw);
                         }
                     } else {
+                        pthread_mutex_unlock(&mx_jit_access);
                         MSG("ERROR: jit_dequeue failed on rf_chain %d with %d\n", i, jit_result);
                     }
+                } else {
+                    pthread_mutex_unlock(&mx_jit_access);
                 }
             } else if (jit_result == JIT_ERROR_EMPTY) {
+                pthread_mutex_unlock(&mx_jit_access);
                 /* Do nothing, it can happen */
             } else {
+                pthread_mutex_unlock(&mx_jit_access);
                 MSG("ERROR: jit_peek failed on rf_chain %d with %d\n", i, jit_result);
             }
+            pthread_mutex_unlock(&mx_tx);
         }
     }
 
@@ -5293,24 +5523,30 @@ void thread_spectral_scan(void) {
                     }
 
                     fprintf(fp, "\n}\n");
-                    fclose(fp);
-                    /* Atomic rename to avoid partial reads */
-                    rename("/tmp/openhop_spectral_results.json.tmp",
-                           "/tmp/openhop_spectral_results.json");
-                    printf("INFO: spectral sweep complete (%d channels%s), results written\n",
-                           written,
-                           cad_config.enable ? " + CAD" : "");
-                    /* Restore SX1261 LoRa RX after spectral scan sweep */
-                    pthread_mutex_lock(&mx_concent);
-                    if (sx1261_lora_rx_active() == false) {
-                        sx1261_lora_rx_restart_light();
-                        printf("INFO: SX1261 LoRa RX restarted after spectral scan sweep\n");
-                        fflush(stdout);
+                    bool write_ok = (ferror(fp) == 0);
+                    if (fflush(fp) != 0) write_ok = false;
+                    if (fclose(fp) != 0) write_ok = false;
+                    /* Publish only a complete file; retain the last good sweep on failure. */
+                    if (write_ok && rename("/tmp/openhop_spectral_results.json.tmp",
+                                           "/tmp/openhop_spectral_results.json") == 0) {
+                        printf("INFO: spectral sweep complete (%d channels%s), results written\n",
+                               written,
+                               cad_config.enable ? " + CAD" : "");
+                    } else {
+                        unlink("/tmp/openhop_spectral_results.json.tmp");
+                        printf("ERROR: could not publish spectral scan results\n");
                     }
-                    pthread_mutex_unlock(&mx_concent);
                 } else {
                     printf("ERROR: could not open /tmp/openhop_spectral_results.json.tmp for writing\n");
                 }
+                /* File I/O must not prevent restoring SX1261 LoRa RX. */
+                pthread_mutex_lock(&mx_concent);
+                if (sx1261_lora_rx_active() == false) {
+                    sx1261_lora_rx_restart_light();
+                    printf("INFO: SX1261 LoRa RX restarted after spectral scan sweep\n");
+                    fflush(stdout);
+                }
+                pthread_mutex_unlock(&mx_concent);
 
                 /* Reset sweep accumulator */
                 freq_hz = spectral_scan_params.freq_hz_start;

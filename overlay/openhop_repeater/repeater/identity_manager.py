@@ -11,10 +11,10 @@ def _namespace_for(identity_type: str) -> str:
     """Routing/persistence namespace a local identity occupies.
 
     A one-byte dest-hash collision is only unrepresentable when both
-    identities share a namespace.  Companions key their runtime bridge
-    (``daemon.companion_bridges[hash]``) and their SQLite state
-    (``companion_prefs`` PRIMARY KEY, plus the contacts/channels/messages
-    tables) by the hash byte.  The repeater and every room server instead
+    identities share a namespace. Companions key their runtime bridge
+    (``daemon.companion_bridges[hash]``) by the hash byte; their SQLite state
+    uses the full public key to preserve ownership across identity changes.
+    The repeater and every room server instead
     share the login/text/protocol helper ``handlers[hash]`` slot and the
     ``room_*`` tables, so they form one "server" namespace.  A companion and
     a server-side identity live in physically separate stores, and the packet
@@ -58,8 +58,8 @@ class IdentityManager:
     ) -> Optional[str]:
         """Return a reason this identity cannot be registered, or ``None``.
 
-        Local protocol routing and per-identity persistence are keyed by the
-        first public-key byte *within a namespace* (see :func:`_namespace_for`).
+        Local protocol routing is keyed by the first public-key byte *within
+        a namespace* (see :func:`_namespace_for`).
         Two identities that share both the hash byte and the namespace cannot
         be represented safely even though their full keys differ; a companion
         and a server-side identity may share a prefix because they live in

@@ -1,5 +1,96 @@
 # Software checks and MeshCore compatibility
 
+## Maintenance validation (2026-10-27)
+
+The review covered forwarding/deduplication, TX/RX lifecycle, protocol and room
+handling, companion transport, storage, authentication and API input handling,
+installers/upgrades, native HAL, monitoring, both dashboards, and site/build/CI.
+A second pass checked interactions and reviewed the accumulated changes for
+unnecessary complexity. Fixes retain existing queue, persistence and overlay
+patterns; no dependency pins or service configuration were changed.
+
+### Regression coverage
+
+| Area | Behaviors checked without physical hardware |
+| --- | --- |
+| Forwarding and deduplication | Short valid frames; validation before duplicate tracking; clock-independent expiry; bounded duplicate children and hash indexes; consistent analytics ranges and fallback formats |
+| Queues and lifecycle | ACK priority across retries; FIFO order and bounded admission; cancellation/deadlines; eligible traffic during duty holds; stop/restart serialization; queue-drain accounting; long-TX caller waits |
+| TX results and timing | Binary ACK headers, malformed results and token wrap; wide airtime calculations; confirmed versus unconfirmed completion; conservative airtime/guard accounting without false echo or retry |
+| Native JIT/HAL | Actual C parser bounds and sanitizers; power selection; exact/fallback LBT; counter-read failures and unsigned wrap; JIT expiration/collision horizons; packet/ACK ownership; serialized TX with RX mutex availability; bounded beacon refill |
+| Shared state | Airtime recording/statistics races; transport-cache invalidation during RX; region/default-scope refresh ordering; companion registration during live refresh |
+| Upgrade recovery | Nested ownership; rollback after copy failures; malformed/symlinked inventories; atomic inventory publication and flush failures; retained checksums, URL fragments, subdirectories and pinned VCS commits |
+| HTTP and diagnostics | Malformed JSON/UTF-8 and query values; authorization; no mutation after rejection; live SQLite region edits; trace snapshot/filter semantics; bounded history; redaction and generic error responses |
+| Browser | Desktop/mobile Console; retained drafts after failed saves; packet scopes; spectrum controls; six history intervals; literal trace names including Object property names; distinct accessible names for all twelve A–D controls |
+
+Native regressions compile actual source functions or blocks with simulated
+hardware interfaces. They check error paths and arithmetic rather than RF
+measurements. The real HTTP, TCP and daemon scenarios use the exact pinned,
+overlaid packages and disposable state.
+
+### Verified results
+
+- The latest completed pinned-package checkpoint passes **409 local tests with
+  no skips**, **13 companion TCP scenarios**, **7 HTTP scenarios**, and
+  **1 simulated-daemon scenario**. All **24 unchanged upstream region-wiring
+  tests** also pass.
+- A final scheduler shutdown regression reproduces swallowed caller cancellation.
+  The fix passes **28 scheduler, deadline and router tests on Python 3.11**
+  and is included in the full checkpoint above.
+- The complete overlaid HAL builds with one make worker. Current native source
+  matches that build; all native regressions are included in the local suite.
+  Seven combined counter/timestamp/TX/beacon/JIT tests also pass on Python 3.11.
+- Current Node.js 22/Chromium checks pass for the browser workflows above.
+  Current offline pip recovery checks pass both unchanged and replaced archive
+  contents, including modern, legacy and uppercase digest metadata. They use
+  `--dry-run --no-index --no-deps` and install nothing.
+- Earlier broader compatibility checks passed **1,823 upstream core tests**
+  with the four established contact-store exclusions documented below, and
+  **69 repeater contracts**. Subsequent frame-server, lifecycle/cap and
+  duplicate-cache/flood-loop checks also passed. One copied dedup fixture uses
+  monotonic time for an expired entry; upstream source tests were not changed.
+- Python correctness lint, shell syntax and whitespace checks pass after the
+  final shutdown change.
+
+The entire upstream router suite is **not** a passing compatibility check for
+this overlay: mock policy services and several optional API expectations differ.
+The unchanged HEAD router fails the same 61 distinct methods (78 reported
+failures including subtests). Relevant lifecycle/cap contracts and real local
+routing workflows are checked separately. This baseline comparison does not
+resolve those upstream compatibility differences.
+
+### Running the checks
+
+After installing `requirements-test.txt` in a local virtual environment:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Native fixtures require GCC; shell fixtures require `jq` and `rsync`. A
+provisioned environment containing pip can also run the offline recovery check:
+
+```bash
+python tests/package_recovery_scenario.py -q
+```
+
+The real-package integration runner, optional complete HAL build, and browser
+commands are documented below. Use disposable state; these checks do not require
+starting an installed repeater service.
+
+### Checks requiring hardware
+
+Verify all six RX/TX paths and over-the-air short frames; measure E/F modulation
+and exact/fallback LBT behavior; test long-TX completion, abort/reset and actual
+SX1261 RX recovery; exercise watchdog/SPI/GPIO recovery on the target Pi; and
+measure GPS synchronization and beacon timing. A disposable-device install or
+upgrade must check systemd behavior, service-account ownership and committed
+SQLite WAL preservation.
+
+Software fixtures do not prove RF behavior, regulatory compliance or power-loss
+safety. Migration rollback handles catchable copy failures; an uncatchable
+interruption may require the retained originals described in the
+[installation guide](installation.md#migration-from-pymc-installation-paths).
+
 ## OpenHop path migration (2026-10-12)
 
 The latest published core 1.1.3 and repeater 1.1.4 releases still match the
@@ -111,6 +202,8 @@ Run it with Node.js 22, Chromium, and an upstream Console HTML directory:
 
 ```bash
 npm ci --ignore-scripts
+# Chromium is found on PATH, or select its executable explicitly:
+export CHROMIUM_PATH=/path/to/chromium
 node tests/dashboard_browser_scenario.cjs /path/to/repeater/web/html
 ```
 

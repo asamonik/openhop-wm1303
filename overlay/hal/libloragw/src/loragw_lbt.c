@@ -116,12 +116,21 @@ static int is_lbt_channel(const struct lgw_conf_lbt_s * lbt_context, uint32_t fr
 
     for (i = 0; i <  lbt_context->nb_channel; i++) {
         if ((is_equal_freq(freq_hz, lbt_context->channels[i].freq_hz) == true) && (is_matching_bw(bandwidth, lbt_context->channels[i].bandwidth) == true)) {
-            DEBUG_PRINTF("LBT: select channel %d (freq:%u Hz, bw:0x%02X, tx_bw:0x%02X)\n", i, lbt_context->channels[i].freq_hz, lbt_context->channels[i].bandwidth, bandwidth);
-            lbt_channel_match = i;
-            break;
+            if (bandwidth == lbt_context->channels[i].bandwidth) {
+                lbt_channel_match = i;
+                break;
+            }
+            /* Keep the first wide-scan fallback only if no exact bandwidth
+               exists. Its enable/threshold may differ from the exact entry. */
+            if (lbt_channel_match == -1) {
+                lbt_channel_match = i;
+            }
         }
     }
 
+    if (lbt_channel_match >= 0) {
+        DEBUG_PRINTF("LBT: select channel %d (freq:%u Hz, bw:0x%02X, tx_bw:0x%02X)\n", lbt_channel_match, lbt_context->channels[lbt_channel_match].freq_hz, lbt_context->channels[lbt_channel_match].bandwidth, bandwidth);
+    }
     /* Return the index of the LBT channel which matched */
     return lbt_channel_match;
 }
