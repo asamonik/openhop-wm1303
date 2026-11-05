@@ -30,6 +30,12 @@ const packet = {id: 1, timestamp: now, type: 15, route: 0, length: 10, rssi: -80
 const config = {radio_type: 'wm1303', node_name: 'Hill', repeater: {mode: 'forward', node_name: 'Hill', latitude: 48.2, longitude: 16.3}, radio: {frequency: 869618000, bandwidth: 125000, spreading_factor: 8, coding_rate: 5, tx_power: 22}, duty_cycle: {enforcement_enabled: true, max_airtime_percent: 6.062}, mesh: {}, web: {auth: {enabled: true}}};
 const stats = {version: 'fixture', core_version: 'fixture', uptime_seconds: 660, rx_count: 1234567, forwarded_count: 43210, current_airtime_ms: 1818.6, utilization_percent: 50, tx_duty_pct: 3.031, rx_duty_pct: 1.234, rx_availability_pct: 96.969, config};
 const success = data => ({success: true, data});
+const radioSaves = new Map();
+const auxChannels = {
+  channel_e: {...channel, name: 'Channel E', frequency: 869618125, enabled: false},
+  channel_f: {...channel, name: 'Channel F', frequency: 869525500, enabled: false},
+};
+const customRegion = {code: 'CUSTOM', tx_freq_min: 868000125, tx_freq_max: 870000875};
 
 function response(url, body) {
   requests.push(url.pathname + url.search);
@@ -66,7 +72,15 @@ function response(url, body) {
     steps: [{name: 'received', elapsed_ms: 0, status: 'ok', detail: 'Received fixture'},
       {name: 'tx_send', elapsed_ms: 4, status: 'ok', detail: 'TX on channel_a (rule: fixture)'}],
   }]};
-  if (/\/channel_[ef]$/.test(url.pathname)) return {enabled: false};
+  if (/\/channel_[ef]$/.test(url.pathname)) {
+    if (body) {radioSaves.set(url.pathname, body); return {status: 'ok'};}
+    return auxChannels[url.pathname.split('/').at(-1)];
+  }
+  if (url.pathname === '/api/wm1303/regions') return {regions: [customRegion]};
+  if (url.pathname === '/api/wm1303/region') {
+    if (body) {radioSaves.set(url.pathname, body); return {status: 'ok'};}
+    return customRegion;
+  }
   if (url.pathname === '/api/wm1303/duty_cycle_history') {
     const hours = Number(url.searchParams.get('hours'));
     const data = [{t: now - 600, bucket_seconds: 60, tx_duty_pct: 3.031, tx_airtime_ms: 1818.6}, {t: now - 540, bucket_seconds: 60, tx_duty_pct: 2, tx_airtime_ms: 1200}];
@@ -181,6 +195,14 @@ const server = http.createServer(async (req, res) => {
     for (const url of ['https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js', 'https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js']) cdn.set(url, execFileSync('curl', ['-fsSL', url]));
     await page.goto(origin + '/wm1303.html', {waitUntil: 'networkidle0'});
     await page.waitForFunction(() => document.getElementById('st-rx-duty').textContent === '1.234%');
+    // An unrelated edit must not round a saved radio frequency or custom bound.
+    await page.evaluate(async () => {
+      await loadChE(); await loadChF(); await loadRegions();
+      await saveChE(false); await saveChF(false); await saveRegion(false);
+    });
+    assert.equal(radioSaves.get('/api/wm1303/channel_e')?.frequency, auxChannels.channel_e.frequency);
+    assert.equal(radioSaves.get('/api/wm1303/channel_f')?.frequency, auxChannels.channel_f.frequency);
+    assert.deepEqual(radioSaves.get('/api/wm1303/region'), customRegion);
     await page.evaluate(() => showTab('spectrum'));
     await page.waitForFunction(() => document.getElementById('specEnableLabel').textContent === 'Disabled');
     assert.ok((await page.$eval('#specScanHelp', e => e.textContent)).includes('disabled by default'));

@@ -9,8 +9,8 @@ import threading
 
 import yaml
 
-from .policy_engine import PolicyEngine, SUPPORTED_ACTIONS, default_policy_engine_config
 from .atomic_file import atomic_write_text
+from .policy_engine import PolicyEngine, SUPPORTED_ACTIONS, default_policy_engine_config
 
 
 logger = logging.getLogger("PolicyService")

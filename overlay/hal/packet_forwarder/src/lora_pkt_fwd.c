@@ -4178,6 +4178,7 @@ void thread_down(void) {
                        CAD is MANDATORY for every TX.  LBT only when enabled
                        for the target channel in the per-channel config. */
                     tx_ack_extra_t imme_extra = {0};
+                    imme_extra.tx_noisefloor = -128; /* unknown until measured */
                     imme_extra.cad_reason = "not_run";
                     imme_extra.tx_result  = "unknown";
                     bool imme_blocked = false;
@@ -4553,6 +4554,7 @@ void thread_jit(void) {
                         }
 
                         tx_ack_extra_t extra = {0};
+                        extra.tx_noisefloor = -128; /* unknown until measured */
                         extra.cad_reason = "not_run";
                         extra.tx_result = "unknown";
 

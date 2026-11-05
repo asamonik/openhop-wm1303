@@ -127,6 +127,54 @@ class ConfigManagerTests(unittest.TestCase):
         self.assertEqual(self.config, original)
         live_update.assert_not_called()
 
+    def test_http_binding_edits_remain_pending_without_relabelling_the_listener(self):
+        for edit in ({"port": 8123}, {"host": "127.0.0.2"}):
+            with self.subTest(edit=edit):
+                self.config["http"] = {"host": "127.0.0.1", "port": 8000}
+                self.assertTrue(self.manager.save_to_file())
+                server = SimpleNamespace(host="127.0.0.1", port=8000,
+                                         start=Mock(), stop=Mock())
+                self.manager.daemon = SimpleNamespace(config=self.config, http_server=server)
+                with patch("repeater.service_utils._is_cherrypy_engine_running", return_value=True):
+                    result = self.manager.update_and_save({"http": edit})
+                self.assertTrue(result["success"] and result["saved"])
+                self.assertFalse(result["live_updated"])
+                self.assertEqual((server.host, server.port), ("127.0.0.1", 8000))
+                saved = yaml.safe_load(self.filename.read_text())["http"]
+                for key, value in edit.items():
+                    self.assertEqual(saved[key], value)
+                server.start.assert_not_called()
+                server.stop.assert_not_called()
+
+    def test_web_binding_fallback_requires_restart_but_dedicated_http_takes_precedence(self):
+        for dedicated_http in (False, True):
+            with self.subTest(dedicated_http=dedicated_http):
+                self.config["web"] = {"host": "127.0.0.1", "port": 8000}
+                if dedicated_http:
+                    self.config["http"] = {"host": "127.0.0.1", "port": 8000}
+                else:
+                    self.config.pop("http", None)
+                self.assertTrue(self.manager.save_to_file())
+                app = SimpleNamespace(apply_web_config=Mock())
+                server = SimpleNamespace(host="127.0.0.1", port=8000, app=app)
+                self.manager.daemon = SimpleNamespace(config=self.config, http_server=server)
+                result = self.manager.update_and_save({"web": {"port": 8123}})
+                self.assertTrue(result["success"] and result["saved"])
+                self.assertEqual(result["live_updated"], dedicated_http)
+                self.assertEqual((server.host, server.port), ("127.0.0.1", 8000))
+                app.apply_web_config.assert_called_once()
+
+    def test_unchanged_http_binding_can_still_report_live_success(self):
+        self.config["http"] = {"host": "127.0.0.1", "port": 8000}
+        server = SimpleNamespace(host="127.0.0.1", port=8000, start=Mock(), stop=Mock())
+        self.manager.daemon = SimpleNamespace(config=self.config, http_server=server)
+        with patch("repeater.service_utils._is_cherrypy_engine_running", return_value=True):
+            result = self.manager.update_and_save({"http": {"port": "8000"}})
+        self.assertTrue(result["success"] and result["saved"] and result["live_updated"])
+        self.assertEqual((server.host, server.port), ("127.0.0.1", 8000))
+        server.start.assert_not_called()
+        server.stop.assert_not_called()
+
     def test_mesh_cli_uses_transactional_runtime_keys_and_rejects_ambiguous_radio(self):
         acl = SimpleNamespace(refresh_repeater_security=Mock())
         handler = SimpleNamespace(reload_runtime_config=Mock())
@@ -186,6 +234,25 @@ class ConfigManagerTests(unittest.TestCase):
         self.assertTrue(self.manager.live_update_daemon(["repeater"]))
         self.config["repeater"]["security"]["max_clients"] = 99
         self.assertEqual(self.manager.daemon.config["repeater"]["security"]["max_clients"], 1)
+
+    def test_replacing_repeater_settings_refreshes_cached_gps_fallback(self):
+        gps = SimpleNamespace(repeater_config=self.config['repeater'])
+        self.manager.daemon = SimpleNamespace(config=self.config, gps_service=gps)
+        result = self.manager.update_and_save(
+            {'repeater': {'node_name': 'Fixture', 'latitude': 48.2,
+                          'longitude': 16.3}}, replace_sections=True)
+        self.assertTrue(result['live_updated'])
+        self.assertIs(gps.repeater_config, self.config['repeater'])
+        self.assertEqual(gps.repeater_config['latitude'], 48.2)
+
+    def test_gps_changes_are_saved_but_require_restart_of_cached_receiver(self):
+        gps = SimpleNamespace(enabled=False)
+        self.manager.daemon = SimpleNamespace(config=self.config, gps_service=gps)
+        result = self.manager.update_and_save({'gps': {'enabled': True}})
+        self.assertTrue(result['saved'])
+        self.assertFalse(result['live_updated'])
+        self.assertFalse(gps.enabled)
+        self.assertTrue(yaml.safe_load(self.filename.read_text())['gps']['enabled'])
 
     def test_live_radio_snapshot_accepts_zero_dbm(self):
         handler = SimpleNamespace(radio_config={"tx_power": 14})

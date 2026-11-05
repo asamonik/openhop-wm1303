@@ -133,8 +133,8 @@ class RoomLifecycleMixin:
             room_hash = identity.get_public_key()[0]
             maps = self._room_handler_maps()
             manager = self.identity_manager
-            if (name in manager.named_identities or manager.has_identity(room_hash)
-                    or room_hash == self.local_hash or room_hash in self.companion_bridges
+            if (name in manager.named_identities or manager.has_identity(room_hash, "server")
+                    or room_hash == self.local_hash
                     or any(room_hash in mapping for mapping in maps.values())):
                 raise ValueError(f"Room server {name!r} conflicts with an active identity")
             if self.config_manager is None:
@@ -177,7 +177,7 @@ class RoomLifecycleMixin:
                 # same lock prevents a concurrent configuration replacement.
                 with self.config_manager._lock:
                     self._check_saved_room_spec(config)
-                    if (name in manager.named_identities or manager.has_identity(room_hash)
+                    if (name in manager.named_identities or manager.has_identity(room_hash, "server")
                             or any(room_hash in mapping for mapping in maps.values())):
                         raise ValueError(f"Room server {name!r} conflicts with an active identity")
                     for label, entry in entries.items():
@@ -195,10 +195,11 @@ class RoomLifecycleMixin:
                 for label, entry in entries.items():
                     if maps[label].get(room_hash) is entry:
                         maps[label].pop(room_hash)
-                registered = manager.identities.get(room_hash)
+                registration_key = (room_hash, "server")
+                registered = manager.identities.get(registration_key)
                 if registered is not None and registered[0] is identity:
-                    manager.identities.pop(room_hash)
-                    manager.registered_hashes.pop(room_hash, None)
+                    manager.identities.pop(registration_key)
+                    manager.registered_hashes.pop(registration_key, None)
                     named = manager.named_identities.get(name)
                     if named is not None and named[0] is identity:
                         manager.named_identities.pop(name)

@@ -296,6 +296,11 @@ static void send_tx_ack(uint8_t high, uint8_t low, enum jit_error_e error, int32
     if (strcmp(extra->tx_result, "sent") == 0 && radio_emitting) premature_sent_acks++;
     last_result = extra->tx_result;
     last_cad_reason = extra->cad_reason;
+    if (strcmp(extra->cad_reason, "scan_error") == 0 ||
+        strcmp(extra->cad_reason, "not_run") == 0 ||
+        strcmp(extra->cad_reason, "unsupported_bw") == 0) {
+        assert(extra->tx_noisefloor == -128);
+    }
 }
 /* Stop the simulated JIT worker only after the whole transaction. Real mutex
    operations still execute, including every failure/empty-queue exit. */
@@ -380,7 +385,10 @@ int main(int argc, char **argv) {
     } else if (scenario == 0 || scenario == 4 || scenario == 8 || scenario == 9 || scenario == 14) {
         assert(sends == 1 && acknowledgements == 1);
         if (scenario == 8) assert(scans == 16);
-        if (scenario == 9) assert(scans == 1);
+        if (scenario == 9) {
+            assert(scans == 1);
+            assert(strcmp(last_cad_reason, "scan_error") == 0);
+        }
     } else if (scenario == 2 || scenario == 3 || strcmp(argv[1], "jit") == 0) {
         assert(sends == 0);
         if (strcmp(argv[1], "jit") == 0 && scenario != 5 && scenario != 6 && scenario != 23) {

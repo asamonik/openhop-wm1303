@@ -789,7 +789,6 @@ class RepeaterDaemon(RoomLifecycleMixin):
             **bridge_limits,
         )
         bridge.region_map = self._region_map
-        self.dispatcher.add_raw_packet_subscriber(bridge.note_flood_copy)
 
         if sqlite_handler:
             contact_rows = sqlite_handler.companion_load_contacts(storage_key)
@@ -864,6 +863,7 @@ class RepeaterDaemon(RoomLifecycleMixin):
             bridge.region_map = self._region_map
             self.companion_bridges[companion_hash] = bridge
             self.companion_frame_servers.append(frame_server)
+        self.dispatcher.add_raw_packet_subscriber(bridge.note_flood_copy)
 
         logger.info(
             f"Hot-reload: Loaded companion '{name}': hash=0x{companion_hash:02x}, "

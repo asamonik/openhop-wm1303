@@ -177,8 +177,25 @@ def _summary_table_name(base_table: str, suffix: str) -> str:
     return f"{base_table}_{suffix}"
 
 
+def _atomic_rollup(func):
+    """Keep each insert/delete pair atomic even if the caller catches errors."""
+    @functools.wraps(func)
+    def wrapped(conn, *args, **kwargs):
+        conn.execute("SAVEPOINT metrics_rollup")
+        try:
+            result = func(conn, *args, **kwargs)
+        except BaseException:
+            conn.execute("ROLLBACK TO metrics_rollup")
+            conn.execute("RELEASE metrics_rollup")
+            raise
+        conn.execute("RELEASE metrics_rollup")
+        return result
+    return wrapped
+
+
+@_atomic_rollup
 def _create_summary_table(conn: sqlite3.Connection, cfg: Dict, suffix: str):
-    """Create summaries and migrate legacy average denominators.
+    """Create summaries and migrate older schemas without losing their rows.
 
     Old summaries did not retain non-NULL counts. Their only available
     fallback is sample_count for a non-NULL average (necessarily approximate).
@@ -199,11 +216,18 @@ def _create_summary_table(conn: sqlite3.Connection, cfg: Dict, suffix: str):
     sql = f"CREATE TABLE IF NOT EXISTS {table_name} ({col_defs})"
     conn.execute(sql)
     existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table_name})")}
+    # CREATE IF NOT EXISTS does not evolve an installed table. Add every new
+    # metric before referring to it while backfilling average denominators.
+    # Unmeasured historical values remain NULL, never invented zero readings.
+    required = {alias for _, alias in agg_cols}
+    required.update(f"{alias}_count" for expr, alias in agg_cols
+                    if expr.startswith("AVG("))
+    for alias in sorted(required - existing):
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {alias} REAL")
     for expr, alias in agg_cols:
         if expr.startswith("AVG("):
             count_alias = f"{alias}_count"
-            if count_alias not in existing:
-                conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {count_alias} REAL")
+            if count_alias not in existing or alias not in existing:
                 conn.execute(
                     f"UPDATE {table_name} SET {count_alias} = "
                     f"CASE WHEN {alias} IS NULL THEN 0 ELSE sample_count END")
@@ -217,22 +241,6 @@ def _create_summary_table(conn: sqlite3.Connection, cfg: Dict, suffix: str):
         idx_name2 = f"idx_{table_name}_grp_ts"
         grp_idx = ", ".join(group_cols + ["bucket_ts"])
         conn.execute(f"CREATE INDEX IF NOT EXISTS {idx_name2} ON {table_name}({grp_idx})")
-
-
-def _atomic_rollup(func):
-    """Keep each insert/delete pair atomic even if the caller catches errors."""
-    @functools.wraps(func)
-    def wrapped(conn, *args, **kwargs):
-        conn.execute("SAVEPOINT metrics_rollup")
-        try:
-            result = func(conn, *args, **kwargs)
-        except BaseException:
-            conn.execute("ROLLBACK TO metrics_rollup")
-            conn.execute("RELEASE metrics_rollup")
-            raise
-        conn.execute("RELEASE metrics_rollup")
-        return result
-    return wrapped
 
 
 @_atomic_rollup

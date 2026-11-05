@@ -626,6 +626,78 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await caller)['error'], 'queue_stopped')
         self.assertEqual(queue.stats['priority_sent'], 0)
 
+    async def test_cancelled_ack_frees_priority_capacity_without_dropping_live_ack(self):
+        queue = self.queue(queue_size=2)
+        first, abandoned, last = (frame(kind=3, payload=value)
+                                  for value in (b'first', b'abandoned', b'last'))
+        retained = asyncio.create_task(queue.enqueue(first))
+        cancelled = asyncio.create_task(queue.enqueue(abandoned))
+        await asyncio.sleep(0)
+        cancelled.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await cancelled
+        self.assertEqual(queue.stats['pending_priority'], 1)
+        newest = asyncio.create_task(queue.enqueue(last))
+        await asyncio.sleep(0)
+        send = AsyncMock(return_value={'ok': True})
+        scheduler = tx.GlobalTXScheduler(send, {queue.channel_id: queue})
+        await scheduler.start()
+        try:
+            results = await asyncio.wait_for(asyncio.gather(retained, newest), 1)
+            self.assertTrue(all(result['ok'] for result in results))
+            self.assertEqual([base64.b64decode(call.args[0]['data'])
+                              for call in send.call_args_list], [first, last])
+            self.assertEqual(queue.stats['dropped_priority_overflow'], 0)
+            self.assertEqual(queue.stats['priority_sent'], 2)
+        finally:
+            await scheduler.stop()
+
+    async def test_ack_retry_keeps_priority_when_bulk_queue_is_full(self):
+        queue = self.queue(queue_size=1)
+        entered, release = asyncio.Event(), asyncio.Event()
+        ack, bulk = frame(kind=3, payload=b'ack'), frame(payload=b'bulk')
+        sent = []
+
+        async def send(txpk, *args, **kwargs):
+            sent.append(base64.b64decode(txpk['data']))
+            if len(sent) == 1:
+                entered.set()
+                await release.wait()
+                return {'ok': False, 'tx_result': 'dropped'}
+            return {'ok': True}
+
+        scheduler = tx.GlobalTXScheduler(send, {queue.channel_id: queue})
+        await scheduler.start()
+        try:
+            priority = asyncio.create_task(queue.enqueue(ack))
+            await asyncio.wait_for(entered.wait(), 1)
+            ordinary = asyncio.create_task(queue.enqueue(bulk))
+            await asyncio.sleep(0)
+            release.set()
+            results = await asyncio.wait_for(asyncio.gather(priority, ordinary), 1)
+            self.assertTrue(all(result['ok'] for result in results))
+            self.assertEqual(sent, [ack, ack, bulk])
+            self.assertEqual(queue.stats['priority_sent'], 1)
+            self.assertEqual(queue.stats['total_sent'], 2)
+        finally:
+            await scheduler.stop()
+
+    async def test_stopped_or_failed_acks_are_not_counted_as_sent(self):
+        queue = self.queue()
+        pending = asyncio.create_task(queue.enqueue(frame(kind=3)))
+        await asyncio.sleep(0)
+        queue.stop()
+        self.assertEqual((await pending)['error'], 'queue_stopped')
+        self.assertEqual(queue.stats['priority_sent'], 0)
+        send = AsyncMock(return_value={'ok': False, 'tx_result': 'blocked'})
+        scheduler = tx.GlobalTXScheduler(send, {queue.channel_id: queue})
+        await scheduler.start()
+        try:
+            self.assertFalse((await asyncio.wait_for(queue.enqueue(frame(kind=3)), 1))['ok'])
+            self.assertEqual(queue.stats['priority_sent'], 0)
+        finally:
+            await scheduler.stop()
+
     async def test_bad_backend_result_does_not_kill_scheduler(self):
         queue = self.queue()
         send_times = []

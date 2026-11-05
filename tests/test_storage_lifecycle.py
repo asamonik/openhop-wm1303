@@ -39,6 +39,32 @@ def storage_module():
 
 
 class StorageLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_mqtt_initialization_honors_canonical_config_and_disabled_legacy_defaults(self):
+        cases = (
+            ({'mqtt_brokers': {'brokers': [], 'owner': ''},
+              'letsmesh': {'enabled': False}}, False),
+            ({'mqtt_brokers': {'brokers': []}, 'letsmesh': {'enabled': True}}, False),
+            ({'letsmesh': {'enabled': False}, 'mqtt': {'enabled': False}}, False),
+            ({'letsmesh': {'enabled': True}}, True),
+            ({'mqtt': {'enabled': True}}, True),
+            ({'mqtt_brokers': {'brokers': [{'preset': 'letsmesh'}]}}, True),
+        )
+        for module, collaborators in storage_module():
+            for config, expected in cases:
+                with self.subTest(config=config), tempfile.TemporaryDirectory() as directory, \
+                        patch.dict(sys.modules, collaborators):
+                    factory = collaborators['repeater.data_acquisition.mqtt_handler'].MeshCoreToMqttPusher
+                    factory.reset_mock()
+                    collector = module.StorageCollector(
+                        {**config, 'storage': {'storage_dir': directory},
+                         'metrics': {'rrd_enabled': False}},
+                        local_identity=SimpleNamespace(get_public_key=lambda: b'\x01' * 32))
+                    try:
+                        self.assertEqual(factory.called, expected)
+                        self.assertEqual(collector.mqtt_handler is not None, expected)
+                    finally:
+                        await asyncio.to_thread(collector.close)
+
     async def test_rrd_rate_totals_cache_and_counter_restart(self):
         spec = importlib.util.spec_from_file_location(
             "_wm_rrd_test", ROOT / "overlay/openhop_repeater/repeater/data_acquisition/rrdtool_handler.py"

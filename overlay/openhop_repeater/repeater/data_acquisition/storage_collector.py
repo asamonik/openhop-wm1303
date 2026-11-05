@@ -82,11 +82,14 @@ class StorageCollector:
             mqtt_brokers_config = config.get("mqtt_brokers", {}) or {}
             letsmesh_config = config.get("letsmesh", {}) or {}
             mqtt_config = config.get("mqtt", {}) or {}
-            has_brokers_configured = (
-                bool(mqtt_brokers_config.get("brokers"))
-                or bool(letsmesh_config)
-                or bool(mqtt_config)
-            )
+            if mqtt_brokers_config:
+                # Match the publisher's precedence: an explicit canonical
+                # configuration replaces both legacy blocks, even if empty.
+                has_brokers_configured = bool(mqtt_brokers_config.get("brokers"))
+            else:
+                has_brokers_configured = bool(
+                    letsmesh_config.get("enabled") or mqtt_config.get("enabled")
+                )
             if has_brokers_configured and local_identity:
                 try:
                     # Pass local_identity directly (supports both standard and firmware keys)

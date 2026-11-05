@@ -3,7 +3,9 @@
 import ast
 import hashlib
 import importlib.util
+import os
 from pathlib import Path
+import stat
 import sys
 import tempfile
 from types import ModuleType, SimpleNamespace
@@ -142,6 +144,26 @@ class PacketPolicyTests(unittest.TestCase):
         self.assertIs(self.service.engine, runtime)
         self.assertEqual(yaml.safe_dump(self.config), saved_config)
         self.assertEqual(list(self.path.parent.iterdir()), [self.path])
+
+    def test_policy_save_flushes_directory_and_keeps_runtime_consistent_after_commit(self):
+        original_fsync = os.fsync
+        for fail_directory in (False, True):
+            with self.subTest(fail_directory=fail_directory):
+                flushed = []
+
+                def fsync(descriptor):
+                    directory = stat.S_ISDIR(os.fstat(descriptor).st_mode)
+                    flushed.append("directory" if directory else "file")
+                    if directory and fail_directory:
+                        raise OSError("directory flush failed")
+                    return original_fsync(descriptor)
+
+                with patch.object(os, "fsync", side_effect=fsync):
+                    self.service.update(document(default_action="drop" if fail_directory else "allow"))
+                self.assertEqual(flushed, ["file", "directory"])
+                saved = yaml.safe_load(self.path.read_text())
+                expected_action = saved["policy_engine"]["default_action"]
+                self.assertEqual(self.service.evaluate(self.packet, {}).action, expected_action)
 
     def test_existing_malformed_file_blocks_load_and_cannot_be_overwritten(self):
         self.path.parent.mkdir()

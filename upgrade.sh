@@ -382,13 +382,13 @@ step "Recording current version info"
     echo "Upgrade timestamp: ${TIMESTAMP}"
     echo ""
     if [ -d "${HAL_DIR}/.git" ]; then
-        echo "sx1302_hal: $(cd "${HAL_DIR}" && git rev-parse HEAD) ($(cd "${HAL_DIR}" && git branch --show-current))"
+        echo "sx1302_hal: $(git -c "safe.directory=${HAL_DIR}" -C "${HAL_DIR}" rev-parse HEAD) ($(git -c "safe.directory=${HAL_DIR}" -C "${HAL_DIR}" branch --show-current))"
     fi
     if [ -d "${REPO_DIR}/openhop_core/.git" ]; then
-        echo "openhop_core:  $(cd "${REPO_DIR}/openhop_core" && git rev-parse HEAD) ($(cd "${REPO_DIR}/openhop_core" && git branch --show-current))"
+        echo "openhop_core:  $(git -c "safe.directory=${REPO_DIR}/openhop_core" -C "${REPO_DIR}/openhop_core" rev-parse HEAD) ($(git -c "safe.directory=${REPO_DIR}/openhop_core" -C "${REPO_DIR}/openhop_core" branch --show-current))"
     fi
     if [ -d "${REPO_DIR}/openhop_repeater/.git" ]; then
-        echo "openhop_repeater: $(cd "${REPO_DIR}/openhop_repeater" && git rev-parse HEAD) ($(cd "${REPO_DIR}/openhop_repeater" && git branch --show-current))"
+        echo "openhop_repeater: $(git -c "safe.directory=${REPO_DIR}/openhop_repeater" -C "${REPO_DIR}/openhop_repeater" rev-parse HEAD) ($(git -c "safe.directory=${REPO_DIR}/openhop_repeater" -C "${REPO_DIR}/openhop_repeater" branch --show-current))"
     fi
 } > "${UPGRADE_BACKUP}/version_info.txt"
 ok "Version info saved"

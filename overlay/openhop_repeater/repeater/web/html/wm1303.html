@@ -1846,7 +1846,7 @@ function renderCh(){
   l.innerHTML=chData.map((ch,i)=>`<div class="crow${ch.active?' con':''}" style="grid-template-columns:140px 1fr 108px 82px 52px 58px 72px 68px 44px 68px 52px 44px 32px">
     <select aria-label="Channel ${'ABCD'[i]} channel assignment" class="ci" style="font-weight:500" onchange="chData[${i}].friendly_name=this.value;renderCh()">${buildChDropdown(i,ch)}</select>
     <input aria-label="Channel ${'ABCD'[i]} name" class="ci" value="${esc(ch.name||'')}" onchange="chData[${i}].name=this.value" placeholder="Name (required)" required>
-    <input aria-label="Channel ${'ABCD'[i]} frequency (MHz)" class="ci" lang="en" type="text" pattern="[0-9]*[.]?[0-9]*" value="${(ch.frequency/1e6).toFixed(3)}" inputmode="decimal" oninput="this.value=this.value.replace(/,/g,'.')" onchange="chData[${i}].frequency=Math.round(parseFloat(this.value.replace(/,/g,'.'))*1e6)">
+    <input aria-label="Channel ${'ABCD'[i]} frequency (MHz)" class="ci" lang="en" type="text" pattern="[0-9]*[.]?[0-9]*" value="${(ch.frequency/1e6).toFixed(6)}" inputmode="decimal" oninput="this.value=this.value.replace(/,/g,'.')" onchange="chData[${i}].frequency=Math.round(parseFloat(this.value.replace(/,/g,'.'))*1e6)">
     <input aria-label="Channel ${'ABCD'[i]} bandwidth (kHz)" class="ci" type="text" value="125" readonly title="Channels A-D = chan_multiSF_0-3 (hardware constraint: BW125 only)" style="background:var(--bgr);cursor:not-allowed;text-align:center">
     <select aria-label="Channel ${'ABCD'[i]} spreading factor" class="ci" onchange="chData[${i}].spreading_factor=parseInt(this.value)">${mkSel(SF,ch.spreading_factor)}</select>
     <select aria-label="Channel ${'ABCD'[i]} coding rate" class="ci" onchange="chData[${i}].coding_rate=this.value">${mkSel(CR,ch.coding_rate)}</select>
@@ -1872,7 +1872,7 @@ async function loadChE(){
     cheData=d;
     G('che-enable').checked=!!(d.enabled??d.enable);
     G('che-name').value=d.name||d.friendly_name||'Channel E';
-    G('che-frequency').value=(d.frequency/1e6).toFixed(3);
+    G('che-frequency').value=(d.frequency/1e6).toFixed(6);
     G('che-bandwidth').value=String(d.bandwidth||62500);
     G('che-sf').value=String(d.spreading_factor||8);
     G('che-cr').value=d.coding_rate||'4/5';
@@ -1942,8 +1942,8 @@ async function loadRegion(){
     var st=G('region-status');if(st)st.textContent=(r.code||'EU868').toUpperCase();
     var mn=r.resolved_tx_freq_min!=null?r.resolved_tx_freq_min:(r.tx_freq_min!=null?r.tx_freq_min:null);
     var mx=r.resolved_tx_freq_max!=null?r.resolved_tx_freq_max:(r.tx_freq_max!=null?r.tx_freq_max:null);
-    G('region-tx-min').value=(mn!=null)?(mn/1e6).toFixed(3):'';
-    G('region-tx-max').value=(mx!=null)?(mx/1e6).toFixed(3):'';
+    G('region-tx-min').value=(mn!=null)?(mn/1e6).toFixed(6):'';
+    G('region-tx-max').value=(mx!=null)?(mx/1e6).toFixed(6):'';
     applyRegionEditableState();
     renderRegionInfo();
     // Snapshot the saved region and hide the change-warning banner. Any
@@ -1959,8 +1959,8 @@ function onRegionChange(){
   var entry=regionList.find(function(rg){return rg.code===code;});
   if(entry){
     var mn=entry.tx_freq_min;var mx=entry.tx_freq_max;
-    G('region-tx-min').value=(mn!=null)?(mn/1e6).toFixed(3):'';
-    G('region-tx-max').value=(mx!=null)?(mx/1e6).toFixed(3):'';
+    G('region-tx-min').value=(mn!=null)?(mn/1e6).toFixed(6):'';
+    G('region-tx-max').value=(mx!=null)?(mx/1e6).toFixed(6):'';
   }
   applyRegionEditableState();
   renderRegionInfo();
@@ -2031,7 +2031,7 @@ async function loadChF(){
     chfData=d;
     G('chf-enable').checked=!!(d.enabled??d.enable);
     G('chf-name').value=d.name||d.friendly_name||'Channel F';
-    G('chf-frequency').value=((d.frequency||869525000)/1e6).toFixed(3);
+    G('chf-frequency').value=((d.frequency||869525000)/1e6).toFixed(6);
     G('chf-bandwidth').value=String(d.bandwidth||250000);
     G('chf-sf').value=String(d.spreading_factor||9);
     G('chf-cr').value=d.coding_rate||'4/5';

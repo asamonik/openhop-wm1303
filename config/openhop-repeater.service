@@ -32,6 +32,11 @@ WatchdogSec=60
 # Allow slow concentrator/HAL startup before READY=1 (no false-positive restart)
 TimeoutStartSec=120
 
+# Let the daemon stop its owned radio processes and finish GPIO cleanup before
+# systemd kills any leftovers. Group-wide TERM interrupts the reset script when
+# the backend sends its own TERM to the packet-forwarder group during shutdown.
+KillMode=mixed
+
 # Restart on failure AND on watchdog timeout
 Restart=always
 RestartSec=5

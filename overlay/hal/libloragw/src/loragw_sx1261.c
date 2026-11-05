@@ -94,10 +94,7 @@ License: Revised BSD License, see LICENSE.TXT file include in the project
 /* SX126x workaround registers */
 #define SX1261_REG_BW500_WORKAROUND     0x0889  /* BW < 500 kHz optimization (datasheet 15.1) */
 #define SX1261_REG_IQ_POLARITY          0x0736  /* IQ polarity fix (datasheet 15.4) */
-#define SX1261_REG_RX_GAIN              0x029F  /* RX gain: 0x00=power saving, 0x01=boosted */
-
-/* SetDIO3AsTCXOCtrl opcode (not in original sx1261_defs.h enum) */
-#define SX1261_OP_SET_DIO3_AS_TCXO_CTRL 0x97
+#define SX1261_REG_RX_GAIN              0x08AC  /* RX gain: 0x94=power saving, 0x96=boosted */
 
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE VARIABLES ---------------------------------------------------- */
@@ -643,7 +640,8 @@ int sx1261_lbt_stop(void) {
     /* Restart LoRa RX if it was configured and not inhibited by TX */
     if (sx1261_lora_rx_enabled && !sx1261_tx_inhibit_rx) {
         printf("SX1261: Restarting LoRa RX after LBT (light)\n");
-        sx1261_lora_rx_restart_light();
+        err = sx1261_lora_rx_restart_light();
+        CHECK_ERR(err);
     } else if (sx1261_lora_rx_enabled && sx1261_tx_inhibit_rx) {
         /* TX inhibit active — defer RX restart until inhibit clears */
         printf("SX1261: Deferred LoRa RX restart (TX inhibit active)\n");
@@ -786,7 +784,7 @@ int sx1261_spectral_scan_status(lgw_spectral_scan_status_t * status) {
  * and reconfigures modulation/packet params, avoiding the heavy 22ms+
  * re-initialization that would block the capture thread.
  *
- * Total execution time: ~3-5ms (no wait_ms calls).
+ * No calibration waits are needed; transfer latency depends on the transport.
  */
 int sx1261_lora_rx_restart_light(void) {
     int err;
@@ -804,8 +802,10 @@ int sx1261_lora_rx_restart_light(void) {
 
     printf("SX1261: LoRa RX light restart (post-scan)\n");
 
-    /* Use bulk write mode for speed */
-    err = sx1261_com_set_write_mode(LGW_COM_WRITE_MODE_BULK);
+    /* IQ correction requires a read, which USB rejects in bulk mode. Keep
+     * this short sequence in single mode so failures cannot leave queued
+     * commands to be replayed during a later operation. */
+    err = sx1261_com_set_write_mode(LGW_COM_WRITE_MODE_SINGLE);
     if (err != LGW_REG_SUCCESS) return err;
 
     /* Step 1: Set Standby XOSC (crystal already running from scan) */
@@ -836,7 +836,7 @@ int sx1261_lora_rx_restart_light(void) {
     if (err != LGW_REG_SUCCESS) goto cleanup;
 
     /* Step 5: Set packet params */
-    buff[0] = 0x00; buff[1] = 0x08; /* PreambleLength = 8 */
+    buff[0] = 0x00; buff[1] = 0x10; /* PreambleLength = 16 */
     buff[2] = 0x00;                 /* HeaderType: explicit */
     buff[3] = 0xFF;                 /* PayloadLength: max */
     buff[4] = 0x01;                 /* CRC on */
@@ -869,9 +869,10 @@ int sx1261_lora_rx_restart_light(void) {
         if (err != LGW_REG_SUCCESS) goto cleanup;
     }
 
-    /* Step 8: Boosted LNA RX gain */
-    buff[0] = 0x08; buff[1] = 0xAC;
-    buff[2] = 0x96;
+    /* Step 8: Restore the configured LNA RX gain */
+    buff[0] = (SX1261_REG_RX_GAIN >> 8) & 0xFF;
+    buff[1] = SX1261_REG_RX_GAIN & 0xFF;
+    buff[2] = sx1261_lora_rx_boosted ? 0x96 : 0x94;
     err = sx1261_reg_w(SX1261_WRITE_REGISTER, buff, 3);
     if (err != LGW_REG_SUCCESS) goto cleanup;
 
@@ -880,9 +881,11 @@ int sx1261_lora_rx_restart_light(void) {
     err = sx1261_reg_w(SX1261_SET_BUFFER_BASE_ADDRESS, buff, 2);
     if (err != LGW_REG_SUCCESS) goto cleanup;
 
-    /* Step 10: Set DIO/IRQ params - enable RxDone, Timeout, CRC error */
-    buff[0] = 0x00; buff[1] = 0x62;  /* IRQ mask: RxDone | Timeout | CRCErr */
-    buff[2] = 0x00; buff[3] = 0x02;  /* DIO1: RxDone */
+    /* Step 10: Restore the same RX events as full receiver startup */
+    uint16_t irq_mask = SX1261_IRQ_RX_DONE | SX1261_IRQ_CRC_ERR |
+                        SX1261_IRQ_HEADER_VALID | SX1261_IRQ_PREAMBLE_DETECTED;
+    buff[0] = (irq_mask >> 8) & 0xFF; buff[1] = irq_mask & 0xFF;
+    buff[2] = buff[0]; buff[3] = buff[1]; /* DIO1: RX events */
     buff[4] = 0x00; buff[5] = 0x00;  /* DIO2: none */
     buff[6] = 0x00; buff[7] = 0x00;  /* DIO3: none */
     err = sx1261_reg_w(SX1261_SET_DIO_IRQ_PARAMS, buff, 8);
@@ -893,13 +896,7 @@ int sx1261_lora_rx_restart_light(void) {
     err = sx1261_reg_w(SX1261_CLR_IRQ_STATUS, buff, 2);
     if (err != LGW_REG_SUCCESS) goto cleanup;
 
-    /* Flush bulk writes */
-    err = sx1261_com_flush();
-    if (err != LGW_REG_SUCCESS) goto cleanup;
-
-    /* Step 12: Start continuous RX (single write, not bulk) */
-    err = sx1261_com_set_write_mode(LGW_COM_WRITE_MODE_SINGLE);
-    if (err != LGW_REG_SUCCESS) return err;
+    /* Step 12: Start continuous RX */
 
     buff[0] = 0xFF; buff[1] = 0xFF; buff[2] = 0xFF; /* continuous */
     err = sx1261_reg_w(SX1261_SET_RX, buff, 3);
@@ -909,7 +906,6 @@ int sx1261_lora_rx_restart_light(void) {
     return LGW_REG_SUCCESS;
 
 cleanup:
-    sx1261_com_set_write_mode(LGW_COM_WRITE_MODE_SINGLE);
     printf("ERROR: sx1261_lora_rx_restart_light failed\n");
     return LGW_REG_ERROR;
 }
@@ -939,7 +935,8 @@ int sx1261_spectral_scan_abort(void) {
     /* Restart LoRa RX if it was configured and not inhibited by TX */
     if (sx1261_lora_rx_enabled && !sx1261_tx_inhibit_rx) {
         printf("SX1261: Restarting LoRa RX after spectral scan abort\n");
-        sx1261_lora_rx_restart_light();
+        err = sx1261_lora_rx_restart_light();
+        CHECK_ERR(err);
     } else if (sx1261_lora_rx_enabled && sx1261_tx_inhibit_rx) {
         /* TX inhibit active — defer RX restart until inhibit clears */
         sx1261_deferred_rx_restart = true;
@@ -975,6 +972,9 @@ int sx1261_cad_scan(uint32_t freq_hz, uint8_t sf, uint8_t bw, sx1261_cad_result_
     uint8_t buff[16];
     int32_t freq_reg;
     uint8_t bw_reg;
+    uint32_t bandwidth_hz;
+    const uint8_t cad_symbol_num = 0x02; /* four symbols */
+    int cad_timeout_ms;
     uint8_t cad_det_peak;
     uint16_t irq_status;
     int timeout_cnt = 0;
@@ -986,33 +986,42 @@ int sx1261_cad_scan(uint32_t freq_hz, uint8_t sf, uint8_t bw, sx1261_cad_result_
         printf("ERROR: %s: result pointer is NULL\n", __FUNCTION__);
         return LGW_REG_ERROR;
     }
+    /* Initialize result */
+    result->detected = false;
+    result->rssi_dbm = -128;
+    result->status = 2; /* error until proven otherwise */
+
     if (sf < 7 || sf > 12) {
         printf("ERROR: %s: invalid SF %u (must be 7-12)\n", __FUNCTION__, sf);
         return LGW_REG_ERROR;
     }
 
-    /* Initialize result */
-    result->detected = false;
-    result->rssi_dbm = -128;
-    result->status = 2; /* error until proven otherwise */
     ms_abort = ms_fsk_rssi = ms_setup = ms_cad = ms_cleanup = 0.0;
 
     _meas_time_start(&tm);
 
-    /* Stop LoRa RX if active */
-    if (sx1261_lora_rx_enabled) {
-        sx1261_lora_rx_stop();
-    }
-
     /* Map BW parameter to SX126x register value */
     switch (bw) {
-        case 0: bw_reg = 0x04; break;  /* 125 kHz */
-        case 1: bw_reg = 0x05; break;  /* 250 kHz */
-        case 2: bw_reg = 0x06; break;  /* 500 kHz */
-        case 3: bw_reg = 0x03; break;  /* 62.5 kHz */
+        case 0: bw_reg = 0x04; bandwidth_hz = 125000; break;  /* 125 kHz */
+        case 1: bw_reg = 0x05; bandwidth_hz = 250000; break;  /* 250 kHz */
+        case 2: bw_reg = 0x06; bandwidth_hz = 500000; break;  /* 500 kHz */
+        case 3: bw_reg = 0x03; bandwidth_hz = 62500; break;  /* 62.5 kHz */
         default:
             printf("ERROR: %s: invalid BW %u\n", __FUNCTION__, bw);
             return LGW_REG_ERROR;
+    }
+
+    /* Four CAD symbols plus two symbol periods and command margin. Keep
+     * the existing minimum for fast settings; SF12/BW62.5 needs >262 ms. */
+    cad_timeout_ms = (int)((((1U << cad_symbol_num) + 2U) * (1U << sf) * 1000U
+                           + bandwidth_hz - 1U) / bandwidth_hz) + 20;
+    if (cad_timeout_ms < 100) cad_timeout_ms = 100;
+
+    /* Validate everything before stopping the receiver. A failed stop must
+     * enter the same reset/recovery path as other hardware failures. */
+    if (sx1261_lora_rx_enabled) {
+        err = sx1261_lora_rx_stop();
+        if (err != LGW_REG_SUCCESS) goto cad_done;
     }
 
     /* CAD detection peak based on SF (SX126x datasheet) */
@@ -1216,7 +1225,7 @@ int sx1261_cad_scan(uint32_t freq_hz, uint8_t sf, uint8_t bw, sx1261_cad_result_
     }
 
     /* Step 4: Set CAD parameters */
-    buff[0] = 0x02;            /* cadSymbolNum: 2 symbols */
+    buff[0] = cad_symbol_num;  /* cadSymbolNum: 4 symbols */
     buff[1] = cad_det_peak;    /* cadDetPeak */
     buff[2] = 10;              /* cadDetMin */
     buff[3] = 0x00;            /* cadExitMode: STDBY after CAD */
@@ -1269,7 +1278,7 @@ int sx1261_cad_scan(uint32_t freq_hz, uint8_t sf, uint8_t bw, sx1261_cad_result_
 
     /* Poll IRQ status until CadDone (with timeout) */
     timeout_cnt = 0;
-    while (timeout_cnt < 100) { /* max 100ms timeout */
+    while (timeout_cnt < cad_timeout_ms) {
         buff[0] = 0x00;
         buff[1] = 0x00;
         buff[2] = 0x00;
@@ -1297,7 +1306,7 @@ int sx1261_cad_scan(uint32_t freq_hz, uint8_t sf, uint8_t bw, sx1261_cad_result_
         timeout_cnt++;
     }
 
-    if (timeout_cnt >= 100) {
+    if (timeout_cnt >= cad_timeout_ms) {
         printf("WARNING: %s: CAD timeout after %dms on freq=%uHz SF%u\n",
                __FUNCTION__, timeout_cnt, freq_hz, sf);
         result->status = 1; /* timeout */
@@ -1330,10 +1339,17 @@ cad_done:
         fd = open(gpio_path, O_WRONLY);
         if (fd < 0) {
             printf("ERROR: [CAD] cannot open %s for GPIO reset\n", gpio_path);
+            result->status = 2;
         } else {
-            write(fd, "0", 1);
+            if (write(fd, "0", 1) != 1) {
+                printf("ERROR: [CAD] failed to assert GPIO reset\n");
+                result->status = 2;
+            }
             wait_ms(1); /* Reset pulse 1ms (min 100us per datasheet) */
-            write(fd, "1", 1);
+            if (write(fd, "1", 1) != 1) {
+                printf("ERROR: [CAD] failed to release GPIO reset\n");
+                result->status = 2;
+            }
             close(fd);
             wait_ms(3); /* Post-reset settle: 3ms (datasheet typ 2ms) */
         }
@@ -1343,6 +1359,7 @@ cad_done:
     err = sx1261_load_pram();
     if (err != LGW_REG_SUCCESS) {
         printf("WARNING: [CAD] post-reset PRAM load failed\n");
+        result->status = 2;
     }
 
 //     err = sx1261_calibrate(freq_hz);
@@ -1353,6 +1370,7 @@ cad_done:
     err = sx1261_setup();
     if (err != LGW_REG_SUCCESS) {
         printf("WARNING: [CAD] post-reset setup failed\n");
+        result->status = 2;
     }
 
 
@@ -1370,7 +1388,9 @@ cad_done:
            ms_cleanup, ms_total);
 
     _meas_time_stop(4, tm, __FUNCTION__);
-    return LGW_REG_SUCCESS;
+    /* Callers check the return code before trusting detected=false. A timed
+     * out scan or failed recovery is unknown, never a measured clear channel. */
+    return result->status == 0 ? LGW_REG_SUCCESS : LGW_REG_ERROR;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1563,16 +1583,16 @@ int sx1261_lora_rx_configure(uint32_t freq_hz, uint8_t bw, uint8_t sf, uint8_t c
     printf("SX1261: IQ polarity fix applied (reg 0x0736 = 0x%02X)\n", iq_reg_val);
 
     /* --- Step 9: Set LNA RX gain (boosted or power-saving) --- */
-    /* Register 0x029F: 0x01 = boosted (max sensitivity), 0x00 = power saving */
+    /* Register 0x08AC: 0x96 = boosted, 0x94 = power saving */
     buff[0] = (SX1261_REG_RX_GAIN >> 8) & 0xFF;
     buff[1] = (SX1261_REG_RX_GAIN >> 0) & 0xFF;
-    buff[2] = boosted ? 0x01 : 0x00;
+    buff[2] = boosted ? 0x96 : 0x94;
     err = sx1261_reg_w(SX1261_WRITE_REGISTER, buff, 3);
     if (err != LGW_REG_SUCCESS) {
         printf("ERROR: %s: failed to set LNA RX gain\n", __FUNCTION__);
         return LGW_REG_ERROR;
     }
-    printf("SX1261: LNA RX gain set to %s (reg 0x029F = 0x%02X)\n", boosted ? "BOOSTED" : "POWER-SAVING", buff[2]);
+    printf("SX1261: LNA RX gain set to %s (reg 0x08AC = 0x%02X)\n", boosted ? "BOOSTED" : "POWER-SAVING", buff[2]);
 
     /* --- Step 10: Set DIO IRQ Parameters for LoRa RX --- */
     {
@@ -1630,42 +1650,30 @@ int sx1261_lora_rx_start(void) {
     }
     wait_ms(1);
 
-    /* Re-enable TCXO via DIO3 (1.7V, 5ms timeout) */
-    {
-        uint32_t tcxo_timeout = (uint32_t)(5.0 / 0.015625);
-        buff[0] = 0x01;
-        buff[1] = (uint8_t)((tcxo_timeout >> 16) & 0xFF);
-        buff[2] = (uint8_t)((tcxo_timeout >> 8) & 0xFF);
-        buff[3] = (uint8_t)((tcxo_timeout >> 0) & 0xFF);
-        sx1261_reg_w(SX1261_OP_SET_DIO3_AS_TCXO_CTRL, buff, 4);
-        wait_ms(2); /* TCXO settle (was 5ms, datasheet <1ms) */
-    }
+    /* Preserve oscillator setup owned by the board/HAL. Enabling DIO3
+     * TCXO mode here survives standby and breaks the first CAD transition
+     * on the WM1303; later post-CAD hardware resets happened to hide it. */
 
     /* Full block calibration in STBY_RC */
     buff[0] = 0x7F;
-    sx1261_reg_w(SX1261_CALIBRATE, buff, 1);
+    err = sx1261_reg_w(SX1261_CALIBRATE, buff, 1);
+    if (err != LGW_REG_SUCCESS) return LGW_REG_ERROR;
     wait_ms(4); /* Full calibrate (was 10ms, datasheet max 3.5ms) */
 
-    /* Image calibration for 869 MHz */
-    buff[0] = 0xD7;
-    buff[1] = 0xDB;
-    sx1261_reg_w(SX1261_CALIBRATE_IMAGE, buff, 2);
-    wait_ms(2); /* Image calibrate (was 5ms) */
+    /* Select image calibration for the configured band, including 915 MHz. */
+    err = sx1261_calibrate(sx1261_lora_rx_freq);
+    if (err != LGW_REG_SUCCESS) return LGW_REG_ERROR;
 
     /* Switch to STBY_XOSC */
     buff[0] = (uint8_t)SX1261_STDBY_XOSC;
-    sx1261_reg_w(SX1261_SET_STANDBY, buff, 1);
+    err = sx1261_reg_w(SX1261_SET_STANDBY, buff, 1);
+    if (err != LGW_REG_SUCCESS) return LGW_REG_ERROR;
     wait_ms(1);
 
     /* DC-DC regulator */
     buff[0] = 0x01;
-    sx1261_reg_w(SX1261_SET_REGULATORMODE, buff, 1);
-
-    /* Sensitivity adjust */
-    buff[0] = 0x08;
-    buff[1] = 0xAC;
-    buff[2] = 0xCB;
-    sx1261_reg_w(SX1261_WRITE_REGISTER, buff, 3);
+    err = sx1261_reg_w(SX1261_SET_REGULATORMODE, buff, 1);
+    if (err != LGW_REG_SUCCESS) return LGW_REG_ERROR;
 
     /* Reconfigure modulation params (they may have been changed by LBT/CAD) */
     {
@@ -1754,17 +1762,20 @@ int sx1261_lora_rx_start(void) {
         buff[1] = (SX1261_REG_IQ_POLARITY >> 0) & 0xFF;
         buff[2] = 0x00;
         buff[3] = 0x00;
-        sx1261_reg_r(SX1261_READ_REGISTER, buff, 4);
+        err = sx1261_reg_r(SX1261_READ_REGISTER, buff, 4);
+        if (err != LGW_REG_SUCCESS) return LGW_REG_ERROR;
         buff[0] = (SX1261_REG_IQ_POLARITY >> 8) & 0xFF;
         buff[1] = (SX1261_REG_IQ_POLARITY >> 0) & 0xFF;
         buff[2] = buff[3] | 0x04; /* set bit 2 for standard IQ */
-        sx1261_reg_w(SX1261_WRITE_REGISTER, buff, 3);
+        err = sx1261_reg_w(SX1261_WRITE_REGISTER, buff, 3);
+        if (err != LGW_REG_SUCCESS) return LGW_REG_ERROR;
 
         /* LNA RX gain (boosted or power-saving, from initial configure) */
         buff[0] = (SX1261_REG_RX_GAIN >> 8) & 0xFF;
         buff[1] = (SX1261_REG_RX_GAIN >> 0) & 0xFF;
-        buff[2] = sx1261_lora_rx_boosted ? 0x01 : 0x00;
-        sx1261_reg_w(SX1261_WRITE_REGISTER, buff, 3);
+        buff[2] = sx1261_lora_rx_boosted ? 0x96 : 0x94;
+        err = sx1261_reg_w(SX1261_WRITE_REGISTER, buff, 3);
+        if (err != LGW_REG_SUCCESS) return LGW_REG_ERROR;
 
         /* Set IRQ mask */
         {
@@ -1779,12 +1790,14 @@ int sx1261_lora_rx_start(void) {
             buff[6] = 0x00;
             buff[7] = 0x00;
         }
-        sx1261_reg_w(SX1261_SET_DIO_IRQ_PARAMS, buff, 8);
+        err = sx1261_reg_w(SX1261_SET_DIO_IRQ_PARAMS, buff, 8);
+        if (err != LGW_REG_SUCCESS) return LGW_REG_ERROR;
 
         /* Set RX buffer base address */
         buff[0] = 0x00;
         buff[1] = 0x00;
-        sx1261_reg_w(SX1261_SET_BUFFER_BASE_ADDRESS, buff, 2);
+        err = sx1261_reg_w(SX1261_SET_BUFFER_BASE_ADDRESS, buff, 2);
+        if (err != LGW_REG_SUCCESS) return LGW_REG_ERROR;
     }
 
     /* Clear all pending IRQ flags */
@@ -1919,7 +1932,9 @@ int sx1261_lora_rx_stop(void) {
  * @return Number of packets found (0 or 1), or -1 on error
  */
 int sx1261_lora_rx_fetch(struct lgw_pkt_rx_s *pkt_data, uint8_t max_pkt) {
-    int err;
+    int err, clear_err;
+    int packet_count = 0;
+    struct lgw_pkt_rx_s packet;
     uint8_t buff[260]; /* max payload 255 + header bytes */
     uint16_t irq_status;
     uint8_t payload_len;
@@ -2018,47 +2033,57 @@ int sx1261_lora_rx_fetch(struct lgw_pkt_rx_s *pkt_data, uint8_t max_pkt) {
     }
 
     /* Fill in the packet structure */
-    memset(&pkt_data[0], 0, sizeof(struct lgw_pkt_rx_s));
-    pkt_data[0].freq_hz = sx1261_lora_rx_freq;
-    pkt_data[0].if_chain = 9;       /* Special marker for Channel E (SX1261 LoRa RX) */
-    pkt_data[0].rf_chain = 1;       /* SX1261 is on radio_1 path */
-    pkt_data[0].modulation = MOD_LORA;
-    pkt_data[0].bandwidth = sx1261_lora_rx_bw;
-    pkt_data[0].datarate = sx1261_lora_rx_sf;
-    pkt_data[0].coderate = sx1261_lora_rx_cr;
-    pkt_data[0].rssic = -(int16_t)rssi_pkt / 2;
-    pkt_data[0].rssis = pkt_data[0].rssic; /* same for SX1261 */
-    pkt_data[0].snr = (float)snr_pkt / 4.0;
-    pkt_data[0].snr_min = pkt_data[0].snr;
-    pkt_data[0].snr_max = pkt_data[0].snr;
-    pkt_data[0].count_us = timestamp;
-    pkt_data[0].size = payload_len;
-    pkt_data[0].crc = 0; /* CRC value not directly available from SX1261 */
+    memset(&packet, 0, sizeof(struct lgw_pkt_rx_s));
+    packet.freq_hz = sx1261_lora_rx_freq;
+    packet.if_chain = 9;       /* Special marker for Channel E (SX1261 LoRa RX) */
+    packet.rf_chain = 1;       /* SX1261 is on radio_1 path */
+    packet.modulation = MOD_LORA;
+    packet.bandwidth = sx1261_lora_rx_bw;
+    packet.datarate = sx1261_lora_rx_sf;
+    packet.coderate = sx1261_lora_rx_cr;
+    packet.rssic = -(float)rssi_pkt / 2.0f;
+    packet.rssis = packet.rssic; /* same for SX1261 */
+    packet.snr = (float)snr_pkt / 4.0;
+    packet.snr_min = packet.snr;
+    packet.snr_max = packet.snr;
+    packet.count_us = timestamp;
+    packet.size = payload_len;
+    packet.crc = 0; /* CRC value not directly available from SX1261 */
 
     /* Determine CRC status from IRQ flags */
     if (irq_status & SX1261_IRQ_CRC_ERR) {
-        pkt_data[0].status = STAT_CRC_BAD;
+        packet.status = STAT_CRC_BAD;
     } else {
-        pkt_data[0].status = STAT_CRC_OK;
+        packet.status = STAT_CRC_OK;
     }
 
     /* Copy payload data (skip offset and status bytes) */
-    memcpy(pkt_data[0].payload, &buff[2], payload_len);
+    memcpy(packet.payload, &buff[2], payload_len);
 
-    printf("SX1261: LoRa RX packet received - %u bytes, RSSI=%.1f dBm, SNR=%.1f dB, CRC=%s\n",
-           payload_len, (double)pkt_data[0].rssic, (double)pkt_data[0].snr,
-           (pkt_data[0].status == STAT_CRC_OK) ? "OK" : "BAD");
+    packet_count = 1;
 
 cleanup:
     /* Clear all IRQ flags */
     buff[0] = (SX1261_IRQ_ALL >> 8) & 0xFF;
     buff[1] = (SX1261_IRQ_ALL >> 0) & 0xFF;
-    sx1261_reg_w(SX1261_CLR_IRQ_STATUS, buff, 2);
-
-    /* Return 1 if we got a valid packet, 0 otherwise */
-    if (err != LGW_REG_SUCCESS) {
-        return 0;
+    clear_err = sx1261_reg_w(SX1261_CLR_IRQ_STATUS, buff, 2);
+    if (clear_err != LGW_REG_SUCCESS) {
+        printf("ERROR: %s: failed to clear RX IRQ status\n", __FUNCTION__);
+        return LGW_REG_ERROR;
     }
+    if (err != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
+    if (packet_count == 0) {
+        return 0; /* Empty payload was discarded; caller's slot is untouched. */
+    }
+
+    /* Publish only after the complete packet has been read and acknowledged.
+     * Failed IRQ cleanup can then retry without delivering this packet twice. */
+    pkt_data[0] = packet;
+    printf("SX1261: LoRa RX packet received - %u bytes, RSSI=%.1f dBm, SNR=%.1f dB, CRC=%s\n",
+           payload_len, (double)packet.rssic, (double)packet.snr,
+           (packet.status == STAT_CRC_OK) ? "OK" : "BAD");
     return 1;
 }
 
@@ -2127,9 +2152,11 @@ void sx1261_set_tx_inhibit_rx(bool inhibit) {
     /* WM1303: when TX inhibit is released and a deferred RX restart is
        pending, restart LoRa RX immediately to minimize RX downtime. */
     if (!inhibit && sx1261_deferred_rx_restart && sx1261_lora_rx_enabled) {
-        sx1261_deferred_rx_restart = false;
         printf("SX1261: Deferred LoRa RX restart after TX inhibit cleared\n");
-        sx1261_lora_rx_restart_light();
+        sx1261_deferred_rx_restart = sx1261_lora_rx_restart_light() != LGW_REG_SUCCESS;
+        if (sx1261_deferred_rx_restart) {
+            printf("ERROR: SX1261 deferred RX restart failed; retry remains pending\n");
+        }
     } else if (!inhibit) {
         sx1261_deferred_rx_restart = false;
     }

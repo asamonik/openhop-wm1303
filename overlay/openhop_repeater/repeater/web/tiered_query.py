@@ -75,6 +75,8 @@ def _summary_table_name(base_table: str, suffix: str) -> str:
 
 
 def _average_count_expr(alias: str, available_columns) -> str:
+    if available_columns is not None and alias not in available_columns:
+        return "0"
     fallback = f"CASE WHEN {alias} IS NULL THEN 0 ELSE sample_count END"
     count_alias = f"{alias}_count"
     if available_columns is None or count_alias in available_columns:
@@ -94,6 +96,10 @@ def _reagg_expr(alias: str, available_columns=None) -> str:
     """
     if alias.endswith("_count") and alias[:-6] in _AVERAGE_ALIASES:
         return f"SUM({_average_count_expr(alias[:-6], available_columns)})"
+    if available_columns is not None and alias not in available_columns:
+        # Readers can run before the retention worker migrates old tables.
+        # A missing metric must not hide the other measurements in that tier.
+        return "NULL"
     if alias in _AVERAGE_ALIASES:
         count_expr = _average_count_expr(alias, available_columns)
         return f"SUM({alias} * {count_expr}) / NULLIF(SUM({count_expr}), 0)"

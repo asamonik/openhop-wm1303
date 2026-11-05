@@ -34,6 +34,34 @@ scan found the channel clear.
    - **Scan error**: continue to TX with `scan_error`
 4. **Resume RX** — SX1261 RX is restarted between busy-channel waits and after the TX guard
 
+RX startup preserves the oscillator configuration selected by the board/HAL.
+Forcing DIO3 TCXO mode during LoRa startup caused the first CAD scan to time out
+on the tested Pi; startup now leaves that board setting intact.
+
+The CAD setting `0x02` selects four symbols, as defined by
+[Semtech's reference driver](https://github.com/Lora-net/LoRaMac-node/blob/master/src/radio/sx126x/sx126x.h#L285-L294).
+Its polling allowance is at least 100 one-millisecond sleeps, or six symbol
+periods plus 20 ms when that is larger. For SF12/BW62.5 this is 414 nominal
+milliseconds; SPI and scheduling overhead add to wall time. The Python ACK wait
+includes the additional allowance for sixteen attempts, so a valid slow scan
+sequence does not cause an early ACK timeout. Existing fast-channel budgets are
+unchanged. These are wait budgets, not measured per-packet CAD durations.
+
+### Receiver recovery
+
+LoRa receiver configuration and restart paths restore the selected gain using
+register `0x08AC`: `0x94` for power saving or `0x96` for boosted sensitivity,
+following [Semtech's register definitions](https://github.com/Lora-net/LoRaMac-node/blob/master/src/radio/sx126x/sx126x.h#L138-L161).
+The former `0x029F` address belongs to the retention list; LoRa setup no longer
+writes it or sends the unrelated `0xCB` value to the gain register.
+
+Light restarts use single-command mode because IQ correction reads a register,
+which the HAL USB transport rejects while bulk mode is enabled. This also avoids
+leaving partially queued USB commands on a failed restart. Preamble and RX event
+masks match full startup, and the configured gain and LDRO setting are retained.
+LBT stop and spectral-abort operations report failed RX restoration; failed
+deferred restarts remain pending until a later TX-inhibit release can retry.
+
 ### SX1261 / SX1302 Interference Resolution
 
 During development, a critical hardware interaction was discovered: configuring the SX1261 for LoRa CAD mode interferes with the SX1302's TX state machine, particularly on narrow-bandwidth channels (BW 62.5 kHz). This was resolved through several techniques:

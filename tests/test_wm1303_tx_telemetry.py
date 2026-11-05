@@ -19,6 +19,19 @@ from test_storage_lifecycle import storage_module
 
 
 class ACKObservationTests(TestCase):
+    def test_legacy_unmeasured_scan_defaults_do_not_become_zero_dbm_readings(self):
+        for reason in ('scan_error', 'not_run', 'unsupported_bw'):
+            with self.subTest(reason=reason):
+                fields = backend_module._tx_ack_diagnostics(
+                    {'enabled': True, 'detected': False, 'reason': reason,
+                     'tx_noisefloor_dbm': 0}, {})
+                self.assertIsNone(fields['tx_noisefloor_dbm'])
+        # The compatibility rule is tied to the absent scan, not an RSSI
+        # clamp. Preserve explicitly measured values on successful scans.
+        fields = backend_module._tx_ack_diagnostics(
+            {'reason': 'clear', 'tx_noisefloor_dbm': 0}, {})
+        self.assertEqual(fields['tx_noisefloor_dbm'], 0)
+
     def test_missing_and_malformed_fields_remain_unknown(self):
         fields = backend_module._tx_ack_diagnostics({}, {})
         self.assertTrue(all(value is None for value in fields.values()))
@@ -46,6 +59,26 @@ class ACKObservationTests(TestCase):
 
 
 class TXObservationTests(IsolatedAsyncioTestCase):
+    async def test_ack_wait_allows_the_longer_cad_window_on_slow_channels(self):
+        for sf in (8, 12):
+            with self.subTest(sf=sf):
+                backend = self.backend([])
+                self.acknowledge(backend, [self.sent_ack()])
+                txpk = {'freq': 869.618, 'datr': f'SF{sf}BW62', 'codr': '4/5',
+                        'size': 12, 'data': 'AA==', 'prea': 17}
+                with patch.object(backend_module.asyncio, 'wait_for', wraps=asyncio.wait_for) as wait:
+                    result = await backend._send_pull_resp(txpk)
+                self.assertTrue(result['ok'])
+                timeout = wait.call_args.kwargs['timeout']
+                original = max(result['airtime_ms'] / 1000 + 2, 3)
+                if sf == 8:
+                    self.assertEqual(timeout, original)
+                else:
+                    # Sixteen four-symbol scans can exceed the old margin
+                    # before RF transmission itself even starts.
+                    self.assertGreater(timeout, result['airtime_ms'] / 1000
+                                       + 16 * 4 * (1 << sf) / 62500)
+
     def backend(self, records):
         backend = backend_module.WM1303Backend({})
         backend._loop = asyncio.get_running_loop()

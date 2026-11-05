@@ -190,6 +190,24 @@ class ConfigManager:
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
 
+    def _http_binding_restart_required(self) -> bool:
+        """Compare desired startup binding with the listener's actual settings."""
+        server = getattr(self.daemon, "http_server", None)
+        if server is None:
+            return False  # Startup has not constructed a listener yet.
+        # Match RepeaterDaemon startup: web is a legacy fallback only when no
+        # nonempty dedicated HTTP section is configured.
+        http_cfg = self.config.get("http") or self.config.get("web", {})
+        host = str(http_cfg.get("host", "0.0.0.0") or "0.0.0.0")
+        try:
+            port = int(http_cfg.get("port", 8000))
+        except (TypeError, ValueError):
+            port = 8000
+        if (server.host, server.port) != (host, port):
+            logger.info("HTTP listener address change requires a service restart")
+            return True
+        return False
+
     def _apply_live_http_config(self) -> bool:
         if not self.daemon:
             logger.warning("Daemon not available for HTTP live update")
@@ -203,19 +221,11 @@ class ConfigManager:
 
         http_cfg = self.config.get("http", {}) if isinstance(self.config, dict) else {}
         enabled = self._parse_bool(http_cfg.get("enabled", True), default=True)
-        host = str(http_cfg.get("host", "0.0.0.0") or "0.0.0.0")  # nosec B104 - intentional LAN bind default
-
-        try:
-            port = int(http_cfg.get("port", 8000))
-        except (TypeError, ValueError):
-            logger.warning(
-                "Invalid http.port=%r, falling back to 8000", http_cfg.get("port")
-            )
-            port = 8000
-
-        # Keep runtime server settings aligned with config before start/restart.
-        http_server.host = host
-        http_server.port = port
+        # The process-wide CherryPy listener cannot be rebound by changing
+        # these attributes. Preserve the active address and keep the request
+        # alive long enough to report that the saved binding needs a restart.
+        if self._http_binding_restart_required():
+            return False
 
         from repeater.service_utils import start_http_server, stop_http_server
 
@@ -335,6 +345,11 @@ class ConfigManager:
             # Login ACLs cache credentials at registration. Refresh only the
             # repeater ACL; room servers retain their per-identity passwords.
             if "repeater" in sections:
+                # GPSService keeps this mapping for static/fallback advert
+                # coordinates. Section replacement retires its old reference.
+                gps_service = getattr(self.daemon, "gps_service", None)
+                if gps_service is not None:
+                    gps_service.repeater_config = daemon_config["repeater"]
                 login_helper = getattr(self.daemon, "login_helper", None)
                 refresh_security = getattr(
                     login_helper, "refresh_repeater_security", None
@@ -431,12 +446,20 @@ class ConfigManager:
                 logger.info("radio_type change detected; service restart required")
                 live_update_ok = False
 
+            if "gps" in sections:
+                # Receiver threads and acquisition options are initialized
+                # once by GPSService; changing the dict cannot reconfigure it.
+                logger.info("GPS configuration change requires a service restart")
+                live_update_ok = False
+
             if "kiss" in sections and self._kiss_transport_restart_required():
                 live_update_ok = False
 
             if "radio" in sections:
                 live_update_ok = self._apply_live_radio_config() and live_update_ok
             if "web" in sections:
+                if self._http_binding_restart_required():
+                    live_update_ok = False
                 app = getattr(getattr(self.daemon, 'http_server', None), 'app', None)
                 if app is not None and hasattr(app, 'apply_web_config'):
                     app.apply_web_config()

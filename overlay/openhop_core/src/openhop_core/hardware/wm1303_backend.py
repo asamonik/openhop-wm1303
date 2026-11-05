@@ -196,13 +196,18 @@ def _tx_ack_diagnostics(cad, lbt):
     lbt = lbt if isinstance(lbt, dict) else {}
     reason = cad.get('reason')
     detected = cad.get('detected')
+    noisefloor = _optional_ack_rssi(cad.get('tx_noisefloor_dbm'))
     if reason in ('scan_error', 'not_run', 'unsupported_bw'):
         detected = None
+        # Older forwarders zero-initialized extras but never measured this
+        # field on these paths. Keep that default out of noise-floor charts.
+        if noisefloor == 0:
+            noisefloor = None
     return {
         'cad_enabled': cad.get('enabled') if isinstance(cad.get('enabled'), bool) else None,
         'cad_detected': detected if isinstance(detected, bool) else None,
         'cad_retries': _optional_ack_count(cad.get('retries')),
-        'tx_noisefloor_dbm': _optional_ack_rssi(cad.get('tx_noisefloor_dbm')),
+        'tx_noisefloor_dbm': noisefloor,
         'cad_reason': reason if isinstance(reason, str) else None,
         'lbt_enabled': lbt.get('enabled') if isinstance(lbt.get('enabled'), bool) else None,
         'lbt_pass': lbt.get('pass') if isinstance(lbt.get('pass'), bool) else None,
@@ -4148,6 +4153,13 @@ class WM1303Backend:
             _airtime_s = 0.0
             _datr = txpk.get("datr", "SF8BW125")
             _sf, _bw = _parse_datr(_datr)
+            # Match the native four-symbol CAD window. Retain the existing
+            # fast-channel allowance and budget the extra time for all sixteen
+            # possible attempts on slow/narrow settings before declaring loss.
+            _cad_extra_s = 0.0
+            if _sf is not None and _bw:
+                _cad_scan_ms = max(100, math.ceil(6 * (1 << _sf) * 1000 / _bw) + 20)
+                _cad_extra_s = 16 * (_cad_scan_ms - 100) / 1000.0
             if _sf is not None:
                 _cr = int(str(txpk.get('codr', '4/5')).split('/')[-1])
                 _airtime_s = self._lora_airtime_s(
@@ -4156,7 +4168,7 @@ class WM1303Backend:
                 _airtime_ms_val = round(_airtime_s * 1000, 1)
                 # Set a CONSERVATIVE _last_tx_end in case ACK never arrives.
                 # A confirmed completion replaces it with a 50ms margin.
-                self._last_tx_end = time.monotonic() + _airtime_s + 2.0
+                self._last_tx_end = time.monotonic() + _airtime_s + 2.0 + _cad_extra_s
                 logger.info('WM1303Backend: TX airtime %.1fms (SF%d BW%d %d bytes)',
                            _airtime_ms_val, _sf, _bw, txpk.get('size', 0))
             # AGC recovery DISABLED: causes ~96s deaf (6s restart + 90s self-recovery)
@@ -4171,7 +4183,7 @@ class WM1303Backend:
                        'freq': txpk['freq'], 'datr': txpk['datr'],
                        'airtime_ms': _airtime_ms_val, 'send_ms': _send_ms,
                        'tx_token': token, 'ack_received': False}
-            _ack_timeout_s = max((_airtime_ms_val + 2000.0) / 1000.0, 3.0)
+            _ack_timeout_s = max((_airtime_ms_val + 2000.0) / 1000.0, 3.0) + _cad_extra_s
             try:
                 _post_ack = await asyncio.wait_for(_ack_future, timeout=_ack_timeout_s)
                 if isinstance(_post_ack, dict):

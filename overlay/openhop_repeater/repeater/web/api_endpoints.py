@@ -4391,19 +4391,21 @@ class APIEndpoints:
         repeater_public_key = derive_companion_public_key_hex(repeater_key)
         if repeater_public_key is None:
             raise ValueError("Cannot validate configured identities without a valid repeater identity_key")
-        owners = {int(repeater_public_key[:2], 16): "repeater"}
+        owners = {(int(repeater_public_key[:2], 16), "server"): "repeater"}
         for section, name, entry in configured:
             label = f"{section}:{name}"
             public_key = derive_companion_public_key_hex(entry.get("identity_key"))
             if public_key is None:
                 raise ValueError(f"Identity '{label}' has an invalid identity_key")
             routing_hash = int(public_key[:2], 16)
-            if routing_hash in owners:
+            namespace = "companion" if section == "companions" else "server"
+            routing_key = (routing_hash, namespace)
+            if routing_key in owners:
                 raise ValueError(
-                    f"Identity '{label}' conflicts with '{owners[routing_hash]}' "
+                    f"Identity '{label}' conflicts with '{owners[routing_key]}' "
                     f"at routing hash 0x{routing_hash:02X}; configure distinct identities"
                 )
-            owners[routing_hash] = label
+            owners[routing_key] = label
 
     @cherrypy.expose
     @cherrypy.tools.json_out()

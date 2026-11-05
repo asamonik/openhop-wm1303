@@ -447,6 +447,18 @@ class ChannelTXQueue:
             self.queue.task_done()
         self.stats["pending"] = self.queue.qsize()
 
+    def retry_nowait(self, request: dict) -> None:
+        """Retry in the original lane without evicting newer admitted work."""
+        self._discard_completed_requests()
+        if request.get("priority"):
+            if len(self._priority_queue) >= self._queue_size:
+                raise asyncio.QueueFull
+            self._priority_queue.append(request)
+            self.stats["pending_priority"] = len(self._priority_queue)
+        else:
+            self.queue.put_nowait(request)
+            self.stats["pending"] = self.queue.qsize()
+
     def peek_nowait(self):
         """Inspect the next request without releasing its admission slot."""
         if self._priority_queue:
@@ -1015,15 +1027,7 @@ class GlobalTXScheduler:
                 # admitted ACKs, just as a full bulk lane rejects a retry.
                 request['_retry_count'] = _retry_count + 1
                 try:
-                    queue._discard_completed_requests()
-                    if request.get('priority'):
-                        if len(queue._priority_queue) >= queue._queue_size:
-                            raise asyncio.QueueFull
-                        queue._priority_queue.append(request)
-                        queue.stats['pending_priority'] = len(queue._priority_queue)
-                    else:
-                        queue.queue.put_nowait(request)
-                        queue.stats['pending'] = queue.queue.qsize()
+                    queue.retry_nowait(request)
                     queue.stats.setdefault('total_retried', 0)
                     queue.stats['total_retried'] += 1
                     logger.warning("GlobalTXScheduler: TX DROPPED on %s, "

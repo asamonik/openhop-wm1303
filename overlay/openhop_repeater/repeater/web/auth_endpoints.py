@@ -382,6 +382,7 @@ class AuthEndpoints:
             # Don't allow login with empty or unconfigured password
             if not config_password:
                 logger.warning("Login attempt rejected - password not configured")
+                cherrypy.response.status = 503
                 return json.dumps(
                     {
                         "success": False,

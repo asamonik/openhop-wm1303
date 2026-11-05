@@ -54,6 +54,7 @@ fi
 "$WM1303_TEST_PYTHON" -m unittest discover -s "$WM1303_TEST_ROOT/tests" -q
 "$WM1303_TEST_PYTHON" "$WM1303_TEST_ROOT/tests/companion_tcp_scenario.py" -q
 "$WM1303_TEST_PYTHON" "$WM1303_TEST_ROOT/tests/analytics_http_scenario.py" -q
+"$WM1303_TEST_PYTHON" "$WM1303_TEST_ROOT/tests/http_binding_scenario.py" -q
 "$WM1303_TEST_PYTHON" "$WM1303_TEST_ROOT/tests/daemon_smoke_scenario.py" -q
 # Four contact-store assertions in vanilla upstream require reference identity,
 # anonymous contacts sharing permanent capacity, and omitted channel indices.

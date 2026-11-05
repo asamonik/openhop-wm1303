@@ -14,6 +14,58 @@ from repeater.web.tiered_query import tiered_channel_query
 
 
 class MetricsRetentionTests(unittest.TestCase):
+    def test_legacy_summary_migration_adds_metrics_without_fabricating_history(self):
+        cfg = next(cfg for cfg in retention.DOWNSAMPLE_TABLES
+                   if cfg['table'] == 'channel_stats_history')
+        with closing(sqlite3.connect(':memory:')) as conn:
+            for suffix in ('1m', '10m', '15m'):
+                table = 'channel_stats_history_' + suffix
+                conn.execute(f'CREATE TABLE {table}(bucket_ts REAL, channel_id TEXT, '
+                             'sample_count REAL, total_rx_count REAL, avg_rssi REAL)')
+                conn.execute(f"INSERT INTO {table} VALUES (120, 'channel_e', 3, 7, -99)")
+                if suffix == '10m':
+                    # A failed older migration can leave the denominator
+                    # behind while the measurement column is still absent.
+                    conn.execute(f'ALTER TABLE {table} ADD COLUMN avg_lbt_last_rssi_count REAL')
+                    conn.execute(f'UPDATE {table} SET avg_lbt_last_rssi_count = 3')
+                retention._create_summary_table(conn, cfg, suffix)
+                retention._create_summary_table(conn, cfg, suffix)
+                row = conn.execute(f'SELECT total_rx_count, avg_rssi, avg_rssi_count, '
+                                   f'avg_lbt_last_rssi, avg_lbt_last_rssi_count FROM {table}').fetchone()
+                self.assertEqual(row, (7, -99, 3, None, 0))
+                self.assertEqual(conn.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0], 1)
+
+    def test_summary_query_keeps_legacy_rows_when_a_new_metric_is_missing(self):
+        with closing(sqlite3.connect(':memory:')) as conn:
+            conn.execute('CREATE TABLE channel_stats_history_1m(bucket_ts REAL, '
+                         'channel_id TEXT, sample_count REAL, total_rx_count REAL, avg_rssi REAL)')
+            conn.execute("INSERT INTO channel_stats_history_1m VALUES (120, 'channel_e', 3, 7, -99)")
+            rows = tiered_channel_query(conn, 'channel_stats_history', 'channel_e', 0, 900, 900,
+                                        columns=['total_rx_count', 'avg_rssi', 'avg_lbt_last_rssi'])
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]['total_rx_count'], 7)
+            self.assertEqual(rows[0]['avg_rssi'], -99)
+            self.assertIsNone(rows[0]['avg_lbt_last_rssi'])
+
+    def test_failed_summary_migration_rolls_back_schema_and_can_be_retried(self):
+        cfg = next(cfg for cfg in retention.DOWNSAMPLE_TABLES
+                   if cfg['table'] == 'noise_floor_history')
+        with closing(sqlite3.connect(':memory:')) as conn:
+            conn.execute('CREATE TABLE noise_floor_history_1m(bucket_ts REAL, channel_id TEXT, '
+                         'sample_count REAL, avg_noise_floor_dbm REAL)')
+            conn.execute("INSERT INTO noise_floor_history_1m VALUES (120, 'channel_e', 3, -99)")
+            conn.execute("CREATE TRIGGER block_summary_migration BEFORE UPDATE ON noise_floor_history_1m "
+                         "BEGIN SELECT RAISE(ABORT, 'fixture migration failure'); END")
+            conn.commit()
+            before = conn.execute('PRAGMA table_info(noise_floor_history_1m)').fetchall()
+            with self.assertRaises(sqlite3.DatabaseError):
+                retention._create_summary_table(conn, cfg, '1m')
+            conn.commit()
+            self.assertEqual(conn.execute('PRAGMA table_info(noise_floor_history_1m)').fetchall(), before)
+            conn.execute('DROP TRIGGER block_summary_migration')
+            retention._create_summary_table(conn, cfg, '1m')
+            self.assertEqual(conn.execute('SELECT avg_noise_floor_dbm_count FROM noise_floor_history_1m').fetchone()[0], 3)
+
     def test_lifetime_packet_counts_survive_migration_pruning_and_restart(self):
         from repeater.data_acquisition.sqlite_handler import SQLiteHandler
 
