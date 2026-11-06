@@ -135,7 +135,8 @@ class ConfigManagerTests(unittest.TestCase):
                 server = SimpleNamespace(host="127.0.0.1", port=8000,
                                          start=Mock(), stop=Mock())
                 self.manager.daemon = SimpleNamespace(config=self.config, http_server=server)
-                with patch("repeater.service_utils._is_cherrypy_engine_running", return_value=True):
+                services = SimpleNamespace(start_http_server=Mock(), stop_http_server=Mock())
+                with patch.dict(sys.modules, {"repeater.service_utils": services}):
                     result = self.manager.update_and_save({"http": edit})
                 self.assertTrue(result["success"] and result["saved"])
                 self.assertFalse(result["live_updated"])
@@ -145,6 +146,8 @@ class ConfigManagerTests(unittest.TestCase):
                     self.assertEqual(saved[key], value)
                 server.start.assert_not_called()
                 server.stop.assert_not_called()
+                services.start_http_server.assert_not_called()
+                services.stop_http_server.assert_not_called()
 
     def test_web_binding_fallback_requires_restart_but_dedicated_http_takes_precedence(self):
         for dedicated_http in (False, True):
@@ -168,9 +171,14 @@ class ConfigManagerTests(unittest.TestCase):
         self.config["http"] = {"host": "127.0.0.1", "port": 8000}
         server = SimpleNamespace(host="127.0.0.1", port=8000, start=Mock(), stop=Mock())
         self.manager.daemon = SimpleNamespace(config=self.config, http_server=server)
-        with patch("repeater.service_utils._is_cherrypy_engine_running", return_value=True):
+        services = SimpleNamespace(
+            start_http_server=Mock(return_value=(True, "Already running")),
+            stop_http_server=Mock())
+        with patch.dict(sys.modules, {"repeater.service_utils": services}):
             result = self.manager.update_and_save({"http": {"port": "8000"}})
         self.assertTrue(result["success"] and result["saved"] and result["live_updated"])
+        services.start_http_server.assert_called_once_with(self.manager.daemon)
+        services.stop_http_server.assert_not_called()
         self.assertEqual((server.host, server.port), ("127.0.0.1", 8000))
         server.start.assert_not_called()
         server.stop.assert_not_called()
